@@ -52,6 +52,16 @@ HTTP 不加密，发现及首次信任仍受网络环境影响。本轮不宣称
 
 ## 平台与验证
 
+### 桌面窗口（main 开发版）
+
+Windows、Linux 关闭原生窗口装饰，使用 `DesktopTitleBar.vue` 自绘标题栏和最小化、最大化／还原、关闭按钮；拖动区支持拖动和双击切换最大化，边缘与四角支持缩放。按钮通过 Tauri 窗口 API 操作窗口，resize 事件同步来自系统快捷键等外部操作的最大化状态，旧查询结果不覆盖较新的状态。失焦时减淡标题文字，组件卸载时清理监听。
+
+`desktop_window_controls` 原生命令按编译目标启用桌面标题栏，独立于核心服务启动；服务启动失败时窗口仍可操作。窗口命令权限只授予 Linux、Windows 的 main 窗口；Android 与普通浏览器不显示标题栏或预留空白。桌面最小化后再次启动应用会还原并聚焦已有窗口。
+
+桌面标题栏占用 36px，工作区、启动页和弹窗据此计算可用高度。窗口接口模拟测试覆盖按钮、拖动、双击、边缘缩放、外部状态变化、异步查询顺序、启动失败、操作失败恢复及 Android／浏览器隔离。前端构建、12 项 Playwright 流程、Tauri 配置 schema 和权限标识校验、Android arm64 `cargo check` 已通过。当前执行环境缺少 GTK／WebKitGTK 图形依赖，未在本地运行 Windows／Linux 原生窗口；模拟测试不替代原生窗口实测。
+
+### 安装与验证范围
+
 Windows 使用 WebView2、NSIS；Linux 使用 WebKitGTK 4.1、DEB/AppImage；Android 使用 JDK 21、SDK 36、NDK 27.2，允许局域网 HTTP，前台持有组播锁，arm64 原生库和 APK 支持 16 KiB 对齐。桌面第二次启动聚焦已有窗口，避免原生应用并发访问同一个数据目录。
 
 本轮运行 Rust 核心与数据库集成测试、clippy、TypeScript/Vite、Playwright 会话流程；CI 构建三平台安装产物，检查 Linux 原生启动和 Android ELF 对齐。真机与复杂网络测试范围单独记录，不以浏览器模拟替代 Android 原生真机验收。

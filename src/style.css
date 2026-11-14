@@ -1,4 +1,6 @@
 :root {
+  --titlebar-height: 0px;
+  --app-height: calc(100dvh - var(--titlebar-height));
   font-family:
     Inter,
     -apple-system,
@@ -18,6 +20,12 @@
 }
 body {
   margin: 0;
+}
+.desktop-window {
+  --titlebar-height: 36px;
+}
+.desktop-window body {
+  padding-top: var(--titlebar-height);
 }
 button,
 input,
@@ -76,7 +84,7 @@ small {
 }
 .workspace {
   display: flex;
-  height: 100dvh;
+  height: var(--app-height);
   min-height: 420px;
   overflow: hidden;
 }
@@ -1030,7 +1038,7 @@ progress::-webkit-progress-value {
 }
 .modal-backdrop {
   position: fixed;
-  inset: 0;
+  inset: var(--titlebar-height) 0 0;
   z-index: 30;
   background: #17243b50;
   backdrop-filter: blur(4px);
@@ -1047,7 +1055,7 @@ progress::-webkit-progress-value {
   padding: 30px;
   width: 420px;
   max-width: 100%;
-  max-height: 88dvh;
+  max-height: calc(88dvh - var(--titlebar-height));
   overflow: auto;
   box-shadow: 0 15px 70px #13203d15;
 }
@@ -1250,7 +1258,7 @@ input::placeholder {
   align-items: center;
   justify-content: center;
   gap: 20px;
-  min-height: 100dvh;
+  min-height: var(--app-height);
   padding: 25px;
 }
 .launch h1 {
@@ -1261,7 +1269,7 @@ input::placeholder {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 100dvh;
+  min-height: var(--app-height);
   padding: 24px;
   background: #f3f5fa;
 }
@@ -1365,7 +1373,7 @@ input::placeholder {
   .workspace {
     display: block;
     padding-bottom: 65px;
-    height: 100dvh;
+    height: var(--app-height);
     min-height: 320px;
   }
   .function-rail {

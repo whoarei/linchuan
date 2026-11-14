@@ -33,6 +33,7 @@ import {
   Globe,
 } from "lucide-vue-next";
 import QRCode from "qrcode";
+import DesktopTitleBar from "./DesktopTitleBar.vue";
 import {
   browserIdentity,
   rememberBrowserName,
@@ -858,6 +859,7 @@ onUnmounted(() => {
 </script>
 
 <template>
+  <DesktopTitleBar @error="notify($event, true)" />
   <div v-if="loading || bootError" class="launch">
     <div class="brand-icon">邻</div>
     <h1>邻传</h1>
