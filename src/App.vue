@@ -63,6 +63,7 @@ import type {
 } from "./types";
 
 type Mode = "devices" | "settings" | "about";
+const downloadsUrl = "https://github.com/whoarei/linchuan/releases/latest";
 const state = ref<AppState>();
 const loading = ref(true);
 const bootError = ref("");
@@ -893,6 +894,12 @@ onUnmounted(() => {
         </button>
       </form>
       <small>同一局域网 · 无需账号 · HTTP 传输</small>
+      <div v-if="!native" class="client-download">
+        <a :href="downloadsUrl" target="_blank" rel="noopener noreferrer">
+          <Download :size="15" />下载客户端<ArrowUpRight :size="13" />
+        </a>
+        <small>Android · Linux · Windows · GitHub</small>
+      </div>
     </section>
   </main>
   <div
@@ -1477,13 +1484,23 @@ onUnmounted(() => {
       <p class="about-note">
         仅在可信局域网使用，当前采用 HTTP 传输。<br />保持应用运行；群聊暂不自动补发离线消息。
       </p>
-      <a
-        href="https://github.com/whoarei/linchuan"
-        @click.prevent="openProject"
-        target="_blank"
-        rel="noreferrer"
-        >GitHub 项目<ArrowUpRight :size="14"
-      /></a>
+      <div class="about-links">
+        <a
+          v-if="!native"
+          :href="downloadsUrl"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <Download :size="15" />下载客户端<ArrowUpRight :size="14" />
+        </a>
+        <a
+          href="https://github.com/whoarei/linchuan"
+          @click.prevent="openProject"
+          target="_blank"
+          rel="noopener noreferrer"
+          >GitHub 项目<ArrowUpRight :size="14"
+        /></a>
+      </div>
     </main>
   </div>
   <div v-if="toast" class="toast" :class="{ error: toastError }" role="status">

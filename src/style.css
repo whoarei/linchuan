@@ -1013,8 +1013,15 @@ progress::-webkit-progress-value {
   color: #a6b0c4;
   line-height: 2;
 }
-.about-page > a {
+.about-links {
   margin-top: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+.about-links a {
   font-size: 11px;
   display: flex;
   align-items: center;
@@ -1283,6 +1290,24 @@ input::placeholder {
   text-align: center;
   font-size: 9px;
   color: #b2bdcf;
+}
+.client-download {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid #eef1f7;
+  text-align: center;
+}
+.client-download a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+.client-download small {
+  display: block;
+  margin-top: 7px;
+  font-size: 10px;
+  color: #9aa6bd;
 }
 .sr-only {
   position: absolute;
