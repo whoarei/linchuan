@@ -50,3 +50,5 @@ Debian 包内部使用 `0.4.0~rc.1` 确保 dpkg 将 RC 排在 `0.4.0` 之前；�
 Tauri CLI 的加密私钥签名已验证可以绑定完整 RC 版本并通过客户端公钥验签；已有 Secrets 的三平台实际签名记录见[开发与发布](development.md)。新流程的完整 RC 安装包构建与公开发布在实际推送版本标签时执行，不以策略单测替代真实平台构建。
 
 本轮本地通过 actionlint、全部工作流 Bash 语法检查、19 项 Python 签名与发布策略测试、32 项 Rust 核心测试及 21 项 Playwright 流程。没有创建新版本标签或公开测试 Release。
+
+[新版 Checks 实际运行](https://github.com/whoarei/linchuan/actions/runs/43611995910)已通过，仅执行一个 verify 任务，没有平台打包任务。仓库的活动工作流为 Checks 和 Release 两项。
