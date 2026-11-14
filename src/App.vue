@@ -46,10 +46,10 @@ function size(bytes:number){if(bytes===0)return '0 B';const u=['B','KB','MB','GB
 function statusLabel(status:string){return ({pending:'等待接收',accepted:'已接受',transferring:'正在传输',completed:'已完成',rejected:'已拒绝',cancelled:'已取消',failed:'传输失败'} as Record<string,string>)[status]||status;}
 function time(value:number){return new Date(value*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});}
 function toggle(id:string){if(busy.value)return;if(selected.value.includes(id))selected.value=selected.value.filter(v=>v!==id);else if(selected.value.length<8)selected.value.push(id);else notify('一次最多选择 8 台设备',true);}
-async function refresh(){
+async function refresh(initial = false){
  if(refreshing||disposed)return;refreshing=true;
  try{const value=await api<AppState>('/api/state');if(disposed)return;state.value=value;ready.value=true;connected.value=true;selected.value=selected.value.filter(id=>value.devices.some(d=>d.id===id));if(!shareAddress.value)shareAddress.value=value.info.addresses[0]||address();}
- catch(error){if(disposed)return;if(error instanceof ApiError&&error.status===401&&!native){forget();ready.value=false;socket?.close();}else connected.value=false;}
+ catch(error){if(disposed)return;if(error instanceof ApiError&&error.status===401&&!native){forget();ready.value=false;socket?.close();}else {connected.value=false;if(initial)throw error;}}
  finally{refreshing=false;loading.value=false;}
 }
 function openEvents(){
@@ -84,12 +84,37 @@ async function showConnection(){connection.value=true;qr.value=await QRCode.toDa
 async function changeAddress(){qr.value=await QRCode.toDataURL(shareAddress.value,{width:240,margin:1});}
 async function connectPeer(){manualBusy.value=true;try{const result=await api<{id:string}>('/api/peers',{address:manualAddress.value.trim()});await refresh();if(!selected.value.includes(result.id))selected.value.push(result.id);manual.value=false;manualAddress.value='';notify('设备已连接');}catch(error){notify((error as Error).message,true);}finally{manualBusy.value=false;}}
 async function saveName(){try{await api('/api/settings',{name:newName.value});editName.value=false;await refresh();notify('名称已更新，设备发现名称将在下次启动后更新');}catch(error){notify((error as Error).message,true);}}
-onMounted(async()=>{try{await bootstrap();const info=await api<{name:string}>('/api/info');hostName.value=info.name;if(token())await refresh();else loading.value=false;if(ready.value)openEvents();poll=setInterval(()=>{if(token()){void refresh();if(ready.value)openEvents();}},3000);}catch(error){bootError.value=(error as Error).message;loading.value=false;}});
+async function start() {
+ loading.value = true;
+ bootError.value = '';
+ clearInterval(poll);
+ try {
+  await bootstrap();
+  if (disposed) return;
+  const info = await api<{name:string}>('/api/info');
+  if (disposed) return;
+  hostName.value = info.name;
+  if (token()) await refresh(true);
+  if (disposed) return;
+  if (ready.value) openEvents();
+  poll = setInterval(() => {
+   if (token()) {
+    void refresh();
+    if (ready.value) openEvents();
+   }
+  }, 3000);
+ } catch (error) {
+  if (!disposed) bootError.value = (error as Error).message;
+ } finally {
+  if (!disposed) loading.value = false;
+ }
+}
+onMounted(start);
 onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);socket?.close();controller.value?.abort();closePreview();});
 </script>
 
 <template>
- <div v-if="loading || bootError" class="launch"><div class="brand-mark">邻</div><h1>邻传</h1><p v-if="bootError" class="error">启动失败：{{ bootError }}</p><template v-else><LoaderCircle class="spin"/><p>正在准备你的传送空间…</p></template></div>
+ <div v-if="loading || bootError" class="launch"><div class="brand-mark">邻</div><h1>邻传</h1><template v-if="bootError"><p class="error" role="alert">启动失败：{{ bootError }}</p><button class="secondary" @click="start">重试</button></template><template v-else><LoaderCircle class="spin"/><p>正在准备你的传送空间…</p></template></div>
  <main v-else-if="!ready" class="pair-page"><div class="pair-card"><div class="brand-mark">邻</div><div class="eyebrow">LINCHUAN / 邻传</div><h1>连接设备</h1><p>连接 <strong>{{ hostName }}</strong>，传送文字、图片和文件。</p><form @submit.prevent="pair"><label>你的设备名称<input v-model="name" required maxlength="64" placeholder="例如：小林的手机" autocomplete="nickname"/></label><label>六位配对码<input v-model="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="查看对方应用中的配对码" autocomplete="off"/></label><p v-if="pairError" class="error" role="alert">{{ pairError }}</p><button class="primary wide" :disabled="pairing"><LoaderCircle v-if="pairing" class="spin" :size="18"/><Link v-else :size="18"/>{{ pairing?'正在连接':'连接设备' }}</button></form><div class="privacy-note"><ShieldCheck :size="16"/>无需账号 · 无云端中转</div><small>仅在可信局域网使用 · HTTP 传输</small></div></main>
  <div v-else class="app-shell" :inert="!!modalKind">
   <aside class="sidebar">

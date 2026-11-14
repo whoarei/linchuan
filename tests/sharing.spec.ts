@@ -79,3 +79,63 @@ test('UTF-8 limit blocks oversized text before creating a draft or uploading fil
  await expect(send).toBeEnabled();
  await expect(textarea).toHaveAttribute('aria-invalid', 'false');
 });
+
+test('startup failure offers a compact retry and recovers without reloading', async ({ page }) => {
+ const b = await boot();
+ let fail = true;
+ await page.route('**/api/info', route => fail
+  ? route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: '暂时无法连接' }) })
+  : route.continue());
+ await page.goto(b.address);
+ await expect(page.getByRole('alert')).toContainText('暂时无法连接');
+ fail = false;
+ await page.getByRole('button', { name: '重试', exact: true }).click();
+ await expect(page.getByRole('heading', { name: '连接设备', exact: true })).toBeVisible();
+ await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('initial authenticated state failure is retryable rather than a false pairing screen', async ({ browser }) => {
+ const b = await boot();
+ const context = await browser.newContext();
+ await context.addInitScript(token => sessionStorage.setItem('linchuan-token', token), b.token);
+ const page = await context.newPage();
+ let fail = true;
+ await page.route('**/api/state', route => fail
+  ? route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: '设备暂时不可用' }) })
+  : route.continue());
+ await page.goto(b.address);
+ await expect(page.getByRole('alert')).toContainText('设备暂时不可用');
+ fail = false;
+ await page.getByRole('button', { name: '重试', exact: true }).click();
+ await expect(page.getByRole('heading', { name: '发送内容', exact: true })).toBeVisible();
+ await context.close();
+});
+
+test('stalled startup times out and retry starts a fresh request', async ({ page }) => {
+ const b = await boot();
+ await page.clock.install();
+ await page.route('**/api/info', () => { /* Simulate a peer that never replies. */ });
+ const request = page.waitForRequest('**/api/info');
+ await page.goto(b.address);
+ await request;
+ await page.clock.fastForward(15_001);
+ await expect(page.getByRole('alert')).toContainText('连接超时');
+ await page.unroute('**/api/info');
+ await page.getByRole('button', { name: '重试', exact: true }).click();
+ await expect(page.getByRole('heading', { name: '连接设备', exact: true })).toBeVisible();
+});
+
+test('a stalled refresh releases its lock and a later poll restores connection', async ({ browser }) => {
+ const host = await owner(browser);
+ await host.page.clock.install();
+ await host.page.route('**/api/state', () => {});
+ const stalled = host.page.waitForRequest('**/api/state');
+ await host.page.clock.fastForward(3_001);
+ await stalled;
+ await host.page.clock.fastForward(15_001);
+ await expect(host.page.getByText('连接中断，正在重试', { exact: true })).toBeVisible();
+ await host.page.unroute('**/api/state');
+ await host.page.clock.fastForward(3_001);
+ await expect(host.page.getByText('局域网已连接', { exact: true })).toBeVisible();
+ await host.context.close();
+});
