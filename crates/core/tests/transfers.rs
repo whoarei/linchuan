@@ -473,3 +473,34 @@ async fn multiple_browser_recipients_have_independent_decisions() {
         .collect();
     assert!(statuses.contains(&"completed") && statuses.contains(&"rejected"));
 }
+
+#[tokio::test]
+async fn startup_preserves_live_workspace_and_removes_stale_workspace() {
+    let dir = TempDir::new().unwrap();
+    let options = || {
+        let mut options = Options::new(dir.path().to_path_buf());
+        options.discovery = false;
+        options
+    };
+    let first = App::start(options()).await.unwrap();
+    let temporary = dir.path().join("temporary");
+    let live = std::fs::read_dir(&temporary)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let live_payload = live.join("live-payload");
+    std::fs::write(&live_payload, b"keep this").unwrap();
+    let stale = temporary.join("stale-run");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join(".active"), b"").unwrap();
+    std::fs::write(stale.join("old-payload"), b"remove this").unwrap();
+
+    let second = App::start(options()).await.unwrap();
+
+    assert_eq!(std::fs::read(live_payload).unwrap(), b"keep this");
+    assert!(!stale.exists(), "reclaim the unlocked workspace");
+    first.stop();
+    second.stop();
+}

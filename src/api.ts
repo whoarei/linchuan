@@ -1,11 +1,12 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { withDeadline, RequestTimeoutError } from './request';
 export const native = isTauri();
 let base = native ? '' : window.location.origin;
 let credential = native ? '' : sessionStorage.getItem('linchuan-token') || '';
 export let pairingCode = '';
 export async function bootstrap() {
   if (native) {
-    const result = await invoke<{address:string;token:string;pairing_code:string}>('bootstrap');
+    const result = await withDeadline(() => invoke<{address:string;token:string;pairing_code:string}>('bootstrap'));
     base = result.address; credential = result.token; pairingCode = result.pairing_code;
   }
 }
@@ -15,9 +16,30 @@ export function setToken(value:string) { credential=value; sessionStorage.setIte
 export function forget() { credential=''; sessionStorage.removeItem('linchuan-token'); }
 export class ApiError extends Error { constructor(message:string,public status:number) {super(message);} }
 export async function api<T = any>(path:string, body?:unknown):Promise<T> {
-  const response=await fetch(base+path,{method:body===undefined?'GET':'POST',headers:{...(credential?{Authorization:`Bearer ${credential}`} : {}),...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});
-  if(!response.ok){const value=await response.json().catch(()=>({error:'请求失败，请检查连接'}));throw new ApiError(value.error||'请求失败',response.status);}
-  return response.json();
+  try {
+    return await withDeadline(async signal => {
+      const response = await fetch(base + path, {
+        signal,
+        method: body === undefined ? 'GET' : 'POST',
+        headers: {
+          ...(credential ? { Authorization: `Bearer ${credential}` } : {}),
+          ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const value = await response.json().catch(() => ({ error: '请求失败，请检查连接' }));
+        throw new ApiError(value.error || '请求失败', response.status);
+      }
+      return await response.json();
+    });
+  } catch (error) {
+    if (error instanceof RequestTimeoutError && body !== undefined) {
+      // A timed-out write may have reached the server. Never retry it automatically.
+      throw new Error('请求超时，操作结果尚未确认。请先查看当前状态，勿重复提交。');
+    }
+    throw error;
+  }
 }
 export function upload(path:string,file:File,onProgress:(bytes:number)=>void,signal:AbortSignal):Promise<void>{
   return new Promise((resolve,reject)=>{
