@@ -335,6 +335,21 @@ async fn multiple_files_unicode_names_binary_integrity_and_one_use_download() {
 #[tokio::test]
 async fn unsafe_paths_limits_partial_upload_and_premature_completion() {
     let host = Host::new("测试").await;
+    let id = "abcdef12-3456-4789-abcd-0123456789ab";
+    for files in [
+        json!([{"id":id.to_uppercase(),"name":"uppercase.txt","size":0,"mime":""}]),
+        json!([{"id":id,"name":"first.txt","size":0,"mime":""},{"id":id.to_uppercase(),"name":"second.txt","size":0,"mime":""}]),
+    ] {
+        assert_eq!(
+            host.post(
+                "/api/peer/offer",
+                json!({"protocol":1,"sender_name":"对端","text":"","files":files})
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
     for name in ["../escape", "/etc/passwd", "a\\b", "C:escape", ".."] {
         assert_eq!(
             host.post("/api/drafts", json!({"files":[{"name":name,"size":1}]}))

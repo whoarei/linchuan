@@ -35,6 +35,9 @@
               "allow": [
                 {
                   "url": "http://127.0.0.1:*/download/*"
+                },
+                {
+                  "url": "https://github.com/whoarei/linchuan"
                 }
               ]
             }

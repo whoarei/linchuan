@@ -203,6 +203,8 @@ conversation_id TEXT PRIMARY KEY REFERENCES conversations、text TEXT、updated_
 
 基础直接传输协议保持兼容 0.1 的 protocol=1；通过 capabilities 识别 signed-offers-v1、groups-v1。新增字段包括稳定 message_id、sender_id、宿主身份、公钥及签名。群接口使用明确的群协议版本。
 
+签名输入为 host_id、public_key、payload 组成的 JSON 对象：递归按键名字典序排序、数组顺序不变、UTF-8、紧凑无额外空白，避免原生构建依赖特性改变序列化结果。签名覆盖正文与附件清单等协议元数据，不覆盖文件二进制内容。
+
 每个宿主拥有本机 Ed25519 密钥；签名绑定发送身份、宿主身份、目标身份、消息及群资料。群主签名单独定义邀请名单，成员签名单独定义自己的加入/退出，避免共享一个群口令就能替他人退群。首次邀请仍需人确认；未加密的 HTTP 和首次信任不能宣称防止所有局域网中间人攻击。
 
 浏览器成员由宿主代理传输，退出宿主后暂不可达；其他原生成员仍可直接互传。群成员持久化名单，发送时按稳定 host_device_id 查找本次发现的随机端口，不能依赖创建群时的旧端口。

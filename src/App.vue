@@ -755,6 +755,19 @@ async function clearFiles() {
     modalBusy.value = false;
   }
 }
+async function openProject() {
+  const url = "https://github.com/whoarei/linchuan";
+  try {
+    if (native) {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } else {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
 async function disconnect() {
   try {
     await api("/api/session/logout", {});
@@ -1417,6 +1430,7 @@ onUnmounted(() => {
       </p>
       <a
         href="https://github.com/whoarei/linchuan"
+        @click.prevent="openProject"
         target="_blank"
         rel="noreferrer"
         >GitHub 项目<ArrowUpRight :size="14"

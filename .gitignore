@@ -16,3 +16,10 @@ src-tauri/gen/android/local.properties
 src-tauri/gen/android/app/src/main/jniLibs/
 
 src-tauri/gen/schemas/
+
+# Local app data contains identity and pairing credentials.
+linchuan.db*
+ready.json
+device.json
+/temporary/
+/files/

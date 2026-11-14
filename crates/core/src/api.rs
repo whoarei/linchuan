@@ -888,7 +888,11 @@ async fn peer_offer(
     let total = validate_files(&input)?;
     let mut file_ids = std::collections::HashSet::new();
     if offer.files.iter().any(|f| {
-        f.id.len() != 36 || uuid::Uuid::parse_str(&f.id).is_err() || !file_ids.insert(&f.id)
+        f.id.len() != 36
+            || uuid::Uuid::parse_str(&f.id)
+                .ok()
+                .is_none_or(|id| id.to_string() != f.id)
+            || !file_ids.insert(&f.id)
     }) {
         return Err(Error::bad("文件标识无效"));
     }
