@@ -26,6 +26,11 @@ jobs:
           shared-key: verify
       - run: npm ci
       - run: npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install cryptography
+      - run: python3 scripts/test_updates.py
       - run: cargo fmt --all -- --check
       - run: cargo clippy -p linchuan-core --all-targets -- -D warnings
       - run: cargo test -p linchuan-core --locked

@@ -6,6 +6,35 @@ fn desktop_window_controls() -> bool {
     cfg!(any(target_os = "windows", target_os = "linux"))
 }
 #[tauri::command]
+async fn check_release(
+    app: tauri::AppHandle,
+) -> Result<linchuan_core::updates::ReleaseInfo, String> {
+    use linchuan_core::updates::Package;
+    let package = if cfg!(target_os = "android") {
+        Package::Android
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Package::Windows
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        match tauri::utils::platform::bundle_type() {
+            Some(tauri::utils::config::BundleType::AppImage) => Package::AppImage,
+            Some(tauri::utils::config::BundleType::Deb) => Package::Deb,
+            _ => Package::Manual,
+        }
+    } else {
+        Package::Manual
+    };
+    linchuan_core::updates::check(&app.package_info().version.to_string(), package).await
+}
+#[tauri::command]
+async fn prepare_update(state: State<'_, Runtime>) -> Result<(), String> {
+    if let Some(core) = state.0.get() {
+        if core.has_active_work().await {
+            return Err("有文件正在准备或传输，请完成后再安装更新".into());
+        }
+    }
+    Ok(())
+}
+#[tauri::command]
 async fn bootstrap(state: State<'_, Runtime>, app: tauri::AppHandle) -> Result<Bootstrap, String> {
     let core = state
         .0
@@ -29,9 +58,18 @@ pub fn run() {
             let _ = window.set_focus();
         }
     }));
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
     builder
         .manage(Runtime(tokio::sync::OnceCell::new()))
-        .invoke_handler(tauri::generate_handler![bootstrap, desktop_window_controls])
+        .invoke_handler(tauri::generate_handler![
+            bootstrap,
+            desktop_window_controls,
+            check_release,
+            prepare_update
+        ])
         .build(tauri::generate_context!())
         .expect("邻传启动失败")
         .run(|app, event| {

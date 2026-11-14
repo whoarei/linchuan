@@ -8,6 +8,8 @@ test-results/
 .env
 *.keystore
 *.jks
+*.key
+__pycache__/
 src-tauri/gen/android/.gradle/
 src-tauri/gen/android/.idea/
 src-tauri/gen/android/app/build/

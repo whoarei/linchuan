@@ -19,6 +19,7 @@ mime_guess = "2"
 rust-embed = "8"
 url = "2"
 anyhow = "1"
+semver = "1"
 
 rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"

@@ -31,9 +31,11 @@ import {
   Wifi,
   X,
   Globe,
+  RefreshCw,
 } from "lucide-vue-next";
 import QRCode from "qrcode";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
+import { useUpdates } from "./useUpdates";
 import {
   browserIdentity,
   rememberBrowserName,
@@ -65,6 +67,16 @@ import type {
 
 type Mode = "devices" | "settings" | "about";
 const downloadsUrl = "https://github.com/whoarei/linchuan/releases/latest";
+const {
+  state: updateState,
+  busy: updateBusy,
+  message: updateMessage,
+  checkForUpdate,
+  downloadUpdate,
+  installUpdate,
+  restartAfterUpdate,
+  openUpdatePage,
+} = useUpdates();
 const state = ref<AppState>();
 const loading = ref(true);
 const bootError = ref("");
@@ -1473,6 +1485,72 @@ onUnmounted(() => {
       <div class="brand-icon">邻</div>
       <h1>邻传 · Linchuan</h1>
       <span class="version-label">{{ state!.info.version }}</span>
+      <section v-if="native" class="app-updates" aria-label="应用更新">
+        <div class="update-heading">
+          <b>版本更新</b>
+          <button
+            class="secondary"
+            :disabled="updateBusy || updateState.phase === 'installed'"
+            @click="checkForUpdate"
+          >
+            <RefreshCw
+              :size="14"
+              :class="{ spin: updateState.phase === 'checking' }"
+            />检查更新
+          </button>
+        </div>
+        <p role="status" aria-live="polite">{{ updateMessage }}</p>
+        <p v-if="updateState.error" class="error" role="alert">
+          {{ updateState.error }}
+        </p>
+        <progress
+          v-if="updateState.phase === 'downloading'"
+          :max="updateState.total || 1"
+          :value="updateState.total ? updateState.downloaded : undefined"
+          aria-label="更新下载进度"
+        />
+        <details v-if="updateState.info?.available && updateState.info.notes">
+          <summary>更新内容</summary>
+          <pre>{{ updateState.info.notes }}</pre>
+        </details>
+        <div v-if="updateState.info?.available" class="update-actions">
+          <button
+            v-if="updateState.phase === 'available' && updateState.inApp"
+            class="primary"
+            @click="downloadUpdate"
+          >
+            <Download :size="15" />下载更新
+          </button>
+          <button
+            v-else-if="updateState.phase === 'available'"
+            class="primary"
+            @click="openUpdatePage(true)"
+          >
+            <Download :size="15" />下载新版安装包
+          </button>
+          <button
+            v-if="updateState.phase === 'ready'"
+            class="primary"
+            @click="installUpdate"
+          >
+            安装并重启
+          </button>
+          <button
+            v-if="updateState.phase === 'installed'"
+            class="primary"
+            @click="restartAfterUpdate"
+          >
+            重启应用
+          </button>
+          <button
+            v-if="!updateBusy"
+            class="text-button"
+            @click="openUpdatePage(false)"
+          >
+            查看发布页<ArrowUpRight :size="13" />
+          </button>
+        </div>
+      </section>
       <p>同一网络，随手互传。</p>
       <div class="about-facts">
         <div>

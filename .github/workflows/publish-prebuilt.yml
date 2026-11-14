@@ -30,6 +30,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - run: python3 -m pip install cryptography
       - name: Verify source build
         run: |
           test "$(gh run view "$BUILD_RUN" --json conclusion --jq .conclusion)" = success
@@ -78,6 +79,7 @@ jobs:
           shutil.copy2(apk,pathlib.Path('release')/apk.name)
           print('APK release signature and 16 KiB ZIP alignment verified')
           PY
+          python3 scripts/updates.py verify release --tag "$TAG" --metadata signed
           python3 scripts/checksums.py release
           cmp release/SHA256SUMS signed/SHA256SUMS
       - name: Upload installers and publish
@@ -98,10 +100,10 @@ jobs:
           assert not release['draft'] and not release['prerelease']
           assets={a['name']:a for a in release['assets']}
           files=list(pathlib.Path('release').iterdir())
-          assert len(files)==5 and set(assets)=={p.name for p in files}
+          assert len(files)==9 and set(assets)=={p.name for p in files}
           for file in files:
               assert assets[file.name]['size']==file.stat().st_size
               expected='sha256:'+hashlib.file_digest(file.open('rb'),'sha256').hexdigest()
               if assets[file.name].get('digest'): assert assets[file.name]['digest']==expected
-          print('Published four installers and SHA256SUMS:',release['html_url'])
+          print('Published four installers, three update signatures, latest.json and SHA256SUMS:',release['html_url'])
           PY

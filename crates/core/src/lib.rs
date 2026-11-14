@@ -7,6 +7,7 @@ mod model;
 mod names;
 mod store;
 mod transport;
+pub mod updates;
 use model::*;
 pub use model::{Bootstrap, Info, VERSION};
 use std::{
@@ -15,6 +16,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, Mutex, Semaphore};
+const MAX_STREAMS: usize = 8;
 
 pub struct Options {
     pub directory: PathBuf,
@@ -140,7 +142,7 @@ impl App {
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
                 .build()?,
-            streams: Semaphore::new(8),
+            streams: Semaphore::new(MAX_STREAMS),
             mdns: std::sync::Mutex::new(None),
             stop,
         }));
@@ -314,6 +316,13 @@ impl App {
                 let _ = daemon.shutdown();
             }
         }
+    }
+    pub async fn has_active_work(&self) -> bool {
+        let state = self.0.state.lock().await;
+        self.0.streams.available_permits() < MAX_STREAMS
+            || state.transfers.values().any(|transfer| {
+                matches!(transfer.view.status.as_str(), "accepted" | "transferring")
+            })
     }
     fn notify(&self) {
         let _ = self.0.events.send(());

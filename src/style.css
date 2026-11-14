@@ -971,8 +971,16 @@ progress::-webkit-progress-value {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   text-align: center;
+}
+.about-page::before,
+.about-page::after {
+  content: "";
+  flex: 1 0 0;
+}
+.about-page > * {
+  flex-shrink: 0;
 }
 .about-page > .brand-icon {
   width: 64px;
@@ -1028,6 +1036,66 @@ progress::-webkit-progress-value {
   justify-content: center;
   flex-wrap: wrap;
   gap: 20px;
+}
+.app-updates {
+  text-align: left;
+  width: min(420px, 100%);
+  margin-top: 20px;
+  padding: 16px 18px;
+  border: 1px solid #e5eaf4;
+  border-radius: 12px;
+  background: #fff;
+  font-size: 12px;
+}
+.update-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.update-heading b {
+  font-weight: 500;
+}
+.update-heading button {
+  padding: 7px 10px;
+  font-size: 11px;
+}
+.app-updates > p {
+  margin-top: 12px;
+  color: #7c8aa4;
+  line-height: 1.7;
+}
+.app-updates progress {
+  display: block;
+  width: 100%;
+  margin-top: 12px;
+}
+.app-updates details {
+  margin-top: 12px;
+  color: #7c8aa4;
+}
+.app-updates summary {
+  cursor: pointer;
+}
+.app-updates pre {
+  max-height: 140px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  line-height: 1.8;
+  margin: 10px 0 0;
+}
+.update-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 14px;
+}
+.update-actions .primary {
+  padding: 8px 12px;
+  font-size: 11px;
 }
 .about-links a {
   font-size: 11px;

@@ -11,6 +11,88 @@ struct Host {
     token: String,
     code: String,
 }
+
+#[tokio::test]
+async fn updater_preflight_detects_incoming_transfer_and_file_preparation() {
+    let host = Host::new("更新检查").await;
+    assert!(!host.app.has_active_work().await);
+    let offer = host.post("/api/peer/offer", json!({"protocol":1,"sender_name":"外部设备","text":"","files":[{"id":uuid::Uuid::new_v4().to_string(),"name":"file.txt","size":1,"mime":"text/plain"}]})).await.json::<Value>().await.unwrap();
+    let id = offer["id"].as_str().unwrap();
+    assert!(!host.app.has_active_work().await);
+    assert_eq!(
+        host.post(
+            &format!("/api/transfers/{id}/decision"),
+            json!({"accept":true})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(host.app.has_active_work().await);
+    assert_eq!(
+        host.post(&format!("/api/transfers/{id}/cancel"), json!({}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(!host.app.has_active_work().await);
+    let draft = host
+        .draft(json!([{"name":"draft.txt","size":2,"mime":"text/plain"}]))
+        .await;
+    assert!(
+        !host.app.has_active_work().await,
+        "An idle draft must not block updates"
+    );
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        receiver,
+        |mut receiver| async {
+            receiver
+                .recv()
+                .await
+                .map(|chunk| (Ok::<_, std::io::Error>(chunk), receiver))
+        },
+    ));
+    let url = format!(
+        "{}/api/drafts/{}/files/{}",
+        host.url,
+        draft["id"].as_str().unwrap(),
+        draft["files"][0]["id"].as_str().unwrap()
+    );
+    let token = host.token.clone();
+    let upload = tokio::spawn(async move {
+        Client::new()
+            .put(url)
+            .bearer_auth(token)
+            .body(body)
+            .send()
+            .await
+    });
+    sender.send(vec![b'a']).await.unwrap();
+    for _ in 0..100 {
+        if host.app.has_active_work().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        host.app.has_active_work().await,
+        "An active draft upload must block installation"
+    );
+    upload.abort();
+    let _ = upload.await;
+    drop(sender);
+    for _ in 0..100 {
+        if !host.app.has_active_work().await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !host.app.has_active_work().await,
+        "Cancelled uploads must not leave updates blocked"
+    );
+}
 impl Host {
     async fn new(name: &str) -> Self {
         let dir = TempDir::new().unwrap();

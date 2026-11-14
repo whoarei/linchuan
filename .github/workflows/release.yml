@@ -51,17 +51,30 @@ jobs:
         with:
           packages: platform-tools
           log-accepted-android-sdk-licenses: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install cryptography
       - run: sdkmanager 'build-tools;35.0.0'
       - name: Sign APK and publish
         env:
           GH_TOKEN: ${{ github.token }}
           PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           TAG: ${{ inputs.tag }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           python3 scripts/collect-release.py artifacts release
           APK=$(find android -name '*.apk' | head -n 1)
           "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -f 4 "$APK" "$RUNNER_TEMP/aligned.apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --v4-signing-enabled false --ks "$RUNNER_TEMP/release.keystore" --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out "release/Linchuan_${TAG#v}_android_arm64.apk" "$RUNNER_TEMP/aligned.apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "release/Linchuan_${TAG#v}_android_arm64.apk"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          python3 scripts/updates.py sign release --tag "$TAG"
           python3 scripts/checksums.py release
-          gh release create "$TAG" release/* --verify-tag --title "邻传 $TAG" --notes-file "docs/releases/${TAG#v}.md"
+          gh release create "$TAG" release/* --verify-tag --draft --title "邻传 $TAG" --notes-file "docs/releases/${TAG#v}.md"
+          gh release edit "$TAG" --draft=false --latest

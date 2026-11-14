@@ -37,6 +37,9 @@
                 },
                 {
                   "url": "https://github.com/whoarei/linchuan"
+                },
+                {
+                  "url": "https://github.com/whoarei/linchuan/releases/*"
                 }
               ]
             }
@@ -51,7 +54,11 @@
             "core:window:allow-toggle-maximize",
             "core:window:allow-close",
             "core:window:allow-start-dragging",
-            "core:window:allow-start-resize-dragging"
+            "core:window:allow-start-resize-dragging",
+            "updater:allow-check",
+            "updater:allow-download",
+            "updater:allow-install",
+            "process:allow-restart"
           ]
         }
       ]
@@ -79,6 +86,16 @@
         "languages": ["SimpChinese", "English"],
         "displayLanguageSelector": true
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEEzOTRDRjQ4ODBFOUMxRkQKUldUOXdlbUFTTStVb3p6M21Kb0FQSmZ3OWFpTlYvYmV5SGdDdjlYWk9ndGZrNGhRekFVdW4xQ1UK",
+      "endpoints": [
+        "https://github.com/whoarei/linchuan/releases/latest/download/latest.json"
+      ],
+      "requireSignedVersion": true,
+      "allowDowngrades": false
     }
   }
 }
