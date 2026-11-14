@@ -6,10 +6,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
-import tomllib
+from release_policy import parse_tag, validate_source_version
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -23,9 +22,7 @@ TARGETS = {
 
 
 def version_for(tag):
-    if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag):
-        raise ValueError("Only stable vX.Y.Z tags can publish updates")
-    return tag[1:]
+    return parse_tag(tag).version
 
 
 def installers(root, version):
@@ -34,13 +31,6 @@ def installers(root, version):
 
 def public_key():
     return json.loads((REPO / "src-tauri/tauri.conf.json").read_text())["plugins"]["updater"]["pubkey"]
-
-
-def validate_source_version(version):
-    versions = [json.loads((REPO / name).read_text())["version"] for name in ("package.json", "src-tauri/tauri.conf.json")]
-    versions += [tomllib.loads((REPO / name).read_text())["package"]["version"] for name in ("crates/core/Cargo.toml", "src-tauri/Cargo.toml")]
-    if any(value != version for value in versions):
-        raise ValueError("The release tag, frontend, Tauri configuration and Rust package versions must match")
 
 
 def verify_signature(file, signature, pubkey, version):

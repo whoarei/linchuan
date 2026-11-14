@@ -93,27 +93,26 @@ Windows PowerShell 示例：
 
 完整的三平台发布工作流还需要 `TAURI_SIGNING_PRIVATE_KEY` 和对应的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，用于桌面更新包签名，配置方法见[在线更新](updates.md)。它们与 Android keystore 分开；仅配置 Android Secrets 还不能执行完整的三平台发布。
 
-`Publish verified release` 工作流要求传入成功构建的 run ID 与已有版本 tag，先检查所需 Secrets，再校验 run 的提交 SHA 等于 tag。随后分别执行 Android 签名、APK 证书与对齐验证、桌面更新签名和正式发布。临时 keystore 和中间 APK 在结束或失败时移除。没有 Secrets 时仍可使用预签名流程。
+## CI 与发布
 
-此配置已通过 actionlint、YAML 和 Bash 语法检查，并在本地用临时测试 keystore 执行工作流中的实际签名命令：覆盖默认别名、任意别名、独立 key 密码、密码回退、多 APK 拒绝和临时文件清理。测试仅在临时目录重签公开 APK，原正式版文件未修改。
+当前只保留两个工作流，完整规则见[CI 与 RC 发布](ci-release.md)：
 
-Secrets 填好后，可运行 `Validate signing configuration`，传入 main 分支上由 push 或手动触发且已成功的 `Build and verify` run ID，不接受 PR 构建。默认只用 Android 产物测试签名、别名、密码及对齐；勾选 `check_desktop` 后，会对同一构建的 Windows NSIS、Linux AppImage／DEB 实际签名，并验证版本、更新清单和客户端内置公钥是否匹配。源码、签名脚本和公钥取自该构建的同一提交。任务不上传测试安装包、不发布 Release，也不导出密钥，只有 contents/actions 读取权限，结束或失败时删除临时密钥、测试 APK 和桌面签名目录。
+- `Checks`：main 提交、PR 自动执行；纯文档修改跳过。包含前端、Rust、浏览器与签名／发布策略测试，不构建三平台安装包。
+- `Release`：推送 `vX.Y.Z` 或 `vX.Y.Z-rc.N` 标签触发，也可手动填写已有标签重试。对标签对应的同一提交先执行 Checks，再构建 Android、Linux、Windows，使用 GitHub Secrets 签名、验签并自动发布。
 
-维护者添加的 Android Secrets 已通过[实际 Actions 验证](https://github.com/whoarei/linchuan/actions/runs/43606279174)：以成功构建 43604913154 的 APK 验证密钥、别名、密码、签名和 16 KiB ZIP 对齐，临时文件清理成功。证书名称为 `CN=Pindou`。该任务未发布版本，也未验证桌面更新私钥与内置公钥是否匹配。
-
-桌面更新 Secrets 添加后，[三平台签名验证](https://github.com/whoarei/linchuan/actions/runs/43608444945)使用 main 分支成功构建 43606417234 的四个安装包通过：Android 签名与对齐、三个桌面更新包的实际签名及内置公钥验证、签名版本和更新清单验证。临时文件清理成功，未上传测试包或发布 Release。
+无需填写旧构建编号，不再维护预签名暂存分支或独立签名验证工作流。签名验证已经并入发布步骤；任何检查、构建或验签失败都不会公开该 Release。发布中断可以重试未公开的草稿，已经发布的版本拒绝覆盖。
 
 ## 发布步骤
 
-1. 更新各处版本（`package.json`、两个 Rust crate、`tauri.conf.json`）及锁文件、发布说明。
-2. 等待同一提交的 `Build and verify` 所有 jobs 成功，检查测试报告与原生产物。
-3. 将版本 tag 指向该提交；下载对应 run 的产物，核对来源和文件数量。
-4. 签名并验证 APK；运行 `scripts/collect-release.py` 汇总桌面包，再用 `scripts/updates.py sign` 生成桌面分离签名和 latest.json，最后运行 `scripts/checksums.py`。
-5. 发布 GitHub Release，附四个安装包、三个桌面 `.sig`、latest.json、校验和及对应版本说明；完整上传后再将草稿发布为最新正式版。
-6. 再读取 Release，确认非 draft、版本 tag 正确、安装包齐全。真实设备测试范围应如实记录。
+1. 同步 `package.json`、两个 Rust crate、`tauri.conf.json` 和两个锁文件的版本。RC 统一使用 `X.Y.Z-rc.N`，N 从 1 开始。
+2. 添加 `docs/releases/X.Y.Z.md` 或 `docs/releases/X.Y.Z-rc.N.md`，提交并推送源码。
+3. 为该提交创建版本标签并推送，例如 `v0.4.0-rc.1`。标签会自动触发检查、三平台构建、签名和发布。
+4. 正式版设为 Latest；RC 标记为 Pre-release 且不设 Latest，不影响正式用户的在线更新。
 
-## 已签名产物发布入口
+运行 Release 时只需选择标签；GitHub Actions 会完成四个安装包、三个桌面 `.sig`、`latest.json` 和 `SHA256SUMS` 的上传及回读校验。所有文件完整后自动公开，无需另一次人工批准。
 
-如果工作区凭证在 `uploads.github.com` 返回 401，可使用 `Publish pre-signed release`，让仓库 Actions 的发布权限执行上传。应用源码仍取自版本 tag，并校验其对应构建已全部成功。
+Android 的 CI 版本码和 Debian 的 RC 排序由发布脚本自动处理，规则与边界见[CI 与 RC 发布](ci-release.md)。无需手工修改生成的 `tauri.properties`。
 
-在临时分支放入已经签名的 APK、三个桌面 `.sig`、latest.json、覆盖全部九个文件的 `SHA256SUMS`、`release-notes.md` 和 `source.json`（tag、source_sha、build_run、apk_name、certificate_sha256），传入该分支的不可变提交 SHA。工作流会核对源码、APK 证书与 ZIP 对齐、桌面包签名、更新清单和所有文件摘要，再上传并正式发布。临时分支只包含将公开的产物，私钥继续由维护者私下保管。签名命令和密钥配置见[在线更新](updates.md)。
+## 已有签名验证记录
+
+维护者配置的 Secrets 已通过[三平台实际签名验证](https://github.com/whoarei/linchuan/actions/runs/43608444945)：Android 证书名称为 `CN=Pindou`，APK 签名及 16 KiB 对齐通过；Windows NSIS、Linux AppImage／DEB 的更新签名、版本、清单和客户端内置公钥匹配。该记录来自工作流简化前的验证任务，未发布版本。

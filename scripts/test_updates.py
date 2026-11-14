@@ -70,6 +70,21 @@ class UpdateReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_release(self.root, "v1.2.3", self.public)
 
+    def test_rc_signatures_and_manifest_bind_exact_prerelease_version(self):
+        version = "1.2.3-rc.2"
+        for old, file in zip(installers(self.root, "1.2.3").values(), installers(self.root, version).values()):
+            old.rename(file)
+            Path(str(old) + ".sig").unlink()
+            signature = self.key.sign(hashlib.blake2b(file.read_bytes()).digest())
+            trusted = f"timestamp:1\tfile:{file.name}\tversion:{version}"
+            text = "untrusted comment: test signature\n" + encode(b"ED" + self.key_id + signature) + "\ntrusted comment: " + trusted + "\n" + encode(self.key.sign(signature + trusted.encode())) + "\n"
+            Path(str(file) + ".sig").write_text(encode(text.encode()))
+        (self.root / "latest.json").write_text(json.dumps(manifest(self.root, "v" + version, "RC")))
+        verify_release(self.root, "v" + version, self.public)
+        file = next(iter(installers(self.root, version).values()))
+        with self.assertRaises(ValueError):
+            verify_signature(file, Path(str(file) + ".sig").read_text(), self.public, "1.2.3")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,24 +1,50 @@
-name: Publish verified release
+name: Release
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
-      build_run:
-        description: Successful Build and verify run ID for the exact tagged commit
-        required: true
       tag:
-        description: Existing version tag
-        default: v0.3.0
+        description: Existing version tag, vX.Y.Z or vX.Y.Z-rc.N
         required: true
 permissions:
-  contents: write
-  actions: read
+  contents: read
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 jobs:
-  publish:
-    runs-on: ubuntu-latest
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+      android_code: ${{ steps.version.outputs.android_code }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate tag, source versions and release notes
+        id: version
+        env:
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          python3 scripts/release_policy.py prepare --tag "$TAG" --github-output "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check release availability
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --json isDraft > "$RUNNER_TEMP/existing-release.json" 2>/dev/null; then
+            python3 -c 'import json,os,pathlib; assert json.loads((pathlib.Path(os.environ["RUNNER_TEMP"])/"existing-release.json").read_text())["isDraft"], "This version is already published"'
+          fi
       - name: Check signing configuration
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -33,82 +59,184 @@ jobs:
             fi
           done
           test "$missing" = 0
-      - name: Verify build provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN: ${{ inputs.build_run }}
-        run: |
-          test "$(gh run view "$RUN" --json conclusion --jq .conclusion)" = success
-          test "$(gh run view "$RUN" --json headSha --jq .headSha)" = "$(git rev-parse HEAD)"
-          test "$(gh run view "$RUN" --json workflowName --jq .workflowName)" = 'Build and verify'
-      - uses: actions/download-artifact@v4
+  checks:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.sha }}
+  desktop:
+    needs: [prepare, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            bundles: deb,appimage
+            artifact: release-linux-x64
+          - os: windows-latest
+            bundles: nsis
+            artifact: release-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.build_run }}
-          pattern: '*-x64'
-          path: artifacts
-          merge-multiple: true
-      - name: Decode Android signing key
-        env:
-          KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          umask 077
-          printf '%s' "$KEY" | base64 --decode > "$RUNNER_TEMP/linchuan-release.keystore"
-      - uses: actions/download-artifact@v4
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-node@v4
         with:
-          github-token: ${{ github.token }}
-          run-id: ${{ inputs.build_run }}
-          name: android-arm64-unsigned
-          path: android
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.os }}
+      - name: Install Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential libssl-dev librsvg2-dev patchelf libayatana-appindicator3-dev xvfb dbus-x11
+      - run: npm ci
+      - run: npm run tauri build -- --bundles ${{ matrix.bundles }}
+        env:
+          NO_STRIP: true
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Linux'
+        with:
+          python-version: '3.12'
+      - name: Prepare Debian release version ordering
+        if: runner.os == 'Linux'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 scripts/prepare_deb.py --directory target/release/bundle/deb --version "$VERSION"
+      - name: Smoke test native Linux startup
+        if: runner.os == 'Linux'
+        run: dbus-run-session -- xvfb-run -a python3 scripts/native-smoke.py target/release/linchuan
+        env:
+          WEBKIT_DISABLE_DMABUF_RENDERER: '1'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+  android:
+    needs: [prepare, checks]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
       - uses: android-actions/setup-android@v3
         with:
           packages: platform-tools
           log-accepted-android-sdk-licenses: false
+      - name: Install Android SDK and NDK
+        run: |
+          sdkmanager 'platforms;android-36' 'build-tools;35.0.0' 'ndk;27.2.12479018'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: android-arm64
+      - uses: gradle/actions/setup-gradle@v4
+      - run: npm ci
+      - name: Prepare Android release versionCode
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: python3 scripts/release_policy.py android-config --tag "$TAG" --output "$RUNNER_TEMP/linchuan-android.json"
+      - run: npm run tauri android build -- --apk --target aarch64 --ci --config "$RUNNER_TEMP/linchuan-android.json"
+      - name: Verify Android 16 KiB page alignment
+        run: python3 scripts/check-android-elf.py "$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" target/aarch64-linux-android/release/liblinchuan_lib.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android-arm64
+          path: src-tauri/gen/android/app/build/outputs/apk/**/release/*.apk
+          if-no-files-found: error
+  publish:
+    needs: [prepare, checks, desktop, android]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts
+          merge-multiple: true
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm ci
+          cache: npm
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
+      - run: npm ci
       - run: python3 -m pip install cryptography
-      - run: sdkmanager 'build-tools;35.0.0'
       - name: Collect desktop installers
-        run: python3 scripts/collect-release.py artifacts release
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: python3 scripts/collect-release.py artifacts release --version "$VERSION"
       - name: Sign and verify Android APK
         env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'linchuan' }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/linchuan-release.keystore"
           export KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
-          mapfile -d '' apks < <(find android -type f -name '*.apk' -print0)
+          mapfile -d '' apks < <(find artifacts -type f -name '*.apk' -print0)
           if [ "${#apks[@]}" -ne 1 ]; then
             echo '::error::Expected exactly one Android release APK'
             exit 1
           fi
           build_tools="$ANDROID_HOME/build-tools/35.0.0"
-          output="release/Linchuan_${TAG#v}_android_arm64.apk"
+          output="release/Linchuan_${VERSION}_android_arm64.apk"
           "$build_tools/zipalign" -P 16 -f 4 "${apks[0]}" "$RUNNER_TEMP/linchuan-aligned.apk"
           "$build_tools/apksigner" sign --v4-signing-enabled false --ks "$RUNNER_TEMP/linchuan-release.keystore" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "$output" "$RUNNER_TEMP/linchuan-aligned.apk"
           "$build_tools/apksigner" verify --verbose --print-certs "$output"
           "$build_tools/zipalign" -c -P 16 4 "$output"
+          python3 scripts/release_policy.py verify-apk --tag "$TAG" --apk "$output" --aapt "$build_tools/aapt"
       - name: Sign desktop updates and generate checksums
         env:
-          TAG: ${{ inputs.tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           python3 scripts/updates.py sign release --tag "$TAG"
           python3 scripts/checksums.py release
-      - name: Publish release
+      - name: Publish stable or RC release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag }}
-        run: |
-          gh release create "$TAG" release/* --verify-tag --draft --title "邻传 $TAG" --notes-file "docs/releases/${TAG#v}.md"
-          gh release edit "$TAG" --draft=false --latest
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/publish_release.py --tag "$TAG" --directory release --repository "$REPOSITORY"
       - name: Remove temporary signing files
         if: always()
         run: rm -f "$RUNNER_TEMP/linchuan-release.keystore" "$RUNNER_TEMP/linchuan-aligned.apk"

@@ -25,26 +25,16 @@
 
 正式版共发布九个文件：四个安装包、三个桌面 `.sig` 文件、`latest.json`、`SHA256SUMS`。Tauri v2 直接使用已构建的 NSIS、AppImage、DEB 作为更新包；构建验证无需持有发布私钥。签名使用 `--app-version` 绑定版本，发布前验证完整字节、Minisign 全局签名、版本、公钥、目标类型和下载地址。
 
-离线签名路径适用于当前账号无法配置 GitHub Secrets 的情形。先将同一源代码构建的四个安装包放入 release 目录，再运行：
+发布统一使用 `.github/workflows/release.yml`，由版本标签触发：检查标签与源码／锁文件版本及说明 → 运行 Checks → 三平台构建 → Secrets 签名和验签 → 上传完整产物 → 自动公开 Release。日常 Checks 不打包；旧预签名发布与独立签名验证工作流已移除，完整流程见[CI 与 RC 发布](ci-release.md)。
 
-```sh
-python3 -m pip install cryptography
-python3 scripts/updates.py sign release --tag vX.Y.Z \
-  --key-path /private/path/linchuan-updater.key \
-  --password-file /private/path/password.txt
-python3 scripts/checksums.py release
-```
+Android 必需配置 `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`；`ANDROID_KEY_ALIAS` 默认 `linchuan`，`ANDROID_KEY_PASSWORD` 默认复用 keystore 密码。桌面更新使用 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。详细配置见[开发与发布](development.md)。私钥与密码只经 Secrets 注入签名步骤，临时 keystore 在任务结束或失败时清理，不进入安装包、仓库或发布资产。
 
-tag 必须与当前 package.json 版本一致。签名结果是分离文件，不修改安装包。把三个 `.sig`、`latest.json`、新的 `SHA256SUMS` 与原有签名 APK、source.json、release-notes.md 一起放入发布用的暂存提交。暂存提交不得包含私钥或密码。`publish-prebuilt.yml` 验证构建来源、APK 签名、实际下载到的桌面安装包签名、清单和校验和后，上传完整资产，再把草稿设为最新正式版。
+支持正式版 `vX.Y.Z` 和 RC `vX.Y.Z-rc.N`，均按完整版本绑定桌面签名和生成清单。RC 自动标记 Pre-release 并设置 latest=false；正式版才设为 Latest。客户端继续只检查 GitHub 最新正式版，RC 通过发布页手动下载测试，正式用户不会自动收到 RC；安装 RC 的客户端之后可以更新到对应正式版。
 
-另一条 `release.yml` 路径使用 GitHub Secrets 中的 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 和 Android 签名 Secrets，在发布任务中签名；没有必需密钥时在下载构建产物前报告缺少的 Secret 名称。
-
-Android 必需配置 `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`；`ANDROID_KEY_ALIAS` 可指定你的密钥别名（默认 `linchuan`），`ANDROID_KEY_PASSWORD` 可指定独立的 key 密码（默认复用 keystore 密码）。详细配置及 Base64 转换命令见[开发与发布](development.md)。已接受 Android 后续版本可卸载重装，此流程允许使用新 Android 密钥；这不改变桌面更新签名密钥及客户端内置公钥。
-
-流程独立验证 Android 签名、证书信息、16 KiB ZIP 对齐和桌面更新签名，最后生成校验和并发布；结束或失败后删除临时 keystore 与中间 APK。私钥内容不得放入普通仓库变量、工作流参数、日志或公开构建资产。
+Android 版本码区分不同 RC 和正式版；Debian 包内使用 `X.Y.Z~rc.N` 确保 RC 排在正式版之前，应用显示和更新签名仍使用 `X.Y.Z-rc.N`。已有正式版发布资产不修改。
 
 ## 验证
 
-本地通过前端构建、Rust fmt／clippy、24 项 Rust 测试、15 项 Playwright 流程、6 项发布签名测试，以及 Android arm64 编译检查。测试包含版本的数值比较、预发布／降级过滤、安装包 URL 回退、真实接收任务和实际上传时的安装阻止、取消上传后解除阻止、更新 UI 状态及重启重试、跨页面下载、Android 下载路径、网络失败、错误签名不允许安装，以及离线发布签名、篡改、重放版本、清单地址、目标完整性和发布目录私密文件保护。
+本轮通过前端构建、Rust fmt／clippy、32 项 Rust 测试、21 项 Playwright 流程、19 项 Python 签名与发布策略测试及 actionlint。新增覆盖 RC 精确签名版本、RC 到正式版更新、正式用户不接收 RC、Android 版本码顺序与范围、Debian 原生预发布排序、RC 不设 Latest、上传校验失败不公开、已公开版本不覆盖及远端摘要缺失时下载验算。
 
 发布时对本版实际桌面包使用真实 Tauri signer 签名和验证，公开清单随完整安装包一起上传，不改动旧版发布。Windows／Linux 系统安装和覆盖升级仍需实机验证；浏览器模拟和离线签名验证不能替代真实安装流程。详见[0.3 验证范围](validation-0.3.md)。

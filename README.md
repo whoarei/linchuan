@@ -12,6 +12,8 @@ main 分支已增加[固定接收目录](docs/receive-storage.md)，尚未发布
 
 main 分支同时整理了[浏览器临时会话](docs/browser-sessions.md)：同一浏览器在同一访问地址下复用 24 小时内的有效配对凭证，关页重开或新标签页不会反复创建身份；离线浏览器的传输历史默认收起，空会话不再显示。浏览器与原生客户端保持独立。
 
+[CI 与发布](docs/ci-release.md)已简化为两个流程：日常只做检查和测试，纯文档修改跳过；版本标签触发三平台构建、GitHub Secrets 签名和自动发布。支持 `vX.Y.Z-rc.N` 预发布，RC 不设为 Latest，也不推送给正式版用户。
+
 ![邻传桌面界面](docs/images/desktop.png)
 
 ## 使用

@@ -141,6 +141,20 @@ mod tests {
         assert!(describe("0.2.0", Package::Windows, release("0.3.0-beta.1")).is_err());
     }
     #[test]
+    fn rc_installations_can_upgrade_to_stable_without_receiving_rc_updates() {
+        assert!(
+            describe("0.4.0-rc.2", Package::Windows, release("0.4.0"))
+                .unwrap()
+                .available
+        );
+        assert!(
+            !describe("0.4.0-rc.2", Package::Windows, release("0.3.0"))
+                .unwrap()
+                .available
+        );
+        assert!(describe("0.3.0", Package::Windows, release("0.4.0-rc.1")).is_err());
+    }
+    #[test]
     fn missing_packages_and_untrusted_urls_fall_back_to_the_release_page() {
         let android = describe("0.2.0", Package::Android, release("0.3.0")).unwrap();
         assert!(!android.in_app);
