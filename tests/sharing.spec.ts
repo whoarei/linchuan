@@ -21,3 +21,61 @@ test('mobile browser layout stays within viewport and can receive owner text',as
 test('wrong pairing code shows a clear error',async({page})=>{
  const b=await boot();await page.goto(b.address);await page.getByLabel('你的设备名称').fill('错误配对');await page.getByLabel('六位配对码').fill(b.pairing_code==='000000'?'111111':'000000');await page.getByRole('button',{name:'连接设备',exact:true}).click();await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByRole('heading',{name:'连接设备'})).toBeVisible();
 });
+
+test('mobile browser can disconnect without desktop controls', async ({ browser }) => {
+ const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+ const page = await context.newPage();
+ await pair(page, '断开测试');
+ await page.locator('.mobile-nav').getByRole('button', { name: '断开当前会话' }).click();
+ await expect(page.getByRole('heading', { name: '连接设备', exact: true })).toBeVisible();
+ expect(await page.evaluate(() => sessionStorage.getItem('linchuan-token'))).toBeNull();
+ await context.close();
+});
+
+test('modal traps keyboard focus, closes with Escape, and restores its opener', async ({ browser }) => {
+ const host = await owner(browser);
+ const opener = host.page.getByRole('button', { name: '通过地址连接', exact: true });
+ await opener.click();
+ const dialog = host.page.getByRole('dialog', { name: '通过地址连接' });
+ await expect(dialog).toBeVisible();
+ await expect(dialog.getByLabel('对方设备地址')).toBeFocused();
+ await host.page.keyboard.press('Shift+Tab');
+ await expect(dialog.getByRole('button', { name: '关闭', exact: true })).toBeFocused();
+ await host.page.keyboard.press('Shift+Tab');
+ await expect(dialog.getByRole('button', { name: '连接设备', exact: true })).toBeFocused();
+ await host.page.keyboard.press('Tab');
+ await expect(dialog.getByRole('button', { name: '关闭', exact: true })).toBeFocused();
+ await host.page.keyboard.press('Escape');
+ await expect(dialog).toBeHidden();
+ await expect(opener).toBeFocused();
+ await host.context.close();
+});
+
+test('UTF-8 limit blocks oversized text before creating a draft or uploading files', async ({ page }) => {
+ await pair(page, '文字限制测试');
+ await page.getByRole('button', { name: /测试电脑 Linux/ }).click();
+ await page.locator('input[type=file]').setInputFiles({ name: 'small.txt', mimeType: 'text/plain', buffer: Buffer.from('small') });
+ const drafts: string[] = [];
+ page.on('request', request => {
+  if (request.url().includes('/api/drafts')) drafts.push(request.url());
+ });
+ const textarea = page.getByRole('textbox', { name: '发送文字' });
+ const send = page.getByRole('button', { name: /发送内容 1/ });
+ await textarea.fill('a'.repeat(65_536));
+ await expect(send).toBeEnabled();
+ await textarea.fill('a'.repeat(65_537));
+ await expect(send).toBeDisabled();
+ await expect(textarea).toHaveAttribute('aria-invalid', 'true');
+ await expect(page.getByRole('alert')).toContainText('文件尚未上传');
+ // JS string length is not UTF-8 byte length: each Chinese character is 3 bytes.
+ await textarea.fill('中'.repeat(21_845) + 'a');
+ await expect(send).toBeEnabled();
+ await expect(page.getByRole('alert')).toHaveCount(0);
+ await textarea.fill('中'.repeat(21_846));
+ await expect(send).toBeDisabled();
+ await expect(page.getByRole('alert')).toContainText('65,536');
+ expect(drafts).toEqual([]);
+ await textarea.fill('已缩短');
+ await expect(send).toBeEnabled();
+ await expect(textarea).toHaveAttribute('aria-invalid', 'false');
+});

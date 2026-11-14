@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { ArrowUpRight, ArrowDownLeft, Check, CheckCheck, Clipboard, Download, File, FileImage, Globe, Laptop, Link, LoaderCircle, Monitor, Plus, QrCode, Send, Settings, ShieldCheck, Smartphone, Upload, Wifi, X, Inbox, ArrowLeft, Copy, Radio } from 'lucide-vue-next';
 import QRCode from 'qrcode';
+import { useModalFocus } from './useModalFocus';
 import { api, bootstrap, native, token, setToken, forget, pairingCode, address, upload, ApiError } from './api';
 import type { AppState, FileMeta, Transfer } from './types';
 const state=ref<AppState>();const ready=ref(false);const bootError=ref('');const connected=ref(true);const loading=ref(true);
@@ -15,8 +16,28 @@ const incoming=computed(()=>transfers.value.filter(t=>t.recipient_id===state.val
 const pending=computed(()=>incoming.value.filter(t=>t.status==='pending'));
 const active=computed(()=>transfers.value.filter(t=>!terminal(t.status)));
 const visible=computed(()=>tab.value==='inbox'?incoming.value:transfers.value);
-const canSend=computed(()=>selected.value.length>0&&(text.value.trim().length>0||files.value.length>0)&&!busy.value);
 const textBytes=computed(()=>new TextEncoder().encode(text.value).length);
+const textTooLong = computed(() => textBytes.value > 65_536);
+const canSend = computed(() =>
+ selected.value.length > 0 &&
+ (text.value.trim().length > 0 || files.value.length > 0) &&
+ !busy.value && !textTooLong.value,
+);
+const modalKind = computed(() => connection.value ? 'connection' : manual.value ? 'manual' : editName.value ? 'name' : preview.value ? 'preview' : '');
+const modalContainer = ref<HTMLElement>();
+function closeModal() {
+ connection.value = false;
+ manual.value = false;
+ editName.value = false;
+ closePreview();
+}
+useModalFocus(modalKind, modalContainer, closeModal);
+function disconnect() {
+ forget();
+ ready.value = false;
+ selected.value = [];
+ socket?.close();
+}
 const totalSize=computed(()=>files.value.reduce((sum,file)=>sum+file.size,0));
 let poll:ReturnType<typeof setInterval>;let socket:WebSocket|undefined;let disposed=false;let refreshing=false;
 function notify(message:string,error=false){toast.value=message;toastError.value=error;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',4500);}
@@ -70,7 +91,7 @@ onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);sock
 <template>
  <div v-if="loading || bootError" class="launch"><div class="brand-mark">邻</div><h1>邻传</h1><p v-if="bootError" class="error">启动失败：{{ bootError }}</p><template v-else><LoaderCircle class="spin"/><p>正在准备你的传送空间…</p></template></div>
  <main v-else-if="!ready" class="pair-page"><div class="pair-card"><div class="brand-mark">邻</div><div class="eyebrow">LINCHUAN / 邻传</div><h1>连接设备</h1><p>连接 <strong>{{ hostName }}</strong>，传送文字、图片和文件。</p><form @submit.prevent="pair"><label>你的设备名称<input v-model="name" required maxlength="64" placeholder="例如：小林的手机" autocomplete="nickname"/></label><label>六位配对码<input v-model="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="查看对方应用中的配对码" autocomplete="off"/></label><p v-if="pairError" class="error" role="alert">{{ pairError }}</p><button class="primary wide" :disabled="pairing"><LoaderCircle v-if="pairing" class="spin" :size="18"/><Link v-else :size="18"/>{{ pairing?'正在连接':'连接设备' }}</button></form><div class="privacy-note"><ShieldCheck :size="16"/>无需账号 · 无云端中转</div><small>仅在可信局域网使用 · HTTP 传输</small></div></main>
- <div v-else class="app-shell">
+ <div v-else class="app-shell" :inert="!!modalKind">
   <aside class="sidebar">
    <a class="brand" href="#" @click.prevent="tab='send'"><span class="brand-mark">邻</span><span><b>邻传</b><small>LINCHUAN</small></span><span class="version">0.1</span></a>
    <div class="workspace-label">工作区</div>
@@ -78,7 +99,7 @@ onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);sock
    <div class="device-heading"><span>附近的设备</span><span class="online-dot" title="设备在线"/><span class="device-count">{{ state!.devices.length }}</span></div>
    <div class="device-list"><button v-for="device in state!.devices" :key="device.id" class="device" :class="{selected:selected.includes(device.id)}" @click="toggle(device.id);tab='send'"><span class="device-icon"><Globe v-if="device.kind==='browser'" :size="21"/><Smartphone v-else-if="device.platform==='Android'" :size="21"/><Monitor v-else :size="21"/></span><span class="device-text"><b>{{ device.name }}</b><small>{{ device.platform }}<template v-if="device.kind==='host'"> · 当前连接</template></small></span><span class="selection"><Check v-if="selected.includes(device.id)" :size="13"/></span></button><div v-if="!state!.devices.length" class="device-empty"><Wifi :size="26"/><p>等待附近设备加入</p><small>打开另一台设备上的邻传，或让浏览器访问本机地址。</small></div></div>
    <button class="manual-connect" @click="manual=true"><Plus :size="16"/>通过地址连接</button>
-   <div class="sidebar-bottom"><div class="local-device"><span class="local-avatar"><Laptop :size="20"/></span><span><b>{{ state!.me.name }}</b><small><i/>{{ state!.me.owner?'本机设备':'浏览器会话' }}</small></span><button v-if="state!.me.owner" class="icon-button" title="修改设备名称" @click="newName=state!.me.name;editName=true"><Settings :size="16"/></button></div><button v-if="state!.me.owner" class="connection-button" @click="showConnection"><QrCode :size="17"/>让其他设备连接<ArrowUpRight :size="15"/></button><button v-else class="connection-button" @click="forget();ready=false;socket?.close()"><ArrowLeft :size="16"/>断开当前会话</button></div>
+   <div class="sidebar-bottom"><div class="local-device"><span class="local-avatar"><Laptop :size="20"/></span><span><b>{{ state!.me.name }}</b><small><i/>{{ state!.me.owner?'本机设备':'浏览器会话' }}</small></span><button v-if="state!.me.owner" class="icon-button" title="修改设备名称" @click="newName=state!.me.name;editName=true"><Settings :size="16"/></button></div><button v-if="state!.me.owner" class="connection-button" @click="showConnection"><QrCode :size="17"/>让其他设备连接<ArrowUpRight :size="15"/></button><button v-else class="connection-button" @click="disconnect"><ArrowLeft :size="16"/>断开当前会话</button></div>
   </aside>
   <section class="main-panel">
    <header class="topbar"><div class="breadcrumb">我的空间<span>/</span><b>{{ tab==='send'?'发送内容':tab==='inbox'?'收件箱':'传输记录' }}</b></div><div class="network-status" :class="{offline:!connected}"><span class="online-dot"/>{{ connected?'局域网已连接':'连接中断，正在重试' }}</div></header>
@@ -87,15 +108,16 @@ onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);sock
      <div class="page-heading"><h1>发送内容</h1><p>选择附近设备，发送文字、图片或文件。</p></div>
      <div v-if="pending.length" class="incoming-banner" @click="tab='inbox'" role="button" tabindex="0" @keydown.enter="tab='inbox'"><Inbox :size="20"/><span>你有 <b>{{ pending.length }}</b> 个待接收请求</span><ArrowUpRight :size="18"/></div>
      <div class="compose-card">
-      <div class="compose-top"><span class="step-label"><span>01</span>添加想发送的内容</span><span class="muted small">文字 / 图片 / 文件</span></div>
-      <textarea v-model="text" aria-label="发送文字" placeholder="写点什么，或粘贴一段文字、网址…" :disabled="busy" @paste="paste"/>
+      <div class="compose-top"><span class="step-label">添加内容</span></div>
+      <textarea v-model="text" aria-label="发送文字" :aria-invalid="textTooLong" :aria-describedby="textTooLong ? 'text-limit-error' : undefined" placeholder="写点什么，或粘贴一段文字、网址…" :disabled="busy" @paste="paste"/>
+      <p v-if="textTooLong" id="text-limit-error" class="error text-limit-error" role="alert">文字超过 65,536 字节，请缩短后再发送。文件尚未上传。</p>
       <div class="drop-zone" :class="{dragging}" @dragover.prevent="dragging=true" @dragleave.prevent="dragging=false" @drop="drop" @paste="paste"><span class="upload-icon"><Upload :size="23"/></span><div><b>把文件拖到这里，或 <button class="text-button" :disabled="busy" @click="fileInput?.click()">选择文件</button></b><p>支持多文件、原图，也可以直接粘贴截图</p></div><span class="file-limit">单文件 ≤ 2 GiB</span><input ref="fileInput" type="file" multiple hidden :disabled="busy" @change="fileChange"/></div>
       <div v-if="files.length" class="selected-files"><div v-for="(file,index) in files" :key="index" class="file-row"><FileImage v-if="file.type.startsWith('image/')" :size="19"/><File v-else :size="19"/><span>{{ file.name }}<small>{{ size(file.size) }}</small></span><button :disabled="busy" class="icon-button" :aria-label="`移除 ${file.name}`" @click="files.splice(index,1)"><X :size="16"/></button></div></div>
       <div class="compose-bottom"><span><Clipboard :size="14"/>内容只在你的局域网内传输</span><span v-if="files.length">{{ files.length }} 个文件 · {{ size(totalSize) }}</span><span v-else>{{ textBytes.toLocaleString() }} / 65,536 字节</span></div>
      </div>
-     <div class="recipient-card"><div class="recipient-info"><span class="step-label"><span>02</span>发送给谁</span><p v-if="selected.length">已选择 {{ selected.length }} 台设备 · 每位接收者独立确认</p><p v-else>从{{ state!.devices.length?'设备列表':'附近设备列表' }}中选择一台或多台设备</p></div><div class="recipient-chips"><button v-for="id in selected" :key="id" @click="toggle(id)">{{ state!.devices.find(d=>d.id===id)?.name }}<X :size="12"/></button><span v-if="!selected.length" class="muted small">尚未选择</span></div></div>
+     <div class="recipient-card"><div class="recipient-info"><span class="step-label">发送给谁</span><p v-if="selected.length">已选择 {{ selected.length }} 台设备 · 每位接收者独立确认</p><p v-else>从{{ state!.devices.length?'设备列表':'附近设备列表' }}中选择一台或多台设备</p></div><div class="recipient-chips"><button v-for="id in selected" :key="id" @click="toggle(id)">{{ state!.devices.find(d=>d.id===id)?.name }}<X :size="12"/></button><span v-if="!selected.length" class="muted small">尚未选择</span></div></div>
      <div v-if="busy" class="upload-progress"><div><span>正在准备文件… {{ size(uploaded) }} / {{ size(uploadTotal) }}</span><button class="text-button" @click="controller?.abort()">取消上传</button></div><progress :max="uploadTotal||1" :value="uploaded"/></div>
-     <div class="send-actions"><div class="hint"><ShieldCheck :size="18"/><span>无需账号，无云端中转。<small>应用与浏览器均可连接。</small></span></div><button class="primary send-button" :disabled="!canSend" @click="send"><LoaderCircle v-if="busy" class="spin" :size="18"/><Send v-else :size="18"/>{{ busy?'正在准备':'发送内容' }}<span v-if="selected.length&&!busy">{{ selected.length }}</span></button></div>
+     <div class="send-actions"><button class="primary send-button" :disabled="!canSend" @click="send"><LoaderCircle v-if="busy" class="spin" :size="18"/><Send v-else :size="18"/>{{ busy?'正在准备':'发送内容' }}<span v-if="selected.length&&!busy">{{ selected.length }}</span></button></div>
 
     </template>
     <template v-else>
@@ -111,13 +133,13 @@ onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);sock
     <footer><span>邻传 · Linchuan 0.1.0</span><span>局域网传输</span></footer>
    </div>
   </section>
-  <nav class="mobile-nav"><button :class="{current:tab==='send'}" @click="tab='send'"><Send :size="20"/>发送</button><button :class="{current:tab==='inbox'}" @click="tab='inbox'"><Inbox :size="20"/>收件箱 {{ pending.length||'' }}</button><button :class="{current:tab==='history'}" @click="tab='history'"><Radio :size="20"/>记录</button><button v-if="state!.me.owner" @click="showConnection"><QrCode :size="20"/>连接</button></nav>
+  <nav class="mobile-nav"><button :class="{current:tab==='send'}" @click="tab='send'"><Send :size="20"/>发送</button><button :class="{current:tab==='inbox'}" @click="tab='inbox'"><Inbox :size="20"/>收件箱 {{ pending.length||'' }}</button><button :class="{current:tab==='history'}" @click="tab='history'"><Radio :size="20"/>记录</button><button v-if="state!.me.owner" @click="showConnection"><QrCode :size="20"/>连接</button><button v-else aria-label="断开当前会话" @click="disconnect"><ArrowLeft :size="20"/>断开</button></nav>
  </div>
  <div v-if="toast" class="toast" :class="{error:toastError}" role="status"><X v-if="toastError" :size="18"/><Check v-else :size="18"/>{{ toast }}</div>
- <div v-if="connection||manual||editName||preview" class="modal-backdrop" @click.self="connection=false;manual=false;editName=false;closePreview()">
-  <section v-if="connection" class="modal connection-modal"><button class="modal-close icon-button" aria-label="关闭" @click="connection=false"><X :size="20"/></button><div class="modal-icon"><QrCode :size="25"/></div><h2>连接其他设备</h2><p>另一台设备打开浏览器，扫码或输入下方地址。</p><div class="connection-device-name"><span>{{ state?.me.name }}</span><button class="text-button" @click="newName=state!.me.name;connection=false;editName=true">修改名称</button></div><img :src="qr" alt="本机浏览器访问二维码" class="qr-image"/><select v-if="(state?.info.addresses.length||0)>1" v-model="shareAddress" aria-label="选择网络地址" @change="changeAddress"><option v-for="item in state?.info.addresses" :key="item">{{ item }}</option></select><button class="address-copy" @click="copy(shareAddress)"><span>{{ shareAddress }}</span><Copy :size="16"/></button><div class="pairing-code"><span>本次配对码</span><b>{{ pairingCode }}</b><small>仅分享给你希望连接的人</small></div><div class="notice">保持应用运行。仅在可信局域网使用，首版采用 HTTP 传输。</div></section>
-  <section v-else-if="manual" class="modal"><button class="modal-close icon-button" aria-label="关闭" @click="manual=false"><X :size="20"/></button><div class="modal-icon"><Link :size="24"/></div><h2>通过地址连接</h2><p>在对方应用的连接面板中找到完整访问地址。</p><form @submit.prevent="connectPeer"><label>对方设备地址<input v-model="manualAddress" required placeholder="http://192.168.1.20:52783" type="url"/></label><button class="primary wide" :disabled="manualBusy"><LoaderCircle v-if="manualBusy" class="spin" :size="18"/>{{ manualBusy?'正在连接':'连接设备' }}</button></form></section>
-  <section v-else-if="editName" class="modal"><button class="modal-close icon-button" aria-label="关闭" @click="editName=false"><X :size="20"/></button><h2>给设备起个名字</h2><p>设备名称会显示在附近设备列表中。</p><form @submit.prevent="saveName"><label>设备名称<input v-model="newName" required maxlength="64"/></label><button class="primary wide">保存名称</button></form></section>
-  <section v-else-if="preview" class="modal image-modal"><button class="modal-close icon-button" aria-label="关闭" @click="closePreview"><X :size="20"/></button><h3>{{ preview.name }}</h3><img :src="preview.url" :alt="preview.name"/></section>
+ <div v-if="modalKind" ref="modalContainer" class="modal-backdrop" tabindex="-1" @click.self="closeModal">
+  <section v-if="connection" class="modal connection-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="modal-close icon-button" aria-label="关闭" @click="connection=false"><X :size="20"/></button><div class="modal-icon"><QrCode :size="25"/></div><h2 id="modal-title">连接其他设备</h2><p>另一台设备打开浏览器，扫码或输入下方地址。</p><div class="connection-device-name"><span>{{ state?.me.name }}</span><button class="text-button" @click="newName=state!.me.name;connection=false;editName=true">修改名称</button></div><img :src="qr" alt="本机浏览器访问二维码" class="qr-image"/><select v-if="(state?.info.addresses.length||0)>1" v-model="shareAddress" aria-label="选择网络地址" @change="changeAddress"><option v-for="item in state?.info.addresses" :key="item">{{ item }}</option></select><button class="address-copy" @click="copy(shareAddress)"><span>{{ shareAddress }}</span><Copy :size="16"/></button><div class="pairing-code"><span>本次配对码</span><b>{{ pairingCode }}</b><small>仅分享给你希望连接的人</small></div><div class="notice">保持应用运行。仅在可信局域网使用，首版采用 HTTP 传输。</div></section>
+  <section v-else-if="manual" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="modal-close icon-button" aria-label="关闭" @click="manual=false"><X :size="20"/></button><div class="modal-icon"><Link :size="24"/></div><h2 id="modal-title">通过地址连接</h2><p>在对方应用的连接面板中找到完整访问地址。</p><form @submit.prevent="connectPeer"><label>对方设备地址<input v-model="manualAddress" required placeholder="http://192.168.1.20:52783" type="url"/></label><button class="primary wide" :disabled="manualBusy"><LoaderCircle v-if="manualBusy" class="spin" :size="18"/>{{ manualBusy?'正在连接':'连接设备' }}</button></form></section>
+  <section v-else-if="editName" class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="modal-close icon-button" aria-label="关闭" @click="editName=false"><X :size="20"/></button><h2 id="modal-title">给设备起个名字</h2><p>设备名称会显示在附近设备列表中。</p><form @submit.prevent="saveName"><label>设备名称<input v-model="newName" required maxlength="64"/></label><button class="primary wide">保存名称</button></form></section>
+  <section v-else-if="preview" class="modal image-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button class="modal-close icon-button" aria-label="关闭" @click="closePreview"><X :size="20"/></button><h3 id="modal-title">{{ preview.name }}</h3><img :src="preview.url" :alt="preview.name"/></section>
  </div>
 </template>
