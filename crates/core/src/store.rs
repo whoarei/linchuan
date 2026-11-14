@@ -28,11 +28,14 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 1, "数据库版本高于当前程序支持的版本，请升级邻传");
-        if version == 0 {
+        anyhow::ensure!(version <= 2, "数据库版本高于当前程序支持的版本，请升级邻传");
+        if version < 2 {
             let tx = conn.transaction()?;
-            tx.execute_batch(include_str!("../migrations/001_initial.sql"))?;
-            tx.pragma_update(None, "user_version", 1)?;
+            if version == 0 {
+                tx.execute_batch(include_str!("../migrations/001_initial.sql"))?;
+            }
+            tx.execute_batch(include_str!("../migrations/002_received_files.sql"))?;
+            tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {
@@ -128,6 +131,9 @@ impl Store {
                     let blob=identity::token_hash(relative);let availability=if f.complete&&f.path.is_file(){"available"}else{"missing"};
                     tx.execute("INSERT INTO file_blobs VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN file_blobs.state='expired' AND excluded.state='missing' THEN 'expired' ELSE excluded.state END",params![blob,relative,f.meta.size,availability,now_ms()])?;
                     tx.execute("INSERT INTO delivery_files VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET complete=excluded.complete",params![v.id,f.meta.id,blob,f.complete])?;
+                    if v.status == "completed" && f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d| d.kind == "local") {
+                        tx.execute("INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) SELECT ?1,?2,?3,?4,'pending',?5 WHERE EXISTS(SELECT 1 FROM app_settings WHERE key='receive_directory') AND (SELECT received_at FROM messages WHERE id=?1)>=CAST((SELECT value FROM app_settings WHERE key='receive_since') AS INTEGER)",params![v.message_id,f.meta.id,v.id,f.meta.name,now_ms()])?;
+                    }
                 }
                 for (principal,peer,direction) in [(&v.sender_id,&v.recipient_id,"outgoing"),(&v.recipient_id,&v.sender_id,"incoming")] {
                     if !local.contains(principal.as_str()){continue;}

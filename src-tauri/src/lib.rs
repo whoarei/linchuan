@@ -1,5 +1,6 @@
 use linchuan_core::{App, Bootstrap, Options};
 use tauri::{Manager, State};
+mod receiving;
 struct Runtime(tokio::sync::OnceCell<App>);
 #[tauri::command]
 fn desktop_window_controls() -> bool {
@@ -40,16 +41,20 @@ async fn bootstrap(state: State<'_, Runtime>, app: tauri::AppHandle) -> Result<B
         .0
         .get_or_try_init(|| async {
             let directory = app.path().app_data_dir().map_err(|e| e.to_string())?;
-            App::start(Options::new(directory))
+            let core = App::start(Options::new(directory))
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            receiving::start(app.clone(), core.clone()).await?;
+            Ok::<_, String>(core)
         })
         .await?;
     Ok(core.bootstrap())
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(receiving::plugin());
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
         if let Some(window) = app.get_webview_window("main") {
@@ -60,6 +65,7 @@ pub fn run() {
     }));
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let builder = builder
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init());
     builder
@@ -68,7 +74,14 @@ pub fn run() {
             bootstrap,
             desktop_window_controls,
             check_release,
-            prepare_update
+            prepare_update,
+            receiving::receive_settings,
+            receiving::choose_receive_directory,
+            receiving::reset_receive_directory,
+            receiving::received_files,
+            receiving::save_received_file,
+            receiving::open_received_file,
+            receiving::open_receive_directory
         ])
         .build(tauri::generate_context!())
         .expect("邻传启动失败")

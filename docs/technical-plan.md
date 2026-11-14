@@ -2,6 +2,8 @@
 
 当前版本为 0.3.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
+main 分支的[固定接收目录](receive-storage.md)尚未发布。`receiving.rs` 在完成接收的事务内创建保存队列，后台流式导出文件；原生 IPC 提供目录设置、保存状态和文件打开。Windows／Linux 使用系统下载目录和目录选择器；Android 使用 MediaStore Downloads、持久授权的 SAF 目录及旧系统存储权限。浏览器下载规则保持由浏览器管理。
+
 [设备自动命名](device-names.md)使用现有 devices、app_settings 和 browser_sessions 关系，不变更数据库 schema 或设备身份。
 
 ## 模块
@@ -11,6 +13,7 @@
 - `identity.rs`：本机 Ed25519 签名和校验；浏览器 token 的 SHA-256。
 - `groups.rs`：群主签名名单、成员签名决定、邀请及成员通知、直连地址核对。
 - `conversations.rs`：会话创建、历史分页、已读位置、文字草稿和缓存清理。
+- `receiving.rs`：接收目录、附件保存队列、保存记录、失败重试和安全重名处理；Tauri 与 Android 插件负责平台目录访问。
 - `api.rs`：配对、授权、文件流、直接传输兼容接口、WebSocket。
 - `transport.rs` / `discovery.rs`：逐人传输、取消、mDNS、在线探测。
 - `src-tauri/`：原生生命周期、私有目录、下载打开、Android 权限、桌面单实例与打包。

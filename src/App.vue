@@ -10,6 +10,7 @@ import {
   Copy,
   Download,
   File,
+  FolderOpen,
   Image as ImageIcon,
   Info,
   Link,
@@ -36,6 +37,7 @@ import {
 import QRCode from "qrcode";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
 import { useUpdates } from "./useUpdates";
+import { useReceiving } from "./useReceiving";
 import {
   browserIdentity,
   rememberBrowserName,
@@ -67,6 +69,17 @@ import type {
 
 type Mode = "devices" | "settings" | "about";
 const downloadsUrl = "https://github.com/whoarei/linchuan/releases/latest";
+const {
+  settings: receiveSettings,
+  busy: receiveBusy,
+  receipt,
+  loadSettings: loadReceiveSettings,
+  loadReceipts,
+  changeDirectory,
+  openDirectory,
+  openFile: openSavedFile,
+  saveFile,
+} = useReceiving(notify);
 const {
   state: updateState,
   busy: updateBusy,
@@ -436,7 +449,9 @@ async function loadMessages(initial: boolean, older = false) {
         through_position: last,
       }).catch(() => {});
     }
-    void loadThumbnails(id, page.messages);
+    await loadReceipts(messages.value.map((message) => message.id));
+    if (id === selected.value && request === timelineRequest)
+      void loadThumbnails(id, page.messages);
   } catch (error) {
     if (initial || older) notify((error as Error).message, true);
   } finally {
@@ -571,20 +586,19 @@ async function fileUrl(file: MessageFile) {
   );
   return address() + value.url;
 }
-async function download(file: MessageFile) {
+async function download(file: MessageFile, message: string) {
+  if (native) {
+    await saveFile(message, file);
+    return;
+  }
   try {
     const url = await fileUrl(file);
-    if (native) {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await openUrl(url);
-    } else {
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = file.name;
-      document.body.append(a);
-      a.click();
-      a.remove();
-    }
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = file.name;
+    document.body.append(a);
+    a.click();
+    a.remove();
   } catch (error) {
     notify((error as Error).message, true);
   }
@@ -841,6 +855,7 @@ function setMode(value: Mode) {
 onMounted(async () => {
   try {
     await bootstrap();
+    void loadReceiveSettings();
     const info = await api<{ name: string }>("/api/info");
     hostName.value = info.name;
     if (token()) await refresh();
@@ -1063,8 +1078,7 @@ onUnmounted(() => {
         </div>
       </div>
       <footer class="list-footer">
-        <span class="self-avatar">{{ state!.me.name.slice(0, 1) }}</span
-        ><span
+        <span class="self-avatar">{{ state!.me.name.slice(0, 1) }}</span><span
           ><b>{{ deviceLabel(state!.me.id, state!.me.name) }}</b
           ><small>{{
             state!.me.platform + (state!.me.owner ? " · 本机设备" : "")
@@ -1187,8 +1201,7 @@ onUnmounted(() => {
                   message.sender_id === state!.me.id
                     ? "我"
                     : message.sender_name
-                }}</span
-                ><time>{{ timestamp(message.created_at) }}</time>
+                }}</span><time>{{ timestamp(message.created_at) }}</time>
               </div>
               <div v-if="message.text" class="text-bubble">
                 <p>{{ message.text }}</p>
@@ -1207,6 +1220,7 @@ onUnmounted(() => {
                 :class="{
                   expired:
                     !file.available &&
+                    receipt(message.id, file.id)?.status !== 'saved' &&
                     message.deliveries.every((d) => terminal(d.status)),
                 }"
               >
@@ -1233,13 +1247,55 @@ onUnmounted(() => {
                       }}<template
                         v-if="
                           !file.available &&
+                          receipt(message.id, file.id)?.status !== 'saved' &&
                           message.deliveries.every((d) => terminal(d.status))
                         "
                       >
                         · 文件不可用或已过期</template
-                      ></small
-                    ></span
-                  ><template v-if="file.available"
+                      >
+                      <template
+                        v-if="receipt(message.id, file.id)?.status === 'saved'"
+                      >
+                        · 已保存</template
+                      >
+                      <template
+                        v-else-if="
+                          receipt(message.id, file.id)?.status === 'pending'
+                        "
+                      >
+                        · 正在保存…</template
+                      >
+                      <template
+                        v-else-if="
+                          receipt(message.id, file.id)?.status === 'failed'
+                        "
+                      >
+                        · 保存失败</template
+                      >
+                    </small></span
+                  ><template
+                    v-if="
+                      native && receipt(message.id, file.id)?.status === 'saved'
+                    "
+                  >
+                    <button
+                      class="icon-button"
+                      :aria-label="`打开文件 ${file.name}`"
+                      title="打开文件"
+                      @click="openSavedFile(message.id, file.id)"
+                    >
+                      <ArrowUpRight :size="18" />
+                    </button>
+                    <button
+                      class="icon-button"
+                      :aria-label="`打开所在文件夹 ${file.name}`"
+                      title="打开所在文件夹"
+                      @click="openSavedFile(message.id, file.id, true)"
+                    >
+                      <FolderOpen :size="18" />
+                    </button>
+                  </template>
+                  <template v-if="file.available"
                     ><button
                       v-if="raster(file) && !thumbnails[message.id + file.id]"
                       class="icon-button"
@@ -1249,12 +1305,25 @@ onUnmounted(() => {
                       <ImageIcon :size="17" /></button
                     ><button
                       class="icon-button"
-                      :aria-label="`下载 ${file.name}`"
-                      @click="download(file)"
+                      :disabled="
+                        receipt(message.id, file.id)?.status === 'pending'
+                      "
+                      :aria-label="`${native ? (receipt(message.id, file.id)?.status === 'failed' ? '重新保存' : '保存副本') : '下载'} ${file.name}`"
+                      :title="native ? '保存到接收目录' : '下载'"
+                      @click="download(file, message.id)"
                     >
                       <Download :size="18" /></button
                   ></template>
                 </div>
+                <p
+                  v-if="receipt(message.id, file.id)?.status === 'failed'"
+                  class="save-error"
+                  role="status"
+                >
+                  {{
+                    receipt(message.id, file.id)?.error
+                  }}。可重试或在设置中更改接收目录。
+                </p>
               </div>
               <div v-if="incomingPending(message)" class="receive-actions">
                 <span
@@ -1303,8 +1372,7 @@ onUnmounted(() => {
                     delivery.recipient_id === state!.me.id
                       ? "本机"
                       : delivery.recipient_name
-                  }}</span
-                  ><span>{{ statusLabel(delivery.status) }}</span
+                  }}</span><span>{{ statusLabel(delivery.status) }}</span
                   ><button
                     v-if="!terminal(delivery.status)"
                     class="text-button"
@@ -1442,6 +1510,41 @@ onUnmounted(() => {
           </button>
         </form>
       </section>
+      <section class="settings-card" aria-label="接收目录">
+        <h2>接收目录</h2>
+        <template v-if="native">
+          <p>接收完成的文件和图片自动保存到此处。</p>
+          <div class="receive-path">
+            {{ receiveSettings?.label || "正在读取…" }}
+          </div>
+          <div class="receive-directory-actions">
+            <button
+              class="secondary"
+              :disabled="receiveBusy"
+              @click="changeDirectory()"
+            >
+              <FolderOpen :size="16" />更改目录
+            </button>
+            <button
+              class="secondary"
+              :disabled="receiveBusy"
+              @click="openDirectory"
+            >
+              打开目录
+            </button>
+            <button
+              class="text-button"
+              :disabled="receiveBusy"
+              @click="changeDirectory(true)"
+            >
+              恢复默认
+            </button>
+          </div>
+        </template>
+        <p v-else>
+          文件保存到浏览器设置的下载位置；可在浏览器设置中更改目录或关闭逐次询问。
+        </p>
+      </section>
       <section v-if="state!.me.owner" class="settings-card">
         <div class="card-heading">
           <div>
@@ -1473,7 +1576,9 @@ onUnmounted(() => {
         <progress
           :value="state!.storage_used"
           :max="state!.storage_limit"
-        /><small>文字和历史记录保存在本机。清理缓存后，原文件卡片保留。</small>
+        /><small
+          >文字和历史记录保存在本机。清理缓存不会删除接收目录中的文件；待保存或保存失败的副本暂不清理。</small
+        >
       </section>
       <section v-if="!state!.me.owner" class="settings-card">
         <button class="secondary" @click="disconnect">
@@ -1614,8 +1719,7 @@ onUnmounted(() => {
             {{ item }}
           </option></select
         ><button class="address-copy" @click="copy(shareAddress)">
-          <span>{{ shareAddress }}</span
-          ><Copy :size="16" />
+          <span>{{ shareAddress }}</span><Copy :size="16" />
         </button>
         <div class="pairing-code">
           <small>本次配对码</small><b>{{ pairingCode }}</b>
@@ -1695,8 +1799,7 @@ onUnmounted(() => {
           <div v-for="member in group.members" :key="member.device.id">
             <span class="avatar small-avatar">{{
               member.device.name.slice(0, 1)
-            }}</span
-            ><span
+            }}</span><span
               >{{ deviceLabel(member.device.id, member.device.name)
               }}<small
                 >{{ member.role === "owner" ? "群主 · " : ""

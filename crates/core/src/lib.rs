@@ -5,6 +5,7 @@ mod groups;
 mod identity;
 mod model;
 mod names;
+pub mod receiving;
 mod store;
 mod transport;
 pub mod updates;

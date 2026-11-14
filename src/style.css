@@ -236,6 +236,28 @@ small {
   color: #4f5b72;
   min-width: 0;
 }
+
+.receive-path {
+  margin: 14px 0;
+  padding: 12px 14px;
+  border: 1px solid #e3e7ee;
+  border-radius: 9px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.receive-directory-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.save-error {
+  margin: 0;
+  padding: 0 12px 10px;
+  color: #b34848;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
 .search-field input::placeholder {
   color: #a0a8b6;
 }

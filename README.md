@@ -8,6 +8,8 @@
 
 [下载 v0.3.0](https://github.com/whoarei/linchuan/releases/tag/v0.3.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [在线更新](docs/updates.md) · [开发与发布](docs/development.md) · [0.3 验证范围](docs/validation-0.3.md)
 
+main 分支已增加[固定接收目录](docs/receive-storage.md)，尚未发布：客户端接收文件、图片后自动保存到系统下载目录下的“邻传”文件夹，可在设置中更改、打开或恢复默认目录。同名文件自动编号，保存失败可重试；清理应用缓存不会删除已保存文件。浏览器仍使用自己的下载设置。
+
 ![邻传桌面界面](docs/images/desktop.png)
 
 ## 使用

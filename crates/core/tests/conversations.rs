@@ -165,6 +165,381 @@ fn assert_nickname(name: &str) {
         "unexpected nickname: {name}"
     );
 }
+
+async fn incoming_file(sender: &Host, receiver: &Host, bytes: &[u8]) -> (String, String, String) {
+    let target = sender.connect(receiver).await;
+    let sent = sender
+        .send(Some(target), None, "保存到下载目录", Some(bytes))
+        .await;
+    let message = sent["message_id"].as_str().unwrap().to_owned();
+    let state = receiver
+        .wait(|s| {
+            s["transfers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["message_id"] == message)
+        })
+        .await;
+    let transfer = state["transfers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["message_id"] == message)
+        .unwrap();
+    let id = transfer["id"].as_str().unwrap().to_owned();
+    let file = transfer["files"][0]["id"].as_str().unwrap().to_owned();
+    assert!(
+        receiver.app.queue_save_file(&id, &file).await.is_err(),
+        "Unaccepted files must not be exported"
+    );
+    receiver
+        .post(
+            &format!("/api/transfers/{id}/decision"),
+            json!({"accept":true}),
+        )
+        .await;
+    receiver
+        .wait(|s| {
+            s["transfers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["message_id"] == message && t["status"] == "completed")
+        })
+        .await;
+    (message, id, file)
+}
+
+fn start_saver(app: &App) -> tokio::task::JoinHandle<()> {
+    let app = app.clone();
+    tokio::spawn(async move {
+        app.run_receive_saver(|job| async move {
+            tokio::task::spawn_blocking(move || linchuan_core::receiving::save_to_folder(job))
+                .await
+                .unwrap()
+        })
+        .await
+    })
+}
+
+async fn saved(app: &App, message: &str, expected: &str) -> linchuan_core::receiving::SavedFile {
+    for _ in 0..200 {
+        if let Some(record) = app
+            .saved_files(vec![message.into()])
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.status == expected)
+        {
+            return record;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "Expected {expected}: {:?}",
+        app.saved_files(vec![message.into()]).await.unwrap()
+    );
+}
+
+#[tokio::test]
+async fn received_files_save_without_overwriting_survive_restart_and_cache_cleanup() {
+    let sender = Host::new("发送").await;
+    let mut receiver = Host::new("接收").await;
+    let downloads = TempDir::new().unwrap();
+    receiver
+        .app
+        .configure_receiving(downloads.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    std::fs::write(downloads.path().join("持久文件.txt"), b"existing").unwrap();
+    let saver = start_saver(&receiver.app);
+    let bytes = "图片与文件的完整字节\0\u{1}".as_bytes();
+    let (message, _, _) = incoming_file(&sender, &receiver, bytes).await;
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(record.name, "持久文件 (1).txt");
+    assert_eq!(std::fs::read(&record.location).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(downloads.path().join("持久文件.txt")).unwrap(),
+        b"existing"
+    );
+    let state = receiver.state().await.to_string();
+    assert!(
+        !state.contains(&record.location),
+        "Paths must not enter the LAN API"
+    );
+    receiver.app.stop();
+    saver.await.unwrap();
+    receiver.restart().await;
+    receiver
+        .app
+        .configure_receiving("unused fallback".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.app.receive_directory().await.unwrap(),
+        downloads.path().to_string_lossy()
+    );
+    let saver = start_saver(&receiver.app);
+    // Force persistence of restored state: this must not enqueue a second copy.
+    receiver
+        .post("/api/settings", json!({"name":"重启后名称"}))
+        .await;
+    receiver.post("/api/storage/clear", json!({})).await;
+    assert_eq!(receiver.state().await["storage_used"], 0);
+    let record_after = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(record.location, record_after.location);
+    assert_eq!(std::fs::read(&record_after.location).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 2);
+    receiver.app.stop();
+    saver.await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory() {
+    let sender = Host::new("发送").await;
+    let receiver = Host::new("接收").await;
+    let storage = TempDir::new().unwrap();
+    let blocked = storage.path().join("not-a-directory");
+    std::fs::write(&blocked, b"keep").unwrap();
+    receiver
+        .app
+        .configure_receiving(blocked.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let (message, _, _) = incoming_file(&sender, &receiver, b"retry contents").await;
+    saved(&receiver.app, &message, "pending").await;
+    receiver.post("/api/storage/clear", json!({})).await;
+    assert!(receiver.state().await["storage_used"].as_u64().unwrap() > 0);
+    let saver = start_saver(&receiver.app);
+    assert!(saved(&receiver.app, &message, "failed")
+        .await
+        .error
+        .is_some());
+    receiver.post("/api/storage/clear", json!({})).await;
+    assert!(receiver.state().await["storage_used"].as_u64().unwrap() > 0);
+    let new_directory = storage.path().join("chosen");
+    receiver
+        .app
+        .set_receive_directory(new_directory.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert!(record.location.starts_with(new_directory.to_str().unwrap()));
+    assert_eq!(std::fs::read(record.location).unwrap(), b"retry contents");
+    assert_eq!(std::fs::read(blocked).unwrap(), b"keep");
+    receiver.app.stop();
+    saver.await.unwrap();
+}
+
+#[tokio::test]
+async fn schema_one_upgrade_preserves_history_without_exporting_old_files() {
+    let sender = Host::new("发送").await;
+    let mut receiver = Host::new("旧版接收").await;
+    let (message, transfer, file) = incoming_file(&sender, &receiver, b"old history").await;
+    let identity = receiver.app.info().await;
+    receiver.app.stop();
+    {
+        let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
+        conn.execute_batch(
+            "DROP TABLE saved_files; PRAGMA user_version=1; UPDATE messages SET received_at=1;",
+        )
+        .unwrap();
+    }
+    receiver.restart().await;
+    let downloads = TempDir::new().unwrap();
+    receiver
+        .app
+        .configure_receiving(downloads.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    receiver
+        .post("/api/settings", json!({"name":"升级后"}))
+        .await;
+    // A second startup used to enqueue pre-upgrade transfers from the restored cache.
+    receiver.restart().await;
+    receiver
+        .post("/api/settings", json!({"name":"再次启动"}))
+        .await;
+    assert!(receiver
+        .app
+        .saved_files(vec![message.clone()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(identity.id, receiver.app.info().await.id);
+    assert_eq!(identity.public_key, receiver.app.info().await.public_key);
+    receiver
+        .app
+        .queue_save_file(&transfer, &file)
+        .await
+        .unwrap();
+    let saver = start_saver(&receiver.app);
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(std::fs::read(record.location).unwrap(), b"old history");
+    receiver.app.stop();
+    saver.await.unwrap();
+}
+
+#[test]
+fn exported_filenames_are_portable_and_cannot_escape_the_directory() {
+    use linchuan_core::receiving::{safe_name, save_to_folder, SaveJob};
+    let folder = TempDir::new().unwrap();
+    let source = folder.path().join("source");
+    std::fs::write(&source, b"bytes").unwrap();
+    let output = folder.path().join("downloads");
+    for name in [
+        "../../escape.txt",
+        "CON.txt",
+        "\0<>:\"|?*",
+        "...",
+        "NUL",
+        &format!("{}.png", "图片".repeat(100)),
+    ] {
+        let safe = safe_name(name);
+        assert!(!safe.contains(['/', '\\']));
+        assert!(safe.len() <= 180);
+        let saved = save_to_folder(SaveJob {
+            message_id: "m".into(),
+            file_id: "f".into(),
+            source: source.clone(),
+            name: name.into(),
+            mime: "application/octet-stream".into(),
+            directory: output.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        assert_eq!(
+            std::path::Path::new(&saved.location).parent().unwrap(),
+            output
+        );
+        assert_eq!(std::fs::read(saved.location).unwrap(), b"bytes");
+    }
+    assert_eq!(safe_name("LPT9.txt"), "_LPT9.txt");
+}
+
+#[tokio::test]
+async fn browser_to_browser_files_are_not_exported_by_the_host() {
+    let host = Host::new("宿主").await;
+    let downloads = TempDir::new().unwrap();
+    host.app
+        .configure_receiving(downloads.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let one = host.pair("发送浏览器").await;
+    let two = host.pair("接收浏览器").await;
+    let state: Value = host.get("/api/state", &two).await.json().await.unwrap();
+    let draft: Value = host
+        .post_as(
+            "/api/drafts",
+            json!({"files":[{"name":"browser.txt","size":3,"mime":"text/plain"}]}),
+            &one,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let draft_id = draft["id"].as_str().unwrap();
+    let file = draft["files"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        Client::new()
+            .put(format!("{}/api/drafts/{draft_id}/files/{file}", host.url))
+            .bearer_auth(&one)
+            .body("abc")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let sent: Value = host
+        .post_as(
+            &format!("/api/drafts/{draft_id}/send"),
+            json!({"targets":[state["me"]["id"]],"text":"仅网页"}),
+            &one,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let message = sent["message_id"].as_str().unwrap();
+    let state: Value = host.get("/api/state", &two).await.json().await.unwrap();
+    let transfer = state["transfers"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        host.post_as(
+            &format!("/api/transfers/{transfer}/decision"),
+            json!({"accept":true}),
+            &two
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert!(host
+        .app
+        .saved_files(vec![message.into()])
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(host.app.queue_save_file(transfer, file).await.is_err());
+    assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn export_database_retry_keeps_actual_directory_without_copying_twice() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let sender = Host::new("发送").await;
+    let receiver = Host::new("接收").await;
+    let first = TempDir::new().unwrap();
+    let second = TempDir::new().unwrap();
+    receiver
+        .app
+        .configure_receiving(first.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let (message, _, _) = incoming_file(&sender, &receiver, b"one export").await;
+    let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER block_saved BEFORE UPDATE ON saved_files WHEN NEW.status='saved' BEGIN SELECT RAISE(ABORT,'disk full'); END;").unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let copied = count.clone();
+    let app = receiver.app.clone();
+    let saver = tokio::spawn(async move {
+        app.run_receive_saver(|job| {
+            let app = app.clone();
+            let copied = copied.clone();
+            async move {
+                assert!(app.has_active_work().await);
+                let result = linchuan_core::receiving::save_to_folder(job);
+                copied.fetch_add(1, Ordering::SeqCst);
+                result
+            }
+        })
+        .await;
+    });
+    for _ in 0..100 {
+        if count.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    // Metadata failed after the copy. Change the configured directory before retrying it.
+    receiver
+        .app
+        .set_receive_directory(second.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    conn.execute_batch("DROP TRIGGER block_saved;").unwrap();
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(record.directory, first.path().to_string_lossy());
+    assert_eq!(std::fs::read(record.location).unwrap(), b"one export");
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read_dir(second.path()).unwrap().count(), 0);
+    receiver.app.stop();
+    saver.await.unwrap();
+}
 async fn group(a: &Host, b: &Host, c: &Host) -> String {
     let b_id = a.connect(b).await;
     let c_id = a.connect(c).await;

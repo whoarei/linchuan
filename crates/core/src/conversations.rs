@@ -160,7 +160,7 @@ pub async fn clear_files(AxState(app): AxState<App>, headers: HeaderMap) -> Resu
         .store
         .run(|c, _| {
             let rows = c
-                .prepare("SELECT relative_path,size FROM file_blobs WHERE state='available'")?
+                .prepare("SELECT b.relative_path,b.size FROM file_blobs b WHERE b.state='available' AND NOT EXISTS(SELECT 1 FROM delivery_files df JOIN deliveries d ON d.id=df.delivery_id JOIN saved_files s ON s.message_id=d.message_id AND s.file_id=df.file_id WHERE df.blob_id=b.id AND s.status IN ('pending','failed'))")?
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<rusqlite::Result<_>>()?;
             Ok(rows)
