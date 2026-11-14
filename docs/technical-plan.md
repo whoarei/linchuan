@@ -1,8 +1,8 @@
 # 邻传技术方案
 
-当前版本为 0.2.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
+当前版本为 0.3.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
-开发中的[设备自动命名](device-names.md)使用现有 devices、app_settings 和 browser_sessions 关系，不变更数据库 schema 或设备身份。
+[设备自动命名](device-names.md)使用现有 devices、app_settings 和 browser_sessions 关系，不变更数据库 schema 或设备身份。
 
 ## 模块
 
@@ -52,9 +52,9 @@ HTTP 不加密，发现及首次信任仍受网络环境影响。本轮不宣称
 
 ## 平台与验证
 
-main 开发版的[在线更新方案](updates.md)使用 GitHub Releases、Tauri updater 和独立更新签名密钥，提供桌面签名更新与 Android APK 下载入口。发布任务验证并上传 latest.json、桌面分离签名和完整校验和；更新操作不通过局域网 HTTP API 开放。
+[在线更新方案](updates.md)使用 GitHub Releases、Tauri updater 和独立更新签名密钥，提供桌面签名更新与 Android APK 下载入口。发布任务验证并上传 latest.json、桌面分离签名和完整校验和；更新操作不通过局域网 HTTP API 开放。
 
-### 桌面窗口（main 开发版）
+### 桌面窗口
 
 Windows、Linux 关闭原生窗口装饰，使用 `DesktopTitleBar.vue` 自绘标题栏和最小化、最大化／还原、关闭按钮；拖动区支持拖动和双击切换最大化，边缘与四角支持缩放。按钮通过 Tauri 窗口 API 操作窗口，resize 事件同步来自系统快捷键等外部操作的最大化状态，旧查询结果不覆盖较新的状态。失焦时减淡标题文字，组件卸载时清理监听。
 

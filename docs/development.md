@@ -38,6 +38,8 @@ cargo test -p linchuan-core --locked
 cargo build -p linchuan-core --locked
 npx playwright install chromium
 npm run test:e2e
+python3 -m pip install cryptography
+python3 scripts/test_updates.py
 ```
 
 `rust-embed` 会嵌入 `dist`；先构建前端再构建 Rust。首次 Linux 浏览器测试可使用 `npx playwright install --with-deps chromium` 安装系统依赖。
@@ -60,8 +62,8 @@ npm run tauri android build -- --apk --target aarch64 --ci
 
 ```bash
 zipalign -P 16 -f 4 input-unsigned.apk aligned.apk
-apksigner sign --v4-signing-enabled false --ks /private/linchuan-release.keystore --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out Linchuan_0.2.0_android_arm64.apk aligned.apk
-apksigner verify --verbose --print-certs Linchuan_0.2.0_android_arm64.apk
+apksigner sign --v4-signing-enabled false --ks /private/linchuan-release.keystore --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out Linchuan_0.3.0_android_arm64.apk aligned.apk
+apksigner verify --verbose --print-certs Linchuan_0.3.0_android_arm64.apk
 ```
 
 不要将密码放进命令行字面量或仓库。`PASSWORD` 由维护者从私有密码管理工具或文件注入。
@@ -78,12 +80,12 @@ apksigner verify --verbose --print-certs Linchuan_0.2.0_android_arm64.apk
 1. 更新各处版本（`package.json`、两个 Rust crate、`tauri.conf.json`）及锁文件、发布说明。
 2. 等待同一提交的 `Build and verify` 所有 jobs 成功，检查测试报告与原生产物。
 3. 将版本 tag 指向该提交；下载对应 run 的产物，核对来源和文件数量。
-4. 签名并验证 APK；运行 `scripts/collect-release.py` 和 `scripts/checksums.py` 汇总安装包。
-5. 发布 GitHub Release，附安装包、校验和及对应版本说明。
+4. 签名并验证 APK；运行 `scripts/collect-release.py` 汇总桌面包，再用 `scripts/updates.py sign` 生成桌面分离签名和 latest.json，最后运行 `scripts/checksums.py`。
+5. 发布 GitHub Release，附四个安装包、三个桌面 `.sig`、latest.json、校验和及对应版本说明；完整上传后再将草稿发布为最新正式版。
 6. 再读取 Release，确认非 draft、版本 tag 正确、安装包齐全。真实设备测试范围应如实记录。
 
 ## 已签名产物发布入口
 
 如果工作区凭证在 `uploads.github.com` 返回 401，可使用 `Publish pre-signed release`，让仓库 Actions 的发布权限执行上传。应用源码仍取自版本 tag，并校验其对应构建已全部成功。
 
-在临时分支放入已经签名的 APK、全部安装包的 `SHA256SUMS`、`release-notes.md` 和 `source.json`（tag、source_sha、build_run、apk_name、certificate_sha256），传入该分支的不可变提交 SHA。工作流会核对源码、签名证书、ZIP 对齐和所有安装包摘要，再上传并正式发布。临时分支只包含将公开的安装产物，私钥继续由维护者私下保管。发布完成后可删除该分支。
+在临时分支放入已经签名的 APK、三个桌面 `.sig`、latest.json、覆盖全部九个文件的 `SHA256SUMS`、`release-notes.md` 和 `source.json`（tag、source_sha、build_run、apk_name、certificate_sha256），传入该分支的不可变提交 SHA。工作流会核对源码、APK 证书与 ZIP 对齐、桌面包签名、更新清单和所有文件摘要，再上传并正式发布。临时分支只包含将公开的产物，私钥继续由维护者私下保管。签名命令和密钥配置见[在线更新](updates.md)。

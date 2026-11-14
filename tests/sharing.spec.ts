@@ -220,7 +220,8 @@ test("settings exposes device rename; drafts and history survive a page reload",
   await expect(
     host.page.getByRole("heading", { name: "邻传 · Linchuan" }),
   ).toBeVisible();
-  await expect(host.page.getByText("0.2.0", { exact: true })).toBeVisible();
+  const version = JSON.parse(await readFile("package.json", "utf8")).version;
+  await expect(host.page.getByText(version, { exact: true })).toBeVisible();
   await host.context.close();
 });
 test("mobile has list-to-conversation navigation and no horizontal overflow", async ({

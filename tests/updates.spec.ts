@@ -148,14 +148,16 @@ test("signed desktop update downloads in the background, checks active transfers
         ).length,
     ),
   ).toBe(1);
-  expect(
-    await page.evaluate(
-      () =>
-        (window as any).__updateMock.calls.filter(
-          (c: any) => c.command === "plugin:process|restart",
-        ).length,
-    ),
-  ).toBe(2);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as any).__updateMock.calls.filter(
+            (c: any) => c.command === "plugin:process|restart",
+          ).length,
+      ),
+    )
+    .toBe(2);
   await page.setViewportSize({ width: 360, height: 620 });
   expect(
     await page.locator(".about-page").evaluate((el) => {
@@ -219,15 +221,17 @@ test("Android updates open the APK in the system browser and current releases sk
   await page
     .getByRole("button", { name: "下载新版安装包", exact: true })
     .click();
-  expect(
-    await page.evaluate(() =>
-      (window as any).__updateMock.calls.some(
-        (c: any) =>
-          c.command === "plugin:opener|open_url" &&
-          c.args.url.endsWith("android_arm64.apk"),
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).__updateMock.calls.some(
+          (c: any) =>
+            c.command === "plugin:opener|open_url" &&
+            c.args.url.endsWith("android_arm64.apk"),
+        ),
       ),
-    ),
-  ).toBe(true);
+    )
+    .toBe(true);
   expect(
     await page.evaluate(() =>
       (window as any).__updateMock.calls.some((c: any) =>
