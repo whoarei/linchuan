@@ -251,6 +251,17 @@ small {
   align-items: center;
   gap: 10px;
 }
+.background-setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 18px 0;
+}
+.background-setting b { font-size: 12px; font-weight: 500; }
+.background-setting small { display: block; margin-top: 4px; color: #8792a5; }
+.background-setting input { width: 18px; height: 18px; flex-shrink: 0; accent-color: #6483d9; }
+.background-fallback { color: #9b6546; }
 .save-error {
   margin: 0;
   padding: 0 12px 10px;

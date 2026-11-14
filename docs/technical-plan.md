@@ -1,12 +1,14 @@
 # 邻传技术方案
 
-当前版本为 0.3.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
+当前版本为 0.4.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
-main 分支的[固定接收目录](receive-storage.md)尚未发布。`receiving.rs` 在完成接收的事务内创建保存队列，后台流式导出文件；原生 IPC 提供目录设置、保存状态和文件打开。Windows／Linux 使用系统下载目录和目录选择器；Android 使用 MediaStore Downloads、持久授权的 SAF 目录及旧系统存储权限。浏览器下载规则保持由浏览器管理。
+0.4.0 的[固定接收目录](receive-storage.md)已实现。`receiving.rs` 在完成接收的事务内创建保存队列，后台流式导出文件；原生 IPC 提供目录设置、保存状态和文件打开。Windows／Linux 使用系统下载目录和目录选择器；Android 使用 MediaStore Downloads、持久授权的 SAF 目录及旧系统存储权限。浏览器下载规则保持由浏览器管理。
 
-main 的[浏览器临时会话](browser-sessions.md)将现有 24 小时凭证保存在当前 origin 的 localStorage 并同步标签页退出，会话列表根据持久化的 peer_kind 和 has_draft 收起离线浏览器历史，不推断物理设备身份或删除传输记录。
+0.4.0 的[浏览器临时会话](browser-sessions.md)将现有 24 小时凭证保存在当前 origin 的 localStorage 并同步标签页退出，会话列表根据持久化的 peer_kind 和 has_draft 收起离线浏览器历史，不推断物理设备身份或删除传输记录。
 
 [设备自动命名](device-names.md)使用现有 devices、app_settings 和 browser_sessions 关系，不变更数据库 schema 或设备身份。
+
+Windows／Linux 的[开机启动与托盘](desktop-background.md)使用原生生命周期初始化后台服务，关闭窗口默认隐藏至托盘，系统自启动状态由 autostart 插件管理；close_to_tray 使用 app_settings 保存。
 
 ## 模块
 

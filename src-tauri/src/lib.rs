@@ -1,5 +1,6 @@
 use linchuan_core::{App, Bootstrap, Options};
 use tauri::{Manager, State};
+mod desktop;
 mod receiving;
 struct Runtime(tokio::sync::OnceCell<App>);
 #[tauri::command]
@@ -35,8 +36,8 @@ async fn prepare_update(state: State<'_, Runtime>) -> Result<(), String> {
     }
     Ok(())
 }
-#[tauri::command]
-async fn bootstrap(state: State<'_, Runtime>, app: tauri::AppHandle) -> Result<Bootstrap, String> {
+async fn ensure_core(app: &tauri::AppHandle) -> Result<App, String> {
+    let state = app.state::<Runtime>();
     let core = state
         .0
         .get_or_try_init(|| async {
@@ -44,11 +45,23 @@ async fn bootstrap(state: State<'_, Runtime>, app: tauri::AppHandle) -> Result<B
             let core = App::start(Options::new(directory))
                 .await
                 .map_err(|e| e.to_string())?;
-            receiving::start(app.clone(), core.clone()).await?;
+            let initialized = async {
+                desktop::initialize(app, &core).await?;
+                receiving::start(app.clone(), core.clone()).await
+            }
+            .await;
+            if let Err(error) = initialized {
+                core.stop();
+                return Err(error);
+            }
             Ok::<_, String>(core)
         })
         .await?;
-    Ok(core.bootstrap())
+    Ok(core.clone())
+}
+#[tauri::command]
+async fn bootstrap(app: tauri::AppHandle) -> Result<Bootstrap, String> {
+    Ok(ensure_core(&app).await?.bootstrap())
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -56,18 +69,30 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(receiving::plugin());
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
-        if let Some(window) = app.get_webview_window("main") {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _| {
+        if !args.iter().any(|arg| arg == "--autostart") {
+            let _ = desktop::show(app);
         }
     }));
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let builder = builder
+        .manage(desktop::DesktopRuntime::default())
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("邻传")
+                .arg("--autostart")
+                .build(),
+        )
+        .setup(|app| {
+            desktop::setup(app)?;
+            Ok(())
+        })
+        .on_window_event(desktop::on_window_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init());
+    let mut context = tauri::generate_context!();
+    desktop::configure_context(&mut context);
     builder
         .manage(Runtime(tokio::sync::OnceCell::new()))
         .invoke_handler(tauri::generate_handler![
@@ -75,6 +100,10 @@ pub fn run() {
             desktop_window_controls,
             check_release,
             prepare_update,
+            desktop::desktop_settings,
+            desktop::desktop_set_autostart,
+            desktop::desktop_set_close_to_tray,
+            desktop::desktop_quit,
             receiving::receive_settings,
             receiving::choose_receive_directory,
             receiving::reset_receive_directory,
@@ -83,7 +112,7 @@ pub fn run() {
             receiving::open_received_file,
             receiving::open_receive_directory
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("邻传启动失败")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {

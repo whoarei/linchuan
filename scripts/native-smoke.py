@@ -7,7 +7,7 @@ import sys
 import time
 import urllib.request
 version = json.loads(pathlib.Path('package.json').read_text())['version']
-process = subprocess.Popen([sys.argv[1]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+process = subprocess.Popen([sys.argv[1], *sys.argv[2:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 try:
     for attempt in range(90):
         if process.poll() is not None:

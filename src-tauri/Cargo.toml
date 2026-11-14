@@ -1,6 +1,6 @@
 [package]
 name = "linchuan"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [lib]
@@ -19,6 +19,8 @@ serde_json = "1"
 tokio = { version = "1", features = ["sync"] }
 
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2.14.1"
 tauri-plugin-process = "2"

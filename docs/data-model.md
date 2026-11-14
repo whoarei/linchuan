@@ -2,9 +2,11 @@
 
 适用范围：0.2.0 会话式界面、群聊与本地持久化。本文初版先于实现单独提交；字段、约束及验收用例作为本次开发依据。0.1.0 的版本标签和安装包保持不变。
 
-后续 schema 2 的接收目录设置、saved_files 表、保存队列和迁移规则见[固定接收目录与数据模型](receive-storage.md)。0.3.0 正式版仍使用 schema 1。
+0.4.0 schema 2 的接收目录设置、saved_files 表、保存队列和迁移规则见[固定接收目录与数据模型](receive-storage.md)。0.3.0 正式版仍使用 schema 1。
 
 [浏览器临时会话与重连](browser-sessions.md)复用现有 browser_sessions、devices.kind 和会话草稿，无需新增数据库迁移；网页凭证在有效期内跨标签页复用，离线临时会话的历史默认收起。
+
+桌面后台设置另见[开机启动与托盘](desktop-background.md)，close_to_tray 复用 app_settings，不增加 schema。
 
 ## 1. 目标与边界
 

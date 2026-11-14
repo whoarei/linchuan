@@ -803,6 +803,18 @@ async fn default_native_name_is_saved_and_manual_name_takes_precedence() {
 }
 
 #[tokio::test]
+async fn desktop_close_preference_defaults_to_background_and_survives_restart() {
+    let mut host = Host::new("后台设备").await;
+    assert!(host.app.close_to_tray().await.unwrap());
+    host.app.set_close_to_tray(false).await.unwrap();
+    host.restart().await;
+    assert!(!host.app.close_to_tray().await.unwrap());
+    host.app.set_close_to_tray(true).await.unwrap();
+    host.restart().await;
+    assert!(host.app.close_to_tray().await.unwrap());
+}
+
+#[tokio::test]
 async fn automatic_browser_names_and_rename_preserve_identity_and_scope() {
     let mut host = Host::new("宿主电脑").await;
     let paired = Client::new()

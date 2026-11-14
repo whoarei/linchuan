@@ -2,17 +2,19 @@
 
 **同一网络，随手互传。**
 
-当前正式版为 **0.3.0**：新增动物昵称、桌面自绘标题栏、客户端下载入口和在线更新，保留三列会话、群聊及 SQLite 历史存储。沿用原设备身份、名称和历史。
+当前正式版为 **0.4.0**：新增固定接收目录、浏览器临时会话整理，以及 Windows／Linux 开机启动和系统托盘。
 
 支持 Android、Linux、Windows 的局域网文字、图片与文件传送工具。应用间直接互传；未安装应用的设备可通过浏览器打开对方地址，配对后双向收发。每台应用使用系统分配的可用端口，无需独立服务器。
 
-[下载 v0.3.0](https://github.com/whoarei/linchuan/releases/tag/v0.3.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [在线更新](docs/updates.md) · [开发与发布](docs/development.md) · [0.3 验证范围](docs/validation-0.3.md)
+[下载 v0.4.0](https://github.com/whoarei/linchuan/releases/tag/v0.4.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [在线更新](docs/updates.md) · [开发与发布](docs/development.md) · [0.4 验证范围](docs/validation-0.4.md)
 
-main 分支已增加[固定接收目录](docs/receive-storage.md)，尚未发布：客户端接收文件、图片后自动保存到系统下载目录下的“邻传”文件夹，可在设置中更改、打开或恢复默认目录。同名文件自动编号，保存失败可重试；清理应用缓存不会删除已保存文件。浏览器仍使用自己的下载设置。
+0.4.0 提供[固定接收目录](docs/receive-storage.md)：客户端接收文件、图片后自动保存到系统下载目录下的“邻传”文件夹，可在设置中更改、打开或恢复默认目录。同名文件自动编号，保存失败可重试；清理应用缓存不会删除已保存文件。浏览器仍使用自己的下载设置。
 
-main 分支同时整理了[浏览器临时会话](docs/browser-sessions.md)：同一浏览器在同一访问地址下复用 24 小时内的有效配对凭证，关页重开或新标签页不会反复创建身份；离线浏览器的传输历史默认收起，空会话不再显示。浏览器与原生客户端保持独立。
+0.4.0 同时整理了[浏览器临时会话](docs/browser-sessions.md)：同一浏览器在同一访问地址下复用 24 小时内的有效配对凭证，关页重开或新标签页不会反复创建身份；离线浏览器的传输历史默认收起，空会话不再显示。浏览器与原生客户端保持独立。
 
 [CI 与发布](docs/ci-release.md)已简化为两个流程：日常只做检查和测试，纯文档修改跳过；版本标签触发三平台构建、GitHub Secrets 签名和自动发布。支持 `vX.Y.Z-rc.N` 预发布，RC 不设为 Latest，也不推送给正式版用户。
+
+Windows／Linux 提供[开机启动和托盘](docs/desktop-background.md)，设置可启用登录后后台启动；关闭窗口默认保留在托盘，托盘菜单可恢复窗口或退出。Android 本轮不增加后台常驻。
 
 ![邻传桌面界面](docs/images/desktop.png)
 
@@ -25,7 +27,7 @@ main 分支同时整理了[浏览器临时会话](docs/browser-sessions.md)：�
 
 会话、群成员、文字草稿和附件记录保存到 SQLite，完整文件保存在应用目录，重启后继续保留。设置中可手动改名或“换个名字”、查看配对码和清理文件缓存；清理保留历史卡片。单文件最大 2 GiB，每次最多 64 个文件，每群最多 16 位成员。应用和网页需保持运行；群聊不自动补发离线消息。
 
-0.2.0 及更早版本需要手动覆盖安装 0.3.0 一次，此后可在“关于”中检查更新。Windows／Linux 支持签名更新包下载和确认安装，Android 下载 APK 后由系统安装。Android 沿用原发布签名。
+Windows／Linux 的 0.3.0 用户可在“关于”中检查更新；更早版本可手动下载安装 0.4.0。Android 本版更换发布密钥，旧版需要卸载后重装；卸载前请保留需要的历史和文件。
 
 ## 平台
 
@@ -36,7 +38,7 @@ main 分支同时整理了[浏览器临时会话](docs/browser-sessions.md)：�
 | Windows 10/11 x64 | NSIS 安装包，需要 WebView2 |
 | 浏览器 | 现代 Chrome / Edge / Firefox / Safari，免安装连接运行中的应用 |
 
-Linux AppImage 下载后先执行 `chmod +x Linchuan_0.3.0_amd64.AppImage`。如遇 FUSE 环境缺失，可使用 `./Linchuan*.AppImage --appimage-extract-and-run`。Windows 首次运行需要允许应用接收局域网连接。
+Linux AppImage 下载后先执行 `chmod +x Linchuan_0.4.0_amd64.AppImage`。如遇 FUSE 环境缺失，可使用 `./Linchuan*.AppImage --appimage-extract-and-run`。Windows 首次运行需要允许应用接收局域网连接。
 
 ## 当前边界
 

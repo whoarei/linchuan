@@ -39,6 +39,7 @@ import DesktopTitleBar from "./DesktopTitleBar.vue";
 import ConversationRow from "./ConversationRow.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
+import { useDesktopSettings } from "./useDesktopSettings";
 import {
   browserIdentity,
   rememberBrowserName,
@@ -69,6 +70,14 @@ import type {
 } from "./types";
 
 type Mode = "devices" | "settings" | "about";
+const {
+  settings: desktopSettings,
+  busy: desktopBusy,
+  load: loadDesktopSettings,
+  setAutostart,
+  setCloseToTray,
+  quit: quitDesktop,
+} = useDesktopSettings(notify);
 const downloadsUrl = "https://github.com/whoarei/linchuan/releases/latest";
 const {
   settings: receiveSettings,
@@ -912,12 +921,16 @@ function sessionChanged() {
 function setMode(value: Mode) {
   flushDraft();
   mode.value = value;
-  if (value === "settings") newName.value = state.value?.me.name || "";
+  if (value === "settings") {
+    newName.value = state.value?.me.name || "";
+    void loadDesktopSettings();
+  }
 }
 onMounted(async () => {
   window.addEventListener("linchuan-session-change", sessionChanged);
   try {
     await bootstrap();
+    void loadDesktopSettings();
     void loadReceiveSettings();
     const info = await api<{ name: string }>("/api/info");
     hostName.value = info.name;
@@ -1590,6 +1603,49 @@ onUnmounted(() => {
             换个名字
           </button>
         </form>
+      </section>
+      <section
+        v-if="desktopSettings?.supported"
+        class="settings-card"
+        aria-label="启动与后台"
+      >
+        <h2>启动与后台</h2>
+        <label class="background-setting">
+          <span
+            ><b>开机启动</b
+            ><small>登录系统后自动启动，在托盘后台运行。</small></span
+          >
+          <input
+            type="checkbox"
+            role="switch"
+            aria-label="开机启动"
+            :checked="desktopSettings.autostart"
+            :disabled="desktopBusy"
+            @change="setAutostart(($event.target as HTMLInputElement).checked)"
+          />
+        </label>
+        <label class="background-setting">
+          <span
+            ><b>关闭窗口后继续运行</b
+            ><small>保持接收文件，可从托盘打开窗口或退出。</small></span
+          >
+          <input
+            type="checkbox"
+            role="switch"
+            aria-label="关闭窗口后继续运行"
+            :checked="desktopSettings.close_to_tray"
+            :disabled="desktopBusy || !desktopSettings.tray_available"
+            @change="
+              setCloseToTray(($event.target as HTMLInputElement).checked)
+            "
+          />
+        </label>
+        <p v-if="!desktopSettings.tray_available" class="background-fallback">
+          当前托盘不可用，关闭窗口会退出应用。
+        </p>
+        <button class="secondary" @click="quitDesktop">
+          <LogOut :size="16" />退出邻传
+        </button>
       </section>
       <section class="settings-card" aria-label="接收目录">
         <h2>接收目录</h2>

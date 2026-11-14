@@ -107,7 +107,9 @@ jobs:
         run: python3 scripts/prepare_deb.py --directory target/release/bundle/deb --version "$VERSION"
       - name: Smoke test native Linux startup
         if: runner.os == 'Linux'
-        run: dbus-run-session -- xvfb-run -a python3 scripts/native-smoke.py target/release/linchuan
+        run: |
+          dbus-run-session -- xvfb-run -a python3 scripts/native-smoke.py target/release/linchuan
+          dbus-run-session -- xvfb-run -a python3 scripts/native-smoke.py target/release/linchuan --autostart
         env:
           WEBKIT_DISABLE_DMABUF_RENDERER: '1'
       - uses: actions/upload-artifact@v4
