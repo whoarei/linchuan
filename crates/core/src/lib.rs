@@ -250,23 +250,56 @@ fn default_name() -> String {
     format!("{} · {}", platform(), &uid()[..4])
 }
 fn addresses(port: u16) -> Vec<String> {
-    let mut ips: Vec<_> = if_addrs::get_if_addrs()
+    let mut candidates: Vec<_> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|i| match i.ip() {
-            std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() => {
-                Some(format!("http://{ip}:{port}"))
+        .filter_map(|interface| {
+            let name = interface.name.to_ascii_lowercase();
+            if ["rmnet", "ccmni", "pdp_ip"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+            {
+                return None;
             }
-            _ => None,
+            let std::net::IpAddr::V4(ip) = interface.ip() else {
+                return None;
+            };
+            if !(ip.is_private() || ip.is_link_local()) {
+                return None;
+            }
+            let rank = if name.contains("wlan") || name.contains("wi-fi") || name.contains("wifi") {
+                0
+            } else if name.starts_with("eth") || name.starts_with("en") || name.contains("ethernet")
+            {
+                1
+            } else {
+                2
+            };
+            Some((rank, format!("http://{ip}:{port}")))
         })
         .collect();
-    ips.sort();
-    ips.dedup();
-    if ips.is_empty() {
-        ips.push(format!("http://127.0.0.1:{port}"));
+    candidates.sort();
+    let mut addresses: Vec<_> = candidates.into_iter().map(|(_, address)| address).collect();
+    addresses.dedup();
+    if addresses.is_empty() {
+        addresses.push(format!("http://127.0.0.1:{port}"));
     }
-    ips
+    addresses
 }
+fn same_subnet(ip: std::net::Ipv4Addr) -> bool {
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .iter()
+        .any(|interface| {
+            if let if_addrs::IfAddr::V4(address) = &interface.addr {
+                let mask = u32::from(address.netmask);
+                (u32::from(address.ip) & mask) == (u32::from(ip) & mask)
+            } else {
+                false
+            }
+        })
+}
+
 fn clean_name(value: &str) -> anyhow::Result<String> {
     let value: String = value.trim().chars().filter(|c| !c.is_control()).collect();
     anyhow::ensure!(

@@ -46,7 +46,9 @@ pub async fn start(app: App) -> anyhow::Result<()> {
                         if service.get_property_val_str("protocol") != Some("1") { continue; }
                         let Some(id) = service.get_property_val_str("id") else { continue };
                         if id == info.id { continue; }
-                        let Some(ip) = service.get_addresses().iter().find_map(|ip| match ip { std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() || ip.is_loopback() => Some(*ip), _ => None }) else { continue };
+                        let mut ips: Vec<_> = service.get_addresses().iter().filter_map(|ip| match ip { std::net::IpAddr::V4(ip) if ip.is_private() || ip.is_link_local() || ip.is_loopback() => Some(*ip), _ => None }).collect();
+                    ips.sort_by_key(|ip| (!crate::same_subnet(*ip), *ip));
+                    let Some(ip) = ips.first() else { continue };
                         let device = Device { id: id.into(), name: service.get_property_val_str("name").unwrap_or("邻传设备").chars().take(64).collect(), platform: service.get_property_val_str("platform").unwrap_or("设备").into(), address: format!("http://{ip}:{}", service.get_port()), last_seen: now(), kind: "app".into() };
                         app.0.state.lock().await.peers.insert(id.into(), device); app.notify();
                     }
