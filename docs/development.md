@@ -56,7 +56,7 @@ npm run tauri android build -- --apk --target aarch64 --ci
 
 ## Android 签名
 
-密钥别名固定为 `linchuan`，私钥和密码只保存于维护者的私有备份中。首版维护凭证不具备 GitHub Secrets 管理权限，因此先在工作区签名，再发布。后续升级必须沿用相同密钥。
+历史发布使用别名为 `linchuan` 的密钥。发布工作流支持接入其他 Android keystore、可配置别名和独立的 key 密码。已接受后续版本可卸载重装，Android 换密钥不再作为本轮发布的阻塞条件；桌面在线更新仍使用既有更新公钥对应的独立密钥。
 
 在本机 SDK Build Tools 中执行：
 
@@ -68,12 +68,34 @@ apksigner verify --verbose --print-certs Linchuan_0.3.0_android_arm64.apk
 
 不要将密码放进命令行字面量或仓库。`PASSWORD` 由维护者从私有密码管理工具或文件注入。
 
-具备权限后设置两个 GitHub Actions secrets：
+在仓库的 [Actions Secrets 设置](https://github.com/whoarei/linchuan/settings/secrets/actions) 点击 **New repository secret**，配置：
 
-- `ANDROID_KEYSTORE_BASE64`：同一发布 keystore 的 Base64 内容。
-- `ANDROID_KEYSTORE_PASSWORD`：keystore 与 key 密码。
+| Secret | 内容 | 是否必填 |
+| --- | --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | 你的 `.jks`／`.keystore` 文件的 Base64 文本 | 必填 |
+| `ANDROID_KEYSTORE_PASSWORD` | keystore 密码 | 必填 |
+| `ANDROID_KEY_ALIAS` | keystore 内要使用的密钥别名 | 建议填写；省略时使用 `linchuan` |
+| `ANDROID_KEY_PASSWORD` | 该别名对应的 key 密码 | 与 keystore 密码不同才需填写；省略时复用 keystore 密码 |
 
-`Publish verified release` 工作流要求传入成功构建的 run ID 与已有版本 tag，校验 run 的提交 SHA 等于 tag，再收集产物、签名和发布。没有 Secrets 时使用本地签名流程，不重建临时密钥。
+Base64 是密钥文件的编码，输出文件也属于私密文件，应在仓库外操作。Linux／macOS 示例：
+
+```bash
+base64 < /private/release.keystore | tr -d '\n' > /private/keystore.base64.txt
+```
+
+Windows PowerShell 示例：
+
+```powershell
+[IO.File]::WriteAllText('C:\private\keystore.base64.txt', [Convert]::ToBase64String([IO.File]::ReadAllBytes('C:\private\release.keystore')))
+```
+
+将输出文本填入 `ANDROID_KEYSTORE_BASE64`。别名可在本机执行 `keytool -list -keystore /private/release.keystore` 查看，按提示输入密码；名称不是文件名，也不是证书显示的发布者名称。
+
+完整的三平台发布工作流还需要 `TAURI_SIGNING_PRIVATE_KEY` 和对应的 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，用于桌面更新包签名，配置方法见[在线更新](updates.md)。它们与 Android keystore 分开；仅配置 Android Secrets 还不能执行完整的三平台发布。
+
+`Publish verified release` 工作流要求传入成功构建的 run ID 与已有版本 tag，先检查所需 Secrets，再校验 run 的提交 SHA 等于 tag。随后分别执行 Android 签名、APK 证书与对齐验证、桌面更新签名和正式发布。临时 keystore 和中间 APK 在结束或失败时移除。没有 Secrets 时仍可使用预签名流程。
+
+此配置已通过 actionlint、YAML 和 Bash 语法检查，并在本地用临时测试 keystore 执行工作流中的实际签名命令：覆盖默认别名、任意别名、独立 key 密码、密码回退、多 APK 拒绝和临时文件清理。测试仅在临时目录重签公开 APK，原正式版文件未修改；用户自己的 Secrets 配置尚需由维护者添加后验证。
 
 ## 发布步骤
 

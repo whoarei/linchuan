@@ -7,7 +7,7 @@
 客户端“关于”页提供“检查更新”。仅在用户点击时联网访问 GitHub 最新正式版，不在启动时后台检查，不获取预发布版本或降级版本。检查失败显示可重试的错误，不把网络故障当作已是最新版本。
 
 - Windows NSIS、Linux AppImage／DEB：发现支持当前安装格式的更新后，先下载，显示进度；签名与版本校验成功后提供“安装并重启”。离开“关于”页不取消下载。安装前检查本机所有身份的实际上传及已接受／传输中的任务，存在这些工作时暂不安装；已取消上传或空闲草稿不阻止更新。安装失败可重试，安装完成但重启失败时可单独重启，避免重复安装。DEB 安装由系统包管理器处理，可能需要系统授权。
-- Android：发现新版本后打开对应 APK 下载地址，由系统浏览器下载、系统安装器确认覆盖安装，继续使用既有 Android APK 发布签名。不绕过系统安装授权。
+- Android：发现新版本后打开对应 APK 下载地址，由系统浏览器下载、系统安装器确认安装；后续使用新密钥的版本可按当前发布约定卸载旧版后安装。不绕过系统安装授权。
 - 未打包的 Linux 开发程序或缺少对应更新清单的版本：提供正式发布页／安装包下载入口。
 - 普通浏览器：保留“下载客户端”，不能发起宿主应用的安装或重启。网页界面随宿主应用升级。
 
@@ -37,7 +37,11 @@ python3 scripts/checksums.py release
 
 tag 必须与当前 package.json 版本一致。签名结果是分离文件，不修改安装包。把三个 `.sig`、`latest.json`、新的 `SHA256SUMS` 与原有签名 APK、source.json、release-notes.md 一起放入发布用的暂存提交。暂存提交不得包含私钥或密码。`publish-prebuilt.yml` 验证构建来源、APK 签名、实际下载到的桌面安装包签名、清单和校验和后，上传完整资产，再把草稿设为最新正式版。
 
-另一条 `release.yml` 路径使用 GitHub Secrets 中的 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 和已有 Android 签名 Secrets，在发布任务中签名；没有这些密钥时会在发布前失败。私钥内容不得放入普通仓库变量、工作流参数、日志或公开构建资产。
+另一条 `release.yml` 路径使用 GitHub Secrets 中的 `TAURI_SIGNING_PRIVATE_KEY`（私钥文件内容）、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 和 Android 签名 Secrets，在发布任务中签名；没有必需密钥时在下载构建产物前报告缺少的 Secret 名称。
+
+Android 必需配置 `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`；`ANDROID_KEY_ALIAS` 可指定你的密钥别名（默认 `linchuan`），`ANDROID_KEY_PASSWORD` 可指定独立的 key 密码（默认复用 keystore 密码）。详细配置及 Base64 转换命令见[开发与发布](development.md)。已接受 Android 后续版本可卸载重装，此流程允许使用新 Android 密钥；这不改变桌面更新签名密钥及客户端内置公钥。
+
+流程独立验证 Android 签名、证书信息、16 KiB ZIP 对齐和桌面更新签名，最后生成校验和并发布；结束或失败后删除临时 keystore 与中间 APK。私钥内容不得放入普通仓库变量、工作流参数、日志或公开构建资产。
 
 ## 验证
 
