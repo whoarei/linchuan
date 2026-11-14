@@ -1,0 +1,64 @@
+name: Publish verified release
+on:
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Successful Build and verify run ID for the exact tagged commit
+        required: true
+      tag:
+        description: Existing version tag
+        default: v0.1.0
+        required: true
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Verify build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.build_run }}
+        run: |
+          test "$(gh run view "$RUN" --json conclusion --jq .conclusion)" = success
+          test "$(gh run view "$RUN" --json headSha --jq .headSha)" = "$(git rev-parse HEAD)"
+          test "$(gh run view "$RUN" --json workflowName --jq .workflowName)" = 'Build and verify'
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          pattern: '*-x64'
+          path: artifacts
+          merge-multiple: true
+      - name: Decode Android signing key
+        env:
+          KEY: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          test -n "$KEY" && test -n "$PASSWORD"
+          printf '%s' "$KEY" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          name: android-arm64-unsigned
+          path: android
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'build-tools;35.0.0'
+      - name: Sign APK and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          python3 scripts/collect-release.py artifacts release
+          APK=$(find android -name '*.apk' | head -n 1)
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -f -p 4 "$APK" "$RUNNER_TEMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks "$RUNNER_TEMP/release.keystore" --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out "release/Linchuan_${TAG#v}_android_arm64.apk" "$RUNNER_TEMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "release/Linchuan_${TAG#v}_android_arm64.apk"
+          python3 scripts/checksums.py release
+          gh release create "$TAG" release/* --verify-tag --title "邻传 $TAG" --notes-file docs/releases/0.1.0.md

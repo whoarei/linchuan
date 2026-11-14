@@ -1,0 +1,128 @@
+use crate::{model::*, App};
+use std::time::{Duration, Instant};
+use tokio_util::io::ReaderStream;
+
+pub async fn send(app: App, id: String, address: String) {
+    let result = run(&app, &id, &address).await;
+    if let Err(error) = result {
+        let mut state = app.0.state.lock().await;
+        if let Some(t) = state.transfers.get_mut(&id) {
+            if !t.view.terminal() {
+                t.view.status = "failed".into();
+                t.view.error = Some(error.to_string());
+            }
+        }
+        drop(state);
+        app.notify();
+    }
+}
+async fn update(app: &App, id: &str, status: &str, bytes: u64) -> bool {
+    let mut state = app.0.state.lock().await;
+    if let Some(t) = state.transfers.get_mut(id) {
+        if !t.view.terminal() {
+            t.view.status = status.into();
+            t.view.bytes = bytes;
+            drop(state);
+            app.notify();
+            return true;
+        }
+    }
+    false
+}
+async fn active(app: &App, id: &str) -> bool {
+    app.0
+        .state
+        .lock()
+        .await
+        .transfers
+        .get(id)
+        .is_some_and(|t| !t.view.terminal())
+}
+async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
+    crate::api::local_address(address).map_err(|_| anyhow::anyhow!("设备地址无效"))?;
+    let transfer = app
+        .0
+        .state
+        .lock()
+        .await
+        .transfers
+        .get(id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("传输已过期"))?;
+    let offer = Offer {
+        protocol: 1,
+        sender_name: transfer.view.sender_name,
+        text: transfer.view.text,
+        files: transfer.view.files,
+    };
+    let response = app
+        .0
+        .client
+        .post(format!("{address}/api/peer/offer"))
+        .json(&offer)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("无法连接接收设备，请检查网络和防火墙"))?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "接收设备拒绝了请求，可能接收队列或空间已满"
+    );
+    let remote: OfferResponse = response.json().await?;
+    let endpoint = format!("{address}/api/peer/transfers/{}", remote.id);
+    let result=async{
+        let start=Instant::now();
+        loop{
+            if !active(app,id).await{return Ok(());}
+            anyhow::ensure!(start.elapsed()<Duration::from_secs(300),"等待接收确认超时，请重新发送");
+            let response=app.0.client.get(&endpoint).bearer_auth(&remote.token).timeout(Duration::from_secs(5)).send().await?;
+            anyhow::ensure!(response.status().is_success(),"接收请求已过期");
+            let status:TransferView=response.json().await?;
+            match status.status.as_str(){
+                "accepted"=>break,
+                "rejected"|"cancelled"|"failed"=>{update(app,id,&status.status,0).await;return Ok(());},
+                _=>tokio::time::sleep(Duration::from_millis(400)).await,
+            }
+        }
+        let mut bytes=0;
+        if !update(app,id,"transferring",bytes).await{return Ok(());}
+        for file in &transfer.files{
+            if !active(app,id).await{return Ok(());}
+            let input=tokio::fs::File::open(&file.path).await?;
+            let upload=app.0.client.put(format!("{endpoint}/files/{}",file.meta.id)).bearer_auth(&remote.token).header("content-length",file.meta.size)
+                .body(reqwest::Body::wrap_stream(ReaderStream::new(input))).timeout(Duration::from_secs(3600)).send();
+            tokio::pin!(upload);
+            let response=loop{tokio::select!{
+                response=&mut upload=>break response?,
+                _=tokio::time::sleep(Duration::from_millis(300))=>{if !active(app,id).await{return Ok(());}}
+            }};
+            anyhow::ensure!(response.status().is_success(),"文件传输失败，对方可能已取消或磁盘空间不足");
+            bytes+=file.meta.size;
+            if !update(app,id,"transferring",bytes).await{return Ok(());}
+        }
+        if !active(app,id).await{return Ok(());}
+        let response=app.0.client.post(format!("{endpoint}/complete")).bearer_auth(&remote.token).timeout(Duration::from_secs(10)).send().await?;
+        anyhow::ensure!(response.status().is_success(),"接收方未确认传输完成");
+        update(app,id,"completed",bytes).await;
+        Ok::<_,anyhow::Error>(())
+    }.await;
+    let completed = app
+        .0
+        .state
+        .lock()
+        .await
+        .transfers
+        .get(id)
+        .is_some_and(|t| t.view.status == "completed");
+    if !completed {
+        let _ = app
+            .0
+            .client
+            .post(format!("{endpoint}/cancel"))
+            .bearer_auth(&remote.token)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await;
+    }
+    result
+}
