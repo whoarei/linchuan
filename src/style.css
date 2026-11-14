@@ -940,6 +940,7 @@ progress::-webkit-progress-value {
 }
 .name-form {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   margin-top: 20px;
@@ -947,7 +948,7 @@ progress::-webkit-progress-value {
 .name-form input {
   max-width: 320px;
   min-width: 0;
-  flex: 1;
+  flex: 1 1 220px;
 }
 .card-heading {
   display: flex;

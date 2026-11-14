@@ -318,6 +318,97 @@ async fn migration_rename_credentials_and_logout_are_durable() {
     );
 }
 #[tokio::test]
+async fn default_native_name_is_saved_and_manual_name_takes_precedence() {
+    let dir = TempDir::new().unwrap();
+    let mut options = Options::new(dir.path().into());
+    options.discovery = false;
+    let app = App::start(options).await.unwrap();
+    let mut host = Host {
+        url: app.bootstrap().address,
+        token: app.bootstrap().token,
+        app,
+        dir,
+    };
+    let original = host.app.info().await;
+    assert!(!original.name.is_empty());
+    assert_eq!(host.state().await["me"]["auto_name"], original.name);
+    host.restart().await;
+    assert_eq!(host.app.info().await.id, original.id);
+    assert_eq!(host.app.info().await.name, original.name);
+    host.post("/api/settings", json!({"name":"我的设备"})).await;
+    host.restart().await;
+    assert_eq!(host.app.info().await.name, "我的设备");
+    assert_eq!(host.state().await["me"]["auto_name"], original.name);
+}
+
+#[tokio::test]
+async fn automatic_browser_names_and_rename_preserve_identity_and_scope() {
+    let mut host = Host::new("宿主电脑").await;
+    let paired = Client::new()
+        .post(format!("{}/api/pair", host.url))
+        .header("user-agent", "Windows Chrome/131 Safari/537 Edg/131")
+        .json(&json!({"code":host.app.bootstrap().pairing_code}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(paired.status(), StatusCode::OK);
+    let paired: Value = paired.json().await.unwrap();
+    let token = paired["token"].as_str().unwrap();
+    let id = paired["id"].as_str().unwrap();
+    assert!(paired["name"]
+        .as_str()
+        .unwrap()
+        .starts_with("Windows · Edge · "));
+    let unnamed = host
+        .post(
+            "/api/pair",
+            json!({"code":host.app.bootstrap().pairing_code,"name":"  "}),
+        )
+        .await;
+    assert!(unnamed["name"].as_str().unwrap().starts_with("浏览器 · "));
+    assert_ne!(unnamed["id"], paired["id"]);
+    let other = host.pair(paired["name"].as_str().unwrap()).await;
+    host.send(Some(id.into()), None, "改名前的历史", None).await;
+    let conversation = cid(&host.state().await, id);
+    let result = host
+        .post_as(
+            "/api/settings",
+            json!({"name":"我的网页","id":host.app.info().await.id}),
+            token,
+        )
+        .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(host.app.info().await.name, "宿主电脑");
+    let me: Value = host.get("/api/state", token).await.json().await.unwrap();
+    assert_eq!(me["me"]["id"], id);
+    assert_eq!(me["me"]["name"], "我的网页");
+    assert!(me["me"]["auto_name"].is_null());
+    let sibling: Value = host.get("/api/state", &other).await.json().await.unwrap();
+    assert_eq!(sibling["me"]["name"], paired["name"]);
+    assert_ne!(sibling["me"]["id"], id);
+    let state = host.state().await;
+    assert_eq!(cid(&state, id), conversation);
+    assert_eq!(
+        state["conversations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == conversation)
+            .unwrap()["name"],
+        "我的网页"
+    );
+    host.restart().await;
+    let me: Value = host.get("/api/state", token).await.json().await.unwrap();
+    assert_eq!(me["me"]["name"], "我的网页");
+    assert_eq!(me["me"]["id"], id);
+    assert_eq!(cid(&host.state().await, id), conversation);
+    let history = host.timeline(&conversation, &host.token).await;
+    assert_eq!(history["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(history["messages"][0]["text"], "改名前的历史");
+    assert_eq!(host.app.info().await.name, "宿主电脑");
+}
+
+#[tokio::test]
 async fn timeline_cursor_and_browser_scope_are_enforced() {
     let host = Host::new("电脑").await;
     let one = host.pair("手机一").await;

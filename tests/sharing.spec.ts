@@ -53,13 +53,11 @@ test("browser text and Unicode file are received in a per-device conversation an
     .getByRole("textbox", { name: "发送文字" })
     .fill("来自浏览器的一段文字");
   const bytes = Buffer.from("邻传原始内容\n图片、文字与文件");
-  await page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "你好 邻传.txt",
-      mimeType: "text/plain",
-      buffer: bytes,
-    });
+  await page.locator("input[type=file]").setInputFiles({
+    name: "你好 邻传.txt",
+    mimeType: "text/plain",
+    buffer: bytes,
+  });
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await host.page
     .getByRole("button", { name: "打开 网页手机", exact: true })
@@ -137,13 +135,11 @@ test("group invitation, shared timeline and per-recipient acceptance work for br
   await host.page
     .getByRole("textbox", { name: "发送文字" })
     .fill("群里只有一条消息");
-  await host.page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "群资料.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from("group bytes"),
-    });
+  await host.page.locator("input[type=file]").setInputFiles({
+    name: "群资料.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("group bytes"),
+  });
   await host.page.getByRole("button", { name: "发送", exact: true }).click();
   for (const p of [a, b]) {
     const message = p
@@ -251,4 +247,75 @@ test("wrong pairing code shows a clear error", async ({ page }) => {
     .fill(b.pairing_code === "000000" ? "111111" : "000000");
   await page.getByRole("button", { name: "连接设备", exact: true }).click();
   await expect(page.getByRole("alert")).toBeVisible();
+});
+
+test("browser names are automatic, editable and remembered without changing identity", async ({
+  browser,
+}) => {
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+  });
+  const page = await context.newPage();
+  const b = await boot();
+  await page.goto(b.address);
+  const field = page.getByLabel("你的设备名称");
+  await expect(field).toHaveValue(/^Windows · Edge · [0-9A-F]{4}$/);
+  const automatic = await field.inputValue();
+  await page.reload();
+  await expect(field).toHaveValue(automatic);
+  await field.fill("");
+  await page.getByLabel("六位配对码").fill(b.pairing_code);
+  await page.getByRole("button", { name: "连接设备", exact: true }).click();
+  await expect(
+    page.getByRole("navigation", { name: "主要功能" }),
+  ).toBeVisible();
+  const identity = await page.evaluate(async () => {
+    const response = await fetch("/api/state", {
+      headers: {
+        Authorization: `Bearer ${sessionStorage.getItem("linchuan-token")}`,
+      },
+    });
+    return (await response.json()).me.id;
+  });
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
+    automatic,
+  );
+  await page.getByLabel("设备名称", { exact: true }).fill("我的 Edge 网页");
+  await page.getByRole("button", { name: "保存名称", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("设备名称已保存");
+  await page.reload();
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
+    "我的 Edge 网页",
+  );
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+  await page.screenshot({
+    path: ".playwright/browser-name-settings.png",
+    fullPage: true,
+  });
+  const renamedIdentity = await page.evaluate(async () => {
+    const response = await fetch("/api/state", {
+      headers: {
+        Authorization: `Bearer ${sessionStorage.getItem("linchuan-token")}`,
+      },
+    });
+    return (await response.json()).me.id;
+  });
+  expect(renamedIdentity).toBe(identity);
+  await page.getByRole("button", { name: "使用自动名称", exact: true }).click();
+  await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
+    automatic,
+  );
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await expect(field).toHaveValue("我的 Edge 网页");
+  await page.reload();
+  await expect(field).toHaveValue("我的 Edge 网页");
+  await context.close();
 });

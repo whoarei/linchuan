@@ -4,6 +4,7 @@ mod discovery;
 mod groups;
 mod identity;
 mod model;
+mod names;
 mod store;
 mod transport;
 use model::*;
@@ -31,6 +32,7 @@ impl Options {
 }
 struct Inner {
     config: Mutex<Config>,
+    auto_name: String,
     device_id: String,
     identity: ed25519_dalek::SigningKey,
     store: store::Store,
@@ -62,17 +64,11 @@ impl App {
         let fallback = if !options.directory.join("linchuan.db").exists() {
             match tokio::fs::read(options.directory.join("device.json")).await {
                 Ok(bytes) => serde_json::from_slice(&bytes)?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config {
-                    id: uid(),
-                    name: default_name(),
-                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => default_config(),
                 Err(e) => return Err(e.into()),
             }
         } else {
-            Config {
-                id: uid(),
-                name: default_name(),
-            }
+            default_config()
         };
         let directory = options.directory.clone();
         let name = options.name.map(|n| clean_name(&n)).transpose()?;
@@ -127,6 +123,7 @@ impl App {
         let (stop, _) = tokio::sync::watch::channel(false);
         let random = uuid::Uuid::new_v4().as_u128() % 1_000_000;
         let app = Self(Arc::new(Inner {
+            auto_name: names::native(&config.id),
             device_id: config.id.clone(),
             identity,
             store,
@@ -389,8 +386,10 @@ fn platform() -> &'static str {
         "Linux"
     }
 }
-fn default_name() -> String {
-    format!("{} · {}", platform(), &uid()[..4])
+fn default_config() -> Config {
+    let id = uid();
+    let name = names::native(&id);
+    Config { id, name }
 }
 fn addresses(port: u16) -> Vec<String> {
     let mut candidates: Vec<_> = if_addrs::get_if_addrs()

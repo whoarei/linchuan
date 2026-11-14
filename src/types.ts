@@ -72,7 +72,7 @@ export interface Message {
   deliveries: Transfer[];
 }
 export interface AppState {
-  me: { id: string; name: string; owner: boolean };
+  me: { id: string; name: string; owner: boolean; auto_name?: string | null };
   info: {
     id: string;
     name: string;

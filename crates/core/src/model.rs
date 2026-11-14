@@ -170,6 +170,7 @@ pub struct State {
 #[derive(Deserialize)]
 pub struct PairRequest {
     pub code: String,
+    #[serde(default)]
     pub name: String,
 }
 #[derive(Deserialize)]

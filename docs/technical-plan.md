@@ -2,6 +2,8 @@
 
 当前版本为 0.2.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
+开发中的[设备自动命名](device-names.md)使用现有 devices、app_settings 和 browser_sessions 关系，不变更数据库 schema 或设备身份。
+
 ## 模块
 
 - `crates/core/src/model.rs`：设备、会话、消息、传输、群和签名数据类型。

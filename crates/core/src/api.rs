@@ -147,9 +147,21 @@ async fn info(AxState(app): AxState<App>) -> Json<Info> {
 async fn pair(
     AxState(app): AxState<App>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<Value>> {
-    let name = crate::clean_name(&request.name).map_err(|e| Error::bad(e.to_string()))?;
+    let id = format!("browser-{}", uid());
+    let name = if request.name.trim().is_empty() {
+        crate::names::browser(
+            headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
+            &id,
+        )
+    } else {
+        crate::clean_name(&request.name).map_err(|e| Error::bad(e.to_string()))?
+    };
     let mut state = app.0.state.lock().await;
     rate_limit(&mut state, format!("pair:{}", addr.ip()), 12)?;
     if request.code != app.0.code {
@@ -159,7 +171,6 @@ async fn pair(
         return Err(Error::conflict("连接数量已达上限"));
     }
     let token = secret();
-    let id = format!("browser-{}", uid());
     state.sessions.insert(
         crate::identity::token_hash(&token),
         Session {
@@ -173,7 +184,7 @@ async fn pair(
         id.clone(),
         Device {
             id: id.clone(),
-            name,
+            name: name.clone(),
             platform: "浏览器".into(),
             kind: "browser".into(),
             host_device_id: app.0.device_id.clone(),
@@ -186,7 +197,7 @@ async fn pair(
     app.commit(&mut state).await?;
     drop(state);
     app.notify();
-    Ok(Json(json!({"token": token, "id": id})))
+    Ok(Json(json!({"token": token, "id": id, "name": name})))
 }
 pub(crate) fn rate_limit(state: &mut crate::model::State, key: String, limit: u32) -> Result<()> {
     if state.attempts.len() > 1024 {
@@ -276,7 +287,7 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
         })
         .collect();
     Ok(Json(
-        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_limit":MAX_STORAGE}),
+        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner,"auto_name":p.owner.then_some(&app.0.auto_name)}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_limit":MAX_STORAGE}),
     ))
 }
 async fn settings(
@@ -284,25 +295,38 @@ async fn settings(
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<Value>> {
-    if !app.principal(token(&headers)?).await?.owner {
-        return Err(Error::unauthorized());
-    }
+    let credential = token(&headers)?;
+    let principal = app.principal(credential).await?;
     let name = crate::clean_name(value["name"].as_str().unwrap_or(""))
         .map_err(|e| Error::bad(e.to_string()))?;
     let mut state = app.0.state.lock().await;
-    state
-        .profiles
-        .get_mut(&app.0.device_id)
-        .ok_or_else(Error::missing)?
-        .name = name.clone();
+    let State {
+        profiles, sessions, ..
+    } = &mut *state;
+    let profile = profiles.get_mut(&principal.id).ok_or_else(Error::missing)?;
+    let session = if principal.owner {
+        None
+    } else {
+        Some(
+            sessions
+                .get_mut(&crate::identity::token_hash(credential))
+                .ok_or_else(Error::unauthorized)?,
+        )
+    };
+    profile.name = name.clone();
+    if let Some(session) = session {
+        session.name = name.clone();
+    }
     app.commit(&mut state).await?;
     drop(state);
-    app.0.config.lock().await.name = name;
-    if let Err(e) = crate::discovery::announce(&app).await {
-        eprintln!("Device announcement update failed: {e}");
+    if principal.owner {
+        app.0.config.lock().await.name = name.clone();
+        if let Err(e) = crate::discovery::announce(&app).await {
+            eprintln!("Device announcement update failed: {e}");
+        }
     }
     app.notify();
-    Ok(Json(json!({"ok":true})))
+    Ok(Json(json!({"ok":true,"name":name})))
 }
 pub(crate) fn local_address(address: &str) -> Result<String> {
     let url = url::Url::parse(address)

@@ -33,6 +33,7 @@ import {
   Globe,
 } from "lucide-vue-next";
 import QRCode from "qrcode";
+import { browserIdentity, rememberBrowserName } from "./names";
 import {
   api,
   bootstrap,
@@ -80,7 +81,8 @@ const composer = ref<HTMLTextAreaElement>();
 const timeline = ref<HTMLDivElement>();
 const dragging = ref(false);
 const pairing = ref(false);
-const browserName = ref("");
+const browserIdentityName = browserIdentity();
+const browserName = ref(browserIdentityName.preferred);
 const code = ref("");
 const hostName = ref("邻传设备");
 const pairError = ref("");
@@ -105,6 +107,11 @@ const editingGroup = ref("");
 const expanded = ref(new Set<string>());
 const newName = ref("");
 const nameBusy = ref(false);
+const automaticName = computed(() =>
+  state.value?.me.owner
+    ? state.value.me.auto_name || state.value.me.name
+    : browserIdentityName.automatic,
+);
 const toast = ref("");
 const toastError = ref(false);
 let toastTimer: ReturnType<typeof setTimeout>;
@@ -288,11 +295,14 @@ async function pair() {
   pairing.value = true;
   pairError.value = "";
   try {
-    const value = await api<{ token: string }>("/api/pair", {
-      name: browserName.value,
+    const name = browserName.value.trim() || browserIdentityName.automatic;
+    const value = await api<{ token: string; name?: string }>("/api/pair", {
+      name,
       code: code.value,
     });
     setToken(value.token);
+    browserName.value = value.name || name;
+    rememberBrowserName(browserName.value);
     await refresh();
     if (ready.value) events();
   } catch (error) {
@@ -732,7 +742,14 @@ async function leaveGroup() {
 async function saveName() {
   nameBusy.value = true;
   try {
-    await api("/api/settings", { name: newName.value });
+    const saved = await api<{ name: string }>("/api/settings", {
+      name: newName.value,
+    });
+    newName.value = saved.name;
+    if (!state.value?.me.owner) {
+      rememberBrowserName(saved.name);
+      browserName.value = saved.name;
+    }
     await refresh();
     notify("设备名称已保存");
   } catch (error) {
@@ -830,9 +847,8 @@ onUnmounted(() => {
         <label
           >你的设备名称<input
             v-model="browserName"
-            required
             maxlength="64"
-            placeholder="例如：我的手机"
+            :placeholder="browserIdentityName.automatic"
             autocomplete="nickname" /></label
         ><label
           >六位配对码<input
@@ -1354,12 +1370,8 @@ onUnmounted(() => {
       </header>
       <section class="settings-card">
         <h2>设备名称</h2>
-        <p>附近设备将通过这个名字识别你。</p>
-        <form
-          v-if="state!.me.owner"
-          class="name-form"
-          @submit.prevent="saveName"
-        >
+        <p>已自动生成名称，也可以修改。附近设备将通过这个名字识别你。</p>
+        <form class="name-form" @submit.prevent="saveName">
           <label class="sr-only" for="device-name">设备名称</label
           ><input
             id="device-name"
@@ -1367,10 +1379,20 @@ onUnmounted(() => {
             required
             maxlength="64"
           /><button class="primary" :disabled="nameBusy">
-            <LoaderCircle v-if="nameBusy" class="spin" :size="15" />保存名称
+            <LoaderCircle
+              v-if="nameBusy"
+              class="spin"
+              :size="15"
+            />保存名称</button
+          ><button
+            type="button"
+            class="secondary"
+            :disabled="nameBusy"
+            @click="newName = automaticName"
+          >
+            使用自动名称
           </button>
         </form>
-        <p v-else class="browser-label">{{ state!.me.name }} · 浏览器会话</p>
       </section>
       <section v-if="state!.me.owner" class="settings-card">
         <div class="card-heading">
