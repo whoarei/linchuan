@@ -15,6 +15,14 @@
 
 发布任务统一使用 GitHub Secrets，上传四个安装包、三个桌面签名、latest.json 和 SHA256SUMS。全部文件上传并核对名称、长度、SHA-256 后自动公开，正式版设为 Latest，RC 保持 Pre-release。已有正式版和历史资产不覆盖。
 
+## 实际发布记录
+
+- [v0.4.0 正式版](https://github.com/whoarei/linchuan/releases/tag/v0.4.0)于 2026-11-14 发布并设为 Latest；发布源码为 `abaae8f66a129477cc49cd56c3700fe44208ab28`。
+- [完整发布流水线](https://github.com/whoarei/linchuan/actions/runs/43615974289)全部通过：Checks、Windows NSIS、Linux DEB／AppImage、Android arm64 和统一签名发布任务。Linux 普通启动与 --autostart 模式的原生服务检查均通过。
+- 发布后从公开下载地址重新下载全部九个资产，核对 SHA256SUMS、远端摘要、三个桌面更新签名、精确版本和 Debian 包版本；公开 Latest 与 latest.json 均指向 0.4.0。
+- Android APK 的证书验证、应用 ID、版本名称 0.4.0、版本码 400999 和 ZIP 16 KiB 对齐检查通过。证书主题为 `CN=Pindou, OU=Mobile, O=Pindou, L=Shanghai, ST=Shanghai, C=CN`，SHA-256 指纹为 `28c461e4f2f8612f9d7717d727e772177474798fd7c48b03ca3ffbca8c81bf0a`。
+- 首次发布在草稿查询阶段中止，草稿未公开。修复 GitHub 按标签接口不返回草稿的问题后，补充草稿分页查找、歧义与失败保护测试，并重新完成全部构建与发布。
+
 ## 实机边界
 
 接口模拟不替代 Windows／Linux 真实登录后的开机启动和托盘菜单实测，也不替代真实系统安装器与 Android MediaStore／SAF 目录提供器验收。Linux 托盘取决于桌面环境支持；托盘创建失败会退回普通窗口。Android 本轮不增加后台常驻或开机启动。
