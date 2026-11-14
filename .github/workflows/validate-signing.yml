@@ -1,0 +1,71 @@
+name: Validate signing configuration
+on:
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Successful Build and verify run containing the unsigned Android APK
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Verify source build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN: ${{ inputs.build_run }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json conclusion --jq .conclusion)" = success
+          test "$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json workflowName --jq .workflowName)" = 'Build and verify'
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          name: android-arm64-unsigned
+          path: android
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
+      - name: Sign and verify test APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS || 'linchuan' }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" || { echo '::error::Missing ANDROID_KEYSTORE_BASE64'; exit 1; }
+          test -n "$KEYSTORE_PASSWORD" || { echo '::error::Missing ANDROID_KEYSTORE_PASSWORD'; exit 1; }
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/linchuan-check.keystore"
+          export KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          mapfile -d '' apks < <(find android -type f -name '*.apk' -print0)
+          if [ "${#apks[@]}" -ne 1 ]; then
+            echo '::error::Expected exactly one Android release APK'
+            exit 1
+          fi
+          build_tools="$ANDROID_HOME/build-tools/35.0.0"
+          "$build_tools/zipalign" -P 16 -f 4 "${apks[0]}" "$RUNNER_TEMP/linchuan-check-aligned.apk"
+          "$build_tools/apksigner" sign --v4-signing-enabled false --ks "$RUNNER_TEMP/linchuan-check.keystore" --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "$RUNNER_TEMP/linchuan-check-signed.apk" "$RUNNER_TEMP/linchuan-check-aligned.apk"
+          "$build_tools/apksigner" verify --verbose --print-certs "$RUNNER_TEMP/linchuan-check-signed.apk"
+          "$build_tools/zipalign" -c -P 16 4 "$RUNNER_TEMP/linchuan-check-signed.apk"
+          echo 'Android keystore, alias, passwords, APK signature and 16 KiB alignment verified.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Report desktop signing configuration
+        env:
+          UPDATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$UPDATE_KEY" ]; then
+            echo 'Desktop update signing key is configured; its password and public-key match are verified during release signing.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Android verification passed. TAURI_SIGNING_PRIVATE_KEY is not configured; full three-platform release signing still requires the separate desktop update key.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Remove temporary signing files
+        if: always()
+        run: rm -f "$RUNNER_TEMP/linchuan-check.keystore" "$RUNNER_TEMP/linchuan-check-aligned.apk" "$RUNNER_TEMP/linchuan-check-signed.apk"

@@ -97,6 +97,8 @@ Windows PowerShell 示例：
 
 此配置已通过 actionlint、YAML 和 Bash 语法检查，并在本地用临时测试 keystore 执行工作流中的实际签名命令：覆盖默认别名、任意别名、独立 key 密码、密码回退、多 APK 拒绝和临时文件清理。测试仅在临时目录重签公开 APK，原正式版文件未修改；用户自己的 Secrets 配置尚需由维护者添加后验证。
 
+Secrets 填好后，可运行 `Validate signing configuration`，传入已成功的 `Build and verify` run ID。该任务只用 Android 产物测试签名、别名、密码及对齐，输出公开证书信息和是否配置桌面更新密钥的状态；不上传测试 APK、不发布 Release，也不导出密钥。任务只有 contents/actions 读取权限，结束或失败时删除临时密钥及测试 APK。
+
 ## 发布步骤
 
 1. 更新各处版本（`package.json`、两个 Rust crate、`tauri.conf.json`）及锁文件、发布说明。
