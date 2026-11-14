@@ -7,7 +7,7 @@ on:
         required: true
       tag:
         description: Existing version tag
-        default: v0.1.0
+        default: v0.2.0
         required: true
 permissions:
   contents: write
@@ -61,7 +61,7 @@ jobs:
           python3 scripts/collect-release.py artifacts release
           APK=$(find android -name '*.apk' | head -n 1)
           "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -f 4 "$APK" "$RUNNER_TEMP/aligned.apk"
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks "$RUNNER_TEMP/release.keystore" --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out "release/Linchuan_${TAG#v}_android_arm64.apk" "$RUNNER_TEMP/aligned.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --v4-signing-enabled false --ks "$RUNNER_TEMP/release.keystore" --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out "release/Linchuan_${TAG#v}_android_arm64.apk" "$RUNNER_TEMP/aligned.apk"
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "release/Linchuan_${TAG#v}_android_arm64.apk"
           python3 scripts/checksums.py release
-          gh release create "$TAG" release/* --verify-tag --title "邻传 $TAG" --notes-file docs/releases/0.1.0.md
+          gh release create "$TAG" release/* --verify-tag --title "邻传 $TAG" --notes-file "docs/releases/${TAG#v}.md"

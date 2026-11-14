@@ -1,6 +1,6 @@
 # 邻传技术方案
 
-当前开发基线为 0.2.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
+当前版本为 0.2.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
 ## 模块
 

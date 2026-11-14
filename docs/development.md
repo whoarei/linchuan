@@ -60,8 +60,8 @@ npm run tauri android build -- --apk --target aarch64 --ci
 
 ```bash
 zipalign -P 16 -f 4 input-unsigned.apk aligned.apk
-apksigner sign --ks /private/linchuan-release.keystore --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out Linchuan_0.1.0_android_arm64.apk aligned.apk
-apksigner verify --verbose --print-certs Linchuan_0.1.0_android_arm64.apk
+apksigner sign --v4-signing-enabled false --ks /private/linchuan-release.keystore --ks-key-alias linchuan --ks-pass env:PASSWORD --key-pass env:PASSWORD --out Linchuan_0.2.0_android_arm64.apk aligned.apk
+apksigner verify --verbose --print-certs Linchuan_0.2.0_android_arm64.apk
 ```
 
 不要将密码放进命令行字面量或仓库。`PASSWORD` 由维护者从私有密码管理工具或文件注入。
