@@ -1,41 +1,31 @@
-/// Names are labels only. Device IDs and pairing credentials remain independent.
-pub(crate) fn native(id: &str) -> String {
-    let hostname = hostname::get().ok();
-    native_with_hostname(
-        crate::platform(),
-        hostname.as_deref().and_then(|h| h.to_str()),
-        id,
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
+
+#[derive(Deserialize)]
+struct Words {
+    moods: Vec<String>,
+    animals: Vec<String>,
+}
+
+static WORDS: LazyLock<Words> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("../../../shared/device-names.json"))
+        .expect("valid bundled device name dictionary")
+});
+
+/// A label derived from a random device ID, independent of its authentication.
+pub(crate) fn for_id(id: &str) -> String {
+    let digest = Sha256::digest(id.as_bytes());
+    let seed = u64::from_le_bytes(digest[..8].try_into().unwrap());
+    let index = (seed % (WORDS.moods.len() * WORDS.animals.len()) as u64) as usize;
+    format!(
+        "{}{}",
+        WORDS.moods[index / WORDS.animals.len()],
+        WORDS.animals[index % WORDS.animals.len()]
     )
 }
 
-fn native_with_hostname(platform: &str, hostname: Option<&str>, id: &str) -> String {
-    let name: String = hostname
-        .unwrap_or_default()
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(64)
-        .collect();
-    if !name.is_empty()
-        && !matches!(
-            name.to_ascii_lowercase().as_str(),
-            "localhost"
-                | "localhost.localdomain"
-                | "localhost6"
-                | "localhost6.localdomain6"
-                | "(none)"
-                | "android"
-        )
-    {
-        name
-    } else {
-        format!("{platform} · {}", suffix(id))
-    }
-}
-
-pub(crate) fn browser(user_agent: &str, id: &str) -> String {
+pub(crate) fn browser_platform(user_agent: &str) -> String {
     let os = if user_agent.contains("Android") {
         "Android"
     } else if user_agent.contains("iPhone")
@@ -72,22 +62,11 @@ pub(crate) fn browser(user_agent: &str, id: &str) -> String {
     } else {
         "浏览器"
     };
-    [os.to_string(), browser.to_string(), suffix(id)]
+    [os, browser]
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join(" · ")
-}
-
-fn suffix(id: &str) -> String {
-    id.chars()
-        .rev()
-        .take(4)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<String>()
-        .to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -95,44 +74,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_names_prefer_clean_hostname_and_fall_back_for_generic_hosts() {
-        assert_eq!(
-            native_with_hostname("Windows", Some(" 小林的电脑\n"), "a7f2"),
-            "小林的电脑"
-        );
-        assert_eq!(
-            native_with_hostname("Android", Some("localhost"), "a7f2"),
-            "Android · A7F2"
-        );
-        assert_eq!(native_with_hostname("Linux", None, "a7f2"), "Linux · A7F2");
-        assert_eq!(
-            native_with_hostname("Linux", Some(&"名".repeat(80)), "a7f2")
-                .chars()
-                .count(),
-            64
-        );
+    fn dictionary_is_unique_and_names_are_stable_valid_labels() {
+        let mut names = std::collections::HashSet::new();
+        for mood in &WORDS.moods {
+            for animal in &WORDS.animals {
+                let name = format!("{mood}{animal}");
+                assert_eq!(crate::clean_name(&name).unwrap(), name);
+                assert!(names.insert(name));
+            }
+        }
+        assert!(names.len() >= 2000);
+        assert!(names.contains(&for_id("device-one")));
+        assert_eq!(for_id("device-one"), "自在小鹿");
     }
 
     #[test]
-    fn browser_names_recognize_overlapping_user_agents() {
+    fn browser_platforms_recognize_overlapping_user_agents() {
         for (ua, expected) in [
-            (
-                "Windows Chrome/131 Safari/537 Edg/131",
-                "Windows · Edge · A7F2",
-            ),
-            (
-                "Linux Android Chrome/131 Safari/537",
-                "Android · Chrome · A7F2",
-            ),
-            (
-                "iPhone Mac OS X CriOS/131 Safari/604",
-                "iOS · Chrome · A7F2",
-            ),
-            ("Macintosh Safari/605", "Mac · Safari · A7F2"),
-            ("Linux Firefox/132", "Linux · Firefox · A7F2"),
-            ("", "浏览器 · A7F2"),
+            ("Windows Chrome/131 Safari/537 Edg/131", "Windows · Edge"),
+            ("Linux Android Chrome/131 Safari/537", "Android · Chrome"),
+            ("iPhone Mac OS X CriOS/131 Safari/604", "iOS · Chrome"),
+            ("Macintosh Safari/605", "Mac · Safari"),
+            ("Linux Firefox/132", "Linux · Firefox"),
+            ("", "浏览器"),
         ] {
-            assert_eq!(browser(ua, "a7f2"), expected);
+            assert_eq!(browser_platform(ua), expected);
         }
     }
 }

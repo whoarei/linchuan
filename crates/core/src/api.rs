@@ -152,13 +152,7 @@ async fn pair(
 ) -> Result<Json<Value>> {
     let id = format!("browser-{}", uid());
     let name = if request.name.trim().is_empty() {
-        crate::names::browser(
-            headers
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or_default(),
-            &id,
-        )
+        crate::names::for_id(&id)
     } else {
         crate::clean_name(&request.name).map_err(|e| Error::bad(e.to_string()))?
     };
@@ -185,7 +179,12 @@ async fn pair(
         Device {
             id: id.clone(),
             name: name.clone(),
-            platform: "浏览器".into(),
+            platform: crate::names::browser_platform(
+                headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default(),
+            ),
             kind: "browser".into(),
             host_device_id: app.0.device_id.clone(),
             public_key: hex::encode(app.0.identity.verifying_key().to_bytes()),
@@ -255,7 +254,11 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
             .map(|s| Device {
                 id: s.id.clone(),
                 name: s.name.clone(),
-                platform: "浏览器".into(),
+                platform: state
+                    .profiles
+                    .get(&s.id)
+                    .map(|d| d.platform.clone())
+                    .unwrap_or_else(|| "浏览器".into()),
                 address: String::new(),
                 last_seen: s.last_seen,
                 kind: "browser".into(),
@@ -286,8 +289,13 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
             group
         })
         .collect();
+    let platform = state
+        .profiles
+        .get(&p.id)
+        .map(|d| d.platform.as_str())
+        .unwrap_or("浏览器");
     Ok(Json(
-        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner,"auto_name":p.owner.then_some(&app.0.auto_name)}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_limit":MAX_STORAGE}),
+        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner,"platform":platform,"auto_name":p.owner.then(|| crate::names::for_id(&p.id))}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_limit":MAX_STORAGE}),
     ))
 }
 async fn settings(

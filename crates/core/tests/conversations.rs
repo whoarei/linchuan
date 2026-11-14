@@ -146,6 +146,25 @@ fn cid(state: &Value, peer: &str) -> String {
         .unwrap()
         .into()
 }
+fn assert_nickname(name: &str) {
+    let words: Value =
+        serde_json::from_str(include_str!("../../../shared/device-names.json")).unwrap();
+    assert!(
+        words["moods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|mood| words["animals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |animal| format!("{}{}", mood.as_str().unwrap(), animal.as_str().unwrap())
+                        == name
+                )),
+        "unexpected nickname: {name}"
+    );
+}
 async fn group(a: &Host, b: &Host, c: &Host) -> String {
     let b_id = a.connect(b).await;
     let c_id = a.connect(c).await;
@@ -330,7 +349,7 @@ async fn default_native_name_is_saved_and_manual_name_takes_precedence() {
         dir,
     };
     let original = host.app.info().await;
-    assert!(!original.name.is_empty());
+    assert_nickname(&original.name);
     assert_eq!(host.state().await["me"]["auto_name"], original.name);
     host.restart().await;
     assert_eq!(host.app.info().await.id, original.id);
@@ -355,17 +374,14 @@ async fn automatic_browser_names_and_rename_preserve_identity_and_scope() {
     let paired: Value = paired.json().await.unwrap();
     let token = paired["token"].as_str().unwrap();
     let id = paired["id"].as_str().unwrap();
-    assert!(paired["name"]
-        .as_str()
-        .unwrap()
-        .starts_with("Windows · Edge · "));
+    assert_nickname(paired["name"].as_str().unwrap());
     let unnamed = host
         .post(
             "/api/pair",
             json!({"code":host.app.bootstrap().pairing_code,"name":"  "}),
         )
         .await;
-    assert!(unnamed["name"].as_str().unwrap().starts_with("浏览器 · "));
+    assert_nickname(unnamed["name"].as_str().unwrap());
     assert_ne!(unnamed["id"], paired["id"]);
     let other = host.pair(paired["name"].as_str().unwrap()).await;
     host.send(Some(id.into()), None, "改名前的历史", None).await;
@@ -382,6 +398,7 @@ async fn automatic_browser_names_and_rename_preserve_identity_and_scope() {
     let me: Value = host.get("/api/state", token).await.json().await.unwrap();
     assert_eq!(me["me"]["id"], id);
     assert_eq!(me["me"]["name"], "我的网页");
+    assert_eq!(me["me"]["platform"], "Windows · Edge");
     assert!(me["me"]["auto_name"].is_null());
     let sibling: Value = host.get("/api/state", &other).await.json().await.unwrap();
     assert_eq!(sibling["me"]["name"], paired["name"]);
@@ -401,6 +418,7 @@ async fn automatic_browser_names_and_rename_preserve_identity_and_scope() {
     let me: Value = host.get("/api/state", token).await.json().await.unwrap();
     assert_eq!(me["me"]["name"], "我的网页");
     assert_eq!(me["me"]["id"], id);
+    assert_eq!(me["me"]["platform"], "Windows · Edge");
     assert_eq!(cid(&host.state().await, id), conversation);
     let history = host.timeline(&conversation, &host.token).await;
     assert_eq!(history["messages"].as_array().unwrap().len(), 1);

@@ -5,6 +5,24 @@ async function boot(index = 0) {
     await readFile(`.playwright/bootstrap-${index}.json`, "utf8"),
   );
 }
+async function nicknames() {
+  const words = JSON.parse(await readFile("shared/device-names.json", "utf8"));
+  return new Set<string>(
+    words.moods.flatMap((mood: string) =>
+      words.animals.map((animal: string) => mood + animal),
+    ),
+  );
+}
+async function me(page: Page) {
+  return page.evaluate(async () => {
+    const response = await fetch("/api/state", {
+      headers: {
+        Authorization: `Bearer ${sessionStorage.getItem("linchuan-token")}`,
+      },
+    });
+    return (await response.json()).me;
+  });
+}
 async function owner(browser: Browser, index = 0) {
   const b = await boot(index);
   const context = await browser.newContext();
@@ -174,6 +192,14 @@ test("settings exposes device rename; drafts and history survive a page reload",
     .fill("还没有发送的草稿");
   await host.page.getByRole("button", { name: "设置", exact: true }).click();
   await host.page
+    .getByRole("button", { name: "换个名字", exact: true })
+    .click();
+  expect(
+    (await nicknames()).has(
+      await host.page.getByLabel("设备名称", { exact: true }).inputValue(),
+    ),
+  ).toBe(true);
+  await host.page
     .getByLabel("设备名称", { exact: true })
     .fill("重命名后的电脑");
   await host.page
@@ -260,8 +286,10 @@ test("browser names are automatic, editable and remembered without changing iden
   const b = await boot();
   await page.goto(b.address);
   const field = page.getByLabel("你的设备名称");
-  await expect(field).toHaveValue(/^Windows · Edge · [0-9A-F]{4}$/);
+  await expect(field).not.toBeEmpty();
   const automatic = await field.inputValue();
+  const choices = await nicknames();
+  expect(choices.has(automatic)).toBe(true);
   await page.reload();
   await expect(field).toHaveValue(automatic);
   await field.fill("");
@@ -270,14 +298,9 @@ test("browser names are automatic, editable and remembered without changing iden
   await expect(
     page.getByRole("navigation", { name: "主要功能" }),
   ).toBeVisible();
-  const identity = await page.evaluate(async () => {
-    const response = await fetch("/api/state", {
-      headers: {
-        Authorization: `Bearer ${sessionStorage.getItem("linchuan-token")}`,
-      },
-    });
-    return (await response.json()).me.id;
-  });
+  const identity = (await me(page)).id;
+  expect((await me(page)).platform).toBe("Windows · Edge");
+  await expect(page.locator(".list-footer small")).toHaveText("Windows · Edge");
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
     automatic,
@@ -300,22 +323,109 @@ test("browser names are automatic, editable and remembered without changing iden
     path: ".playwright/browser-name-settings.png",
     fullPage: true,
   });
-  const renamedIdentity = await page.evaluate(async () => {
-    const response = await fetch("/api/state", {
-      headers: {
-        Authorization: `Bearer ${sessionStorage.getItem("linchuan-token")}`,
-      },
-    });
-    return (await response.json()).me.id;
-  });
+  const renamedIdentity = (await me(page)).id;
   expect(renamedIdentity).toBe(identity);
-  await page.getByRole("button", { name: "使用自动名称", exact: true }).click();
-  await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
-    automatic,
-  );
-  await page.getByRole("button", { name: "断开连接", exact: true }).click();
-  await expect(field).toHaveValue("我的 Edge 网页");
+  await page.getByRole("button", { name: "换个名字", exact: true }).click();
+  const generated = await page
+    .getByLabel("设备名称", { exact: true })
+    .inputValue();
+  expect(choices.has(generated)).toBe(true);
+  expect((await me(page)).name).toBe("我的 Edge 网页");
+  await page.getByRole("button", { name: "换个名字", exact: true }).click();
+  const next = await page.getByLabel("设备名称", { exact: true }).inputValue();
+  expect(next).not.toBe(generated);
+  expect(choices.has(next)).toBe(true);
+  await page.getByRole("button", { name: "保存名称", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("设备名称已保存");
   await page.reload();
-  await expect(field).toHaveValue("我的 Edge 网页");
+  expect((await me(page)).id).toBe(identity);
+  expect((await me(page)).name).toBe(next);
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(next);
+  await page.getByRole("button", { name: "断开连接", exact: true }).click();
+  await expect(field).toHaveValue(next);
+  await page.reload();
+  await expect(field).toHaveValue(next);
   await context.close();
+});
+
+test("matching nicknames are distinguished across nearby devices and conversations", async ({
+  browser,
+}) => {
+  const host = await owner(browser);
+  const a = await browser.newContext();
+  const b = await browser.newContext();
+  const first = await a.newPage();
+  const second = await b.newPage();
+  await pair(first, "摸鱼海獭");
+  await pair(second, "摸鱼海獭");
+  const one = await me(first);
+  const two = await me(second);
+  let suffixLength = 4;
+  while (one.id.slice(-suffixLength) === two.id.slice(-suffixLength))
+    suffixLength += 4;
+  const oneLabel = `摸鱼海獭 · ${one.id.slice(-suffixLength).toUpperCase()}`;
+  const twoLabel = `摸鱼海獭 · ${two.id.slice(-suffixLength).toUpperCase()}`;
+  await expect(
+    host.page.getByRole("button", { name: `连接 ${oneLabel}`, exact: true }),
+  ).toBeVisible();
+  await expect(
+    host.page.getByRole("button", { name: `连接 ${twoLabel}`, exact: true }),
+  ).toBeVisible();
+  await host.page
+    .getByRole("button", { name: `连接 ${oneLabel}`, exact: true })
+    .click();
+  await expect(
+    host.page.getByRole("heading", { name: oneLabel, exact: true }),
+  ).toBeVisible();
+  await expect(
+    host.page.getByRole("button", { name: `打开 ${oneLabel}`, exact: true }),
+  ).toBeVisible();
+  await expect(
+    host.page.getByRole("button", { name: `连接 ${twoLabel}`, exact: true }),
+  ).toBeVisible();
+  await host.page.screenshot({
+    path: ".playwright/nickname-collision.png",
+    fullPage: true,
+  });
+  await first.getByRole("button", { name: "设置", exact: true }).click();
+  await first.getByLabel("设备名称", { exact: true }).fill("好奇水豚");
+  await first.getByRole("button", { name: "保存名称", exact: true }).click();
+  await expect(
+    host.page.getByRole("button", { name: "打开 好奇水豚", exact: true }),
+  ).toBeVisible();
+  await expect(
+    host.page.getByRole("button", { name: "连接 摸鱼海獭", exact: true }),
+  ).toBeVisible();
+  expect((await me(first)).id).toBe(one.id);
+  expect((await me(second)).id).toBe(two.id);
+  await host.context.close();
+  await a.close();
+  await b.close();
+});
+
+test("existing browser names are preserved when animal nicknames are introduced", async ({
+  browser,
+}) => {
+  for (const preferred of ["", "我的旧名字"]) {
+    const context = await browser.newContext();
+    await context.addInitScript((name) => {
+      if (!localStorage.getItem("linchuan-browser-auto-name"))
+        localStorage.setItem(
+          "linchuan-browser-auto-name",
+          "Windows · Edge · A7F2",
+        );
+      if (name) localStorage.setItem("linchuan-browser-name", name);
+    }, preferred);
+    const page = await context.newPage();
+    await page.goto((await boot()).address);
+    await expect(page.getByLabel("你的设备名称")).toHaveValue(
+      preferred || "Windows · Edge · A7F2",
+    );
+    await page.reload();
+    await expect(page.getByLabel("你的设备名称")).toHaveValue(
+      preferred || "Windows · Edge · A7F2",
+    );
+    await context.close();
+  }
 });

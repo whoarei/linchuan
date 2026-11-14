@@ -32,7 +32,6 @@ impl Options {
 }
 struct Inner {
     config: Mutex<Config>,
-    auto_name: String,
     device_id: String,
     identity: ed25519_dalek::SigningKey,
     store: store::Store,
@@ -123,7 +122,6 @@ impl App {
         let (stop, _) = tokio::sync::watch::channel(false);
         let random = uuid::Uuid::new_v4().as_u128() % 1_000_000;
         let app = Self(Arc::new(Inner {
-            auto_name: names::native(&config.id),
             device_id: config.id.clone(),
             identity,
             store,
@@ -388,7 +386,7 @@ fn platform() -> &'static str {
 }
 fn default_config() -> Config {
     let id = uid();
-    let name = names::native(&id);
+    let name = names::for_id(&id);
     Config { id, name }
 }
 fn addresses(port: u16) -> Vec<String> {

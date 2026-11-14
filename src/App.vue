@@ -33,7 +33,12 @@ import {
   Globe,
 } from "lucide-vue-next";
 import QRCode from "qrcode";
-import { browserIdentity, rememberBrowserName } from "./names";
+import {
+  browserIdentity,
+  rememberBrowserName,
+  randomNickname,
+  deviceLabels,
+} from "./names";
 import {
   api,
   bootstrap,
@@ -107,11 +112,6 @@ const editingGroup = ref("");
 const expanded = ref(new Set<string>());
 const newName = ref("");
 const nameBusy = ref(false);
-const automaticName = computed(() =>
-  state.value?.me.owner
-    ? state.value.me.auto_name || state.value.me.name
-    : browserIdentityName.automatic,
-);
 const toast = ref("");
 const toastError = ref(false);
 let toastTimer: ReturnType<typeof setTimeout>;
@@ -131,6 +131,31 @@ let draftWrites: Promise<unknown> = Promise.resolve();
 const current = computed(() =>
   state.value?.conversations.find((c) => c.id === selected.value),
 );
+const currentDevice = computed(() =>
+  state.value?.devices.find((d) => d.id === current.value?.peer_id),
+);
+const displayNames = computed(() => {
+  if (!state.value) return new Map<string, string>();
+  return deviceLabels([
+    ...state.value.groups.flatMap((g) => g.members.map((m) => m.device)),
+    ...state.value.conversations
+      .filter((c) => c.kind === "direct" && c.peer_id)
+      .map((c) => ({ id: c.peer_id!, name: c.name })),
+    ...state.value.devices,
+    state.value.me,
+  ]);
+});
+function deviceLabel(id: string, name: string) {
+  return displayNames.value.get(id) || name;
+}
+function conversationLabel(conversation: Conversation) {
+  return conversation.kind === "direct"
+    ? deviceLabel(conversation.peer_id || "", conversation.name)
+    : conversation.name;
+}
+function shuffleName() {
+  newName.value = randomNickname([newName.value, state.value?.me.name || ""]);
+}
 const group = computed(() =>
   state.value?.groups.find((g) => g.id === current.value?.group_id),
 );
@@ -957,7 +982,7 @@ onUnmounted(() => {
           :key="conversation.id"
           class="conversation-row"
           :class="{ selected: conversation.id === selected }"
-          :aria-label="`打开 ${conversation.name}`"
+          :aria-label="`打开 ${conversationLabel(conversation)}`"
           @click="selectConversation(conversation)"
         >
           <span class="avatar" :class="{ group: conversation.kind === 'group' }"
@@ -969,7 +994,7 @@ onUnmounted(() => {
               " /></span
           ><span class="row-copy"
             ><span class="row-title"
-              ><b>{{ conversation.name }}</b
+              ><b>{{ conversationLabel(conversation) }}</b
               ><time v-if="conversation.last_message_at">{{
                 timestamp(conversation.last_message_at)
               }}</time></span
@@ -991,7 +1016,7 @@ onUnmounted(() => {
           v-for="device in nearby"
           :key="device.id"
           class="conversation-row"
-          :aria-label="`连接 ${device.name}`"
+          :aria-label="`连接 ${deviceLabel(device.id, device.name)}`"
           @click="selectDevice(device)"
         >
           <span class="avatar"
@@ -1002,7 +1027,7 @@ onUnmounted(() => {
               :size="23" /><Monitor v-else :size="23" /><i /></span
           ><span class="row-copy"
             ><span class="row-title"
-              ><b>{{ device.name }}</b></span
+              ><b>{{ deviceLabel(device.id, device.name) }}</b></span
             ><span class="row-preview">{{ device.platform }} · 在线</span></span
           >
         </button>
@@ -1019,9 +1044,9 @@ onUnmounted(() => {
       <footer class="list-footer">
         <span class="self-avatar">{{ state!.me.name.slice(0, 1) }}</span
         ><span
-          ><b>{{ state!.me.name }}</b
+          ><b>{{ deviceLabel(state!.me.id, state!.me.name) }}</b
           ><small>{{
-            state!.me.owner ? "本机设备" : "浏览器会话"
+            state!.me.platform + (state!.me.owner ? " · 本机设备" : "")
           }}</small></span
         ><button
           v-if="state!.me.owner"
@@ -1048,7 +1073,7 @@ onUnmounted(() => {
             <ArrowLeft :size="21" />
           </button>
           <div class="chat-title">
-            <h2>{{ current.name }}</h2>
+            <h2>{{ conversationLabel(current) }}</h2>
             <p v-if="current.kind === 'group'">
               {{
                 group?.members.filter((m) => m.state === "joined").length || 0
@@ -1061,7 +1086,9 @@ onUnmounted(() => {
               <span
                 class="connection-dot"
                 :class="{ offline: !online(current.peer_id) }"
-              />{{ online(current.peer_id) ? "在线" : "离线 · 历史记录保留" }}
+              /><template v-if="currentDevice"
+                >{{ currentDevice.platform }} · </template
+              >{{ online(current.peer_id) ? "在线" : "离线 · 历史记录保留" }}
             </p>
           </div>
           <button
@@ -1370,7 +1397,7 @@ onUnmounted(() => {
       </header>
       <section class="settings-card">
         <h2>设备名称</h2>
-        <p>已自动生成名称，也可以修改。附近设备将通过这个名字识别你。</p>
+        <p>自动生成动物昵称，也可以修改。附近设备将通过这个名字识别你。</p>
         <form class="name-form" @submit.prevent="saveName">
           <label class="sr-only" for="device-name">设备名称</label
           ><input
@@ -1388,9 +1415,9 @@ onUnmounted(() => {
             type="button"
             class="secondary"
             :disabled="nameBusy"
-            @click="newName = automaticName"
+            @click="shuffleName"
           >
-            使用自动名称
+            换个名字
           </button>
         </form>
       </section>
@@ -1544,7 +1571,8 @@ onUnmounted(() => {
                 :value="device.id"
               /><span class="avatar small-avatar"><Monitor :size="18" /></span
               ><span
-                >{{ device.name }}<small>{{ device.platform }}</small></span
+                >{{ deviceLabel(device.id, device.name)
+                }}<small>{{ device.platform }}</small></span
               ></label
             >
             <p v-if="!eligible.length">暂无支持群聊的附近设备</p>
@@ -1572,7 +1600,7 @@ onUnmounted(() => {
               member.device.name.slice(0, 1)
             }}</span
             ><span
-              >{{ member.device.name
+              >{{ deviceLabel(member.device.id, member.device.name)
               }}<small
                 >{{ member.role === "owner" ? "群主 · " : ""
                 }}{{
