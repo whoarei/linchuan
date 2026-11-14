@@ -1,6 +1,10 @@
 mod api;
+mod conversations;
 mod discovery;
+mod groups;
+mod identity;
 mod model;
+mod store;
 mod transport;
 use model::*;
 pub use model::{Bootstrap, Info, VERSION};
@@ -27,6 +31,10 @@ impl Options {
 }
 struct Inner {
     config: Mutex<Config>,
+    device_id: String,
+    identity: ed25519_dalek::SigningKey,
+    store: store::Store,
+    committed: std::sync::Mutex<State>,
     directory: PathBuf,
     work: PathBuf,
     _run_lock: std::fs::File,
@@ -45,19 +53,49 @@ pub struct App(Arc<Inner>);
 impl App {
     pub async fn start(options: Options) -> anyhow::Result<Self> {
         tokio::fs::create_dir_all(&options.directory).await?;
-        let config_path = options.directory.join("device.json");
-        let mut config: Config = match tokio::fs::read(&config_path).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config {
-                id: uid(),
-                name: options.name.clone().unwrap_or_else(default_name),
-            },
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(name) = options.name {
-            config.name = clean_name(&name)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&options.directory, std::fs::Permissions::from_mode(0o700))
+                .await?;
         }
-        tokio::fs::write(&config_path, serde_json::to_vec_pretty(&config)?).await?;
+        let fallback = if !options.directory.join("linchuan.db").exists() {
+            match tokio::fs::read(options.directory.join("device.json")).await {
+                Ok(bytes) => serde_json::from_slice(&bytes)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config {
+                    id: uid(),
+                    name: default_name(),
+                },
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            Config {
+                id: uid(),
+                name: default_name(),
+            }
+        };
+        let directory = options.directory.clone();
+        let name = options.name.map(|n| clean_name(&n)).transpose()?;
+        let (store, config, key) =
+            tokio::task::spawn_blocking(move || store::Store::open(&directory, fallback, name))
+                .await??;
+        let identity = identity::signing_key(&key)?;
+        let mut restored = store.load(config.id.clone()).await?;
+        restored.profiles.insert(
+            config.id.clone(),
+            Device {
+                id: config.id.clone(),
+                name: config.name.clone(),
+                platform: platform().into(),
+                kind: "local".into(),
+                host_device_id: config.id.clone(),
+                public_key: hex::encode(identity.verifying_key().to_bytes()),
+                capabilities: capabilities(),
+                address: String::new(),
+                last_seen: now(),
+            },
+        );
+        tokio::fs::create_dir_all(options.directory.join("files")).await?;
         let temporary = options.directory.join("temporary");
         tokio::fs::create_dir_all(&temporary).await?;
         // An active instance must never lose its files when another instance starts.
@@ -89,6 +127,10 @@ impl App {
         let (stop, _) = tokio::sync::watch::channel(false);
         let random = uuid::Uuid::new_v4().as_u128() % 1_000_000;
         let app = Self(Arc::new(Inner {
+            device_id: config.id.clone(),
+            identity,
+            store,
+            committed: std::sync::Mutex::new(restored.clone()),
             config: Mutex::new(config),
             directory: options.directory,
             work,
@@ -96,7 +138,7 @@ impl App {
             port,
             token: secret(),
             code: format!("{random:06}"),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(restored),
             events,
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
@@ -107,6 +149,17 @@ impl App {
             mdns: std::sync::Mutex::new(None),
             stop,
         }));
+        {
+            let mut state = app.0.state.lock().await;
+            app.commit(&mut state).await?;
+        }
+        {
+            let mut state = app.0.state.lock().await;
+            if let Some(local) = state.profiles.get_mut(&app.0.device_id) {
+                local.address = addresses(app.0.port)[0].clone();
+            }
+            app.commit(&mut state).await?;
+        }
         let router = api::router(app.clone());
         let mut shutdown = app.0.stop.subscribe();
         tokio::spawn(async move {
@@ -137,6 +190,108 @@ impl App {
         });
         Ok(app)
     }
+    async fn commit(&self, state: &mut State) -> Result<(), api::Error> {
+        for transfer in state.transfers.values_mut() {
+            if transfer.incoming_remote && transfer.view.terminal() && transfer.reserved > 0 {
+                let used: u64 = transfer
+                    .files
+                    .iter()
+                    .filter(|f| f.complete && f.path.is_file())
+                    .map(|f| f.meta.size)
+                    .sum();
+                state.reserved = state
+                    .reserved
+                    .saturating_sub(transfer.reserved.saturating_sub(used));
+                transfer.reserved = used;
+            }
+        }
+        state.link_conversations(&self.0.device_id);
+        match self.0.store.save(state.clone()).await {
+            Ok(()) => {
+                // Active tasks stay cached; old completed history remains queryable in SQLite.
+                if state.transfers.len() > 500 {
+                    let mut finished: Vec<_> = state
+                        .transfers
+                        .values()
+                        .filter(|t| t.view.terminal())
+                        .map(|t| (t.view.created_at, t.view.id.clone()))
+                        .collect();
+                    finished.sort();
+                    for (_, id) in finished.into_iter().take(state.transfers.len() - 500) {
+                        state.transfers.remove(&id);
+                    }
+                }
+                *self
+                    .0
+                    .committed
+                    .lock()
+                    .map_err(|_| api::Error::bad("存储状态异常"))? = state.clone();
+                Ok(())
+            }
+            Err(error) => {
+                let drafts = std::mem::take(&mut state.drafts);
+                let tickets = std::mem::take(&mut state.tickets);
+                let attempts = std::mem::take(&mut state.attempts);
+                let mut restored = self
+                    .0
+                    .committed
+                    .lock()
+                    .map_err(|_| api::Error::bad("存储状态异常"))?
+                    .clone();
+                let old_budget: u64 = restored
+                    .drafts
+                    .values()
+                    .filter(|d| !d.sent)
+                    .flat_map(|d| &d.files)
+                    .map(|f| f.meta.size)
+                    .sum();
+                let new_budget: u64 = drafts
+                    .values()
+                    .filter(|d| !d.sent)
+                    .flat_map(|d| &d.files)
+                    .map(|f| f.meta.size)
+                    .sum();
+                restored.reserved = restored.reserved.saturating_sub(old_budget) + new_budget;
+                restored.drafts = drafts;
+                restored.tickets = tickets;
+                restored.attempts = attempts;
+                *state = restored;
+                Err(api::Error::storage(error.to_string()))
+            }
+        }
+    }
+    async fn cache_transfer(&self, id: &str) -> Result<(), api::Error> {
+        if self.0.state.lock().await.transfers.contains_key(id) {
+            return Ok(());
+        }
+        if let Some(t) = self
+            .0
+            .store
+            .transfer(id.into())
+            .await
+            .map_err(|e| api::Error::storage(e.to_string()))?
+        {
+            self.0.state.lock().await.transfers.insert(id.into(), t);
+        }
+        Ok(())
+    }
+    async fn signed(&self, payload: serde_json::Value) -> SignedEnvelope {
+        identity::sign(&self.0.identity, &self.0.device_id, payload)
+    }
+    async fn remember_peer(&self, device: Device) -> Result<(), api::Error> {
+        let mut state = self.0.state.lock().await;
+        if let Some(existing) = state.profiles.get(&device.id) {
+            if !existing.public_key.is_empty() && existing.public_key != device.public_key {
+                return Err(api::Error::bad("设备身份密钥发生变化，拒绝覆盖"));
+            }
+        }
+        state.profiles.insert(device.id.clone(), device.clone());
+        state.peers.insert(device.id.clone(), device);
+        self.commit(&mut state).await?;
+        drop(state);
+        self.notify();
+        Ok(())
+    }
     pub async fn info(&self) -> Info {
         let config = self.0.config.lock().await.clone();
         Info {
@@ -146,6 +301,8 @@ impl App {
             version: VERSION.into(),
             protocol: 1,
             addresses: addresses(self.0.port),
+            public_key: hex::encode(self.0.identity.verifying_key().to_bytes()),
+            capabilities: capabilities(),
         }
     }
     pub fn bootstrap(&self) -> Bootstrap {
@@ -176,8 +333,8 @@ impl App {
             });
         }
         let mut state = self.0.state.lock().await;
-        if let Some(session) = state.sessions.get_mut(token) {
-            if now().saturating_sub(session.last_seen) <= RETENTION {
+        if let Some(session) = state.sessions.get_mut(&identity::token_hash(token)) {
+            if now() < session.expires {
                 session.last_seen = now();
                 return Ok(Principal {
                     id: session.id.clone(),
@@ -192,29 +349,11 @@ impl App {
         let mut paths = Vec::new();
         let mut state = self.0.state.lock().await;
         state.tickets.retain(|_, t| t.expires > now());
-        state
-            .sessions
-            .retain(|_, s| now().saturating_sub(s.last_seen) < RETENTION);
-        state
-            .peers
-            .retain(|_, p| now().saturating_sub(p.last_seen) < 90);
+        state.sessions.retain(|_, s| now() < s.expires);
+        state.peers.retain(|_, _| true);
         state
             .attempts
             .retain(|_, (start, _)| now().saturating_sub(*start) < 120);
-        let stale: Vec<_> = state
-            .transfers
-            .iter()
-            .filter(|(_, t)| now().saturating_sub(t.view.created) > RETENTION)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in stale {
-            if let Some(t) = state.transfers.remove(&id) {
-                state.reserved = state.reserved.saturating_sub(t.reserved);
-                if t.incoming_remote {
-                    paths.push(self.0.work.join(&id));
-                }
-            }
-        }
         let stale: Vec<_> = state
             .drafts
             .iter()
@@ -225,10 +364,14 @@ impl App {
             .collect();
         for id in stale {
             if let Some(d) = state.drafts.remove(&id) {
-                state.reserved = state
-                    .reserved
-                    .saturating_sub(d.files.iter().map(|f| f.meta.size).sum());
-                paths.push(self.0.work.join(&id));
+                state.reserved = state.reserved.saturating_sub(if d.sent {
+                    0
+                } else {
+                    d.files.iter().map(|f| f.meta.size).sum()
+                });
+                if !d.sent {
+                    paths.push(self.0.work.join(&id));
+                }
             }
         }
         drop(state);
@@ -317,4 +460,26 @@ fn safe_filename(value: &str) -> bool {
             .chars()
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '\0'))
         && !Path::new(value).is_absolute()
+}
+
+fn capabilities() -> Vec<String> {
+    vec![
+        "groups-v1".into(),
+        "signed-offers-v1".into(),
+        "history-v1".into(),
+    ]
+}
+
+async fn sync_directory(path: PathBuf) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+            .await
+            .map_err(std::io::Error::other)??;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }

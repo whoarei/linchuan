@@ -1,123 +1,1602 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
-import { ArrowUpRight, ArrowDownLeft, Check, CheckCheck, Clipboard, Download, File, FileImage, Globe, Laptop, Link, LoaderCircle, Monitor, Plus, QrCode, Send, Settings, ShieldCheck, Smartphone, Upload, Wifi, X, Inbox, ArrowLeft, Copy, Radio } from 'lucide-vue-next';
-import QRCode from 'qrcode';
-import { api, bootstrap, native, token, setToken, forget, pairingCode, address, upload, ApiError } from './api';
-import type { AppState, FileMeta, Transfer } from './types';
-const state=ref<AppState>();const ready=ref(false);const bootError=ref('');const connected=ref(true);const loading=ref(true);
-const name=ref('');const code=ref('');const hostName=ref('邻传设备');const pairError=ref('');const pairing=ref(false);
-const tab=ref<'send'|'inbox'|'history'>('send');const selected=ref<string[]>([]);const text=ref('');const files=ref<File[]>([]);const dragging=ref(false);
-const busy=ref(false);const uploaded=ref(0);const uploadTotal=ref(0);const controller=ref<AbortController>();const fileInput=ref<HTMLInputElement>();
-const connection=ref(false);const manual=ref(false);const manualAddress=ref('');const manualBusy=ref(false);const qr=ref('');const shareAddress=ref('');const toast=ref('');const toastError=ref(false);let toastTimer:ReturnType<typeof setTimeout>;
-const editName=ref(false);const newName=ref('');const preview=ref<{url:string;name:string}>();
-const transfers=computed(()=>state.value?.transfers||[]);
-const incoming=computed(()=>transfers.value.filter(t=>t.recipient_id===state.value?.me.id));
-const pending=computed(()=>incoming.value.filter(t=>t.status==='pending'));
-const active=computed(()=>transfers.value.filter(t=>!terminal(t.status)));
-const visible=computed(()=>tab.value==='inbox'?incoming.value:transfers.value);
-const canSend=computed(()=>selected.value.length>0&&(text.value.trim().length>0||files.value.length>0)&&!busy.value);
-const textBytes=computed(()=>new TextEncoder().encode(text.value).length);
-const totalSize=computed(()=>files.value.reduce((sum,file)=>sum+file.size,0));
-let poll:ReturnType<typeof setInterval>;let socket:WebSocket|undefined;let disposed=false;let refreshing=false;
-function notify(message:string,error=false){toast.value=message;toastError.value=error;clearTimeout(toastTimer);toastTimer=setTimeout(()=>toast.value='',4500);}
-function terminal(status:string){return ['completed','rejected','cancelled','failed'].includes(status);}
-function size(bytes:number){if(bytes===0)return '0 B';const u=['B','KB','MB','GB'];const i=Math.min(Math.floor(Math.log(bytes)/Math.log(1024)),3);return `${(bytes/1024**i).toFixed(i>0?1:0)} ${u[i]}`;}
-function statusLabel(status:string){return ({pending:'等待接收',accepted:'已接受',transferring:'正在传输',completed:'已完成',rejected:'已拒绝',cancelled:'已取消',failed:'传输失败'} as Record<string,string>)[status]||status;}
-function time(value:number){return new Date(value*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});}
-function toggle(id:string){if(busy.value)return;if(selected.value.includes(id))selected.value=selected.value.filter(v=>v!==id);else if(selected.value.length<8)selected.value.push(id);else notify('一次最多选择 8 台设备',true);}
-async function refresh(){
- if(refreshing||disposed)return;refreshing=true;
- try{const value=await api<AppState>('/api/state');if(disposed)return;state.value=value;ready.value=true;connected.value=true;selected.value=selected.value.filter(id=>value.devices.some(d=>d.id===id));if(!shareAddress.value)shareAddress.value=value.info.addresses[0]||address();}
- catch(error){if(disposed)return;if(error instanceof ApiError&&error.status===401&&!native){forget();ready.value=false;socket?.close();}else connected.value=false;}
- finally{refreshing=false;loading.value=false;}
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import {
+  ArrowLeft,
+  ArrowUpRight,
+  Check,
+  CheckCheck,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  Download,
+  File,
+  Image as ImageIcon,
+  Info,
+  Link,
+  LoaderCircle,
+  LogOut,
+  MessageSquare,
+  Monitor,
+  MoreHorizontal,
+  Paperclip,
+  Plus,
+  QrCode,
+  Search,
+  Send,
+  Settings,
+  ShieldCheck,
+  Smartphone,
+  Trash2,
+  Users,
+  Wifi,
+  X,
+  Globe,
+} from "lucide-vue-next";
+import QRCode from "qrcode";
+import {
+  api,
+  bootstrap,
+  native,
+  token,
+  setToken,
+  forget,
+  pairingCode,
+  address,
+  upload,
+  ApiError,
+} from "./api";
+import type {
+  AppState,
+  Conversation,
+  Device,
+  Group,
+  Message,
+  MessageFile,
+  Transfer,
+  FileMeta,
+} from "./types";
+
+type Mode = "devices" | "settings" | "about";
+const state = ref<AppState>();
+const loading = ref(true);
+const bootError = ref("");
+const ready = ref(false);
+const connected = ref(true);
+const mode = ref<Mode>("devices");
+const selected = ref("");
+const search = ref("");
+const messages = ref<Message[]>([]);
+const before = ref<number | null>(null);
+const historyBusy = ref(false);
+const text = ref("");
+const files = ref<File[]>([]);
+const fileCache = new Map<string, File[]>();
+const sending = ref(false);
+const progress = ref(0);
+const uploadTotal = ref(0);
+let controller: AbortController | undefined;
+const input = ref<HTMLInputElement>();
+const composer = ref<HTMLTextAreaElement>();
+const timeline = ref<HTMLDivElement>();
+const dragging = ref(false);
+const pairing = ref(false);
+const browserName = ref("");
+const code = ref("");
+const hostName = ref("邻传设备");
+const pairError = ref("");
+const modal = ref<
+  | ""
+  | "connect"
+  | "manual"
+  | "group"
+  | "members"
+  | "clear"
+  | "leave"
+  | "preview"
+>("");
+const addMenu = ref(false);
+const qr = ref("");
+const shareAddress = ref("");
+const manualAddress = ref("");
+const modalBusy = ref(false);
+const groupName = ref("");
+const memberIds = ref<string[]>([]);
+const editingGroup = ref("");
+const expanded = ref(new Set<string>());
+const newName = ref("");
+const nameBusy = ref(false);
+const toast = ref("");
+const toastError = ref(false);
+let toastTimer: ReturnType<typeof setTimeout>;
+const preview = ref<{ url: string; name: string }>();
+const thumbnails = ref<Record<string, string>>({});
+const thumbnailRequests = new Set<string>();
+let thumbnailBytes = 0;
+let poll: ReturnType<typeof setInterval>;
+let draftTimer: ReturnType<typeof setTimeout>;
+let socket: WebSocket | undefined;
+let disposed = false;
+let refreshing = false;
+let timelineRequest = 0;
+let markedPosition = 0;
+let eventTimer: ReturnType<typeof setTimeout>;
+let draftWrites: Promise<unknown> = Promise.resolve();
+const current = computed(() =>
+  state.value?.conversations.find((c) => c.id === selected.value),
+);
+const group = computed(() =>
+  state.value?.groups.find((g) => g.id === current.value?.group_id),
+);
+const membership = computed(() =>
+  group.value?.members.find((m) => m.device.id === state.value?.me.id),
+);
+const owner = computed(() => group.value?.owner_id === state.value?.me.id);
+const canWrite = computed(
+  () =>
+    !!current.value &&
+    (current.value.kind === "direct" || membership.value?.state === "joined"),
+);
+const canSend = computed(
+  () =>
+    connected.value &&
+    canWrite.value &&
+    !sending.value &&
+    (text.value.trim().length > 0 || files.value.length > 0) &&
+    new TextEncoder().encode(text.value).length <= 65536,
+);
+const conversations = computed(
+  () =>
+    state.value?.conversations.filter((c) =>
+      `${c.name} ${c.preview}`
+        .toLowerCase()
+        .includes(search.value.toLowerCase()),
+    ) || [],
+);
+const nearby = computed(
+  () =>
+    state.value?.devices.filter(
+      (d) =>
+        !state.value!.conversations.some((c) => c.peer_id === d.id) &&
+        d.name.toLowerCase().includes(search.value.toLowerCase()),
+    ) || [],
+);
+const eligible = computed(
+  () =>
+    state.value?.devices.filter(
+      (d) =>
+        d.capabilities?.includes("groups-v1") &&
+        (!editingGroup.value ||
+          !group.value?.members.some(
+            (m) => m.device.id === d.id && m.state !== "left",
+          )),
+    ) || [],
+);
+const unread = computed(
+  () => state.value?.conversations.reduce((n, c) => n + c.unread, 0) || 0,
+);
+const terminal = (status: string) =>
+  ["completed", "rejected", "cancelled", "failed", "interrupted"].includes(
+    status,
+  );
+function notify(message: string, error = false) {
+  toast.value = message;
+  toastError.value = error;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (toast.value = ""), 4500);
 }
-function openEvents(){
- if(socket&&(socket.readyState===WebSocket.OPEN||socket.readyState===WebSocket.CONNECTING))return;
- socket=new WebSocket(address().replace(/^http/,'ws')+'/api/events');socket.onopen=()=>socket?.send(JSON.stringify({token:token()}));socket.onmessage=()=>void refresh();socket.onerror=()=>{};
+function size(bytes: number) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 3);
+  return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
 }
-async function pair(){pairing.value=true;pairError.value='';try{const result=await api<{token:string}>('/api/pair',{code:code.value,name:name.value});setToken(result.token);await refresh();if(ready.value)openEvents();}catch(error){pairError.value=(error as Error).message;}finally{pairing.value=false;}}
-function addFiles(items:File[]){
- const valid:File[]=[];for(const file of items){if(file.size>2*1024**3){notify(`${file.name} 超过 2 GiB`,true);continue;}if(files.value.length+valid.length>=64){notify('一次最多添加 64 个文件',true);break;}if(file.name.includes('/')||file.name.includes('\\')||file.name.includes(':')){notify('文件名不能包含路径符号',true);continue;}valid.push(file);}files.value.push(...valid);
+function timestamp(ms: number) {
+  const date = new Date(ms);
+  const today = new Date();
+  return date.toDateString() === today.toDateString()
+    ? date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
-function fileChange(event:Event){const input=event.target as HTMLInputElement;addFiles(Array.from(input.files||[]));input.value='';}
-function drop(event:DragEvent){event.preventDefault();dragging.value=false;if(!busy.value)addFiles(Array.from(event.dataTransfer?.files||[]));}
-function paste(event:ClipboardEvent){const items=Array.from(event.clipboardData?.items||[]);const images=items.filter(item=>item.kind==='file').map(item=>item.getAsFile()).filter((f):f is File=>f!==null);if(images.length&&!busy.value){addFiles(images);event.preventDefault();}}
-async function send(){
- if(!canSend.value)return;busy.value=true;uploaded.value=0;uploadTotal.value=totalSize.value;const targets=[...selected.value];const message=text.value;const abort=new AbortController();controller.value=abort;
- try{const draft=await api<{id:string;files:FileMeta[]}>('/api/drafts',{files:files.value.map(f=>({name:f.name,size:f.size,mime:f.type}))});let completed=0;
- for(let i=0;i<files.value.length;i++){const file=files.value[i];await upload(`/api/drafts/${draft.id}/files/${draft.files[i].id}`,file,bytes=>uploaded.value=completed+bytes,abort.signal);completed+=file.size;}
- if(abort.signal.aborted)throw new Error('已取消上传');
- await api(`/api/drafts/${draft.id}/send`,{targets,text:message});files.value=[];text.value='';notify('已发送请求，等待对方接收');await refresh();tab.value='history';
- }catch(error){notify((error as Error).message,true);}finally{busy.value=false;controller.value=undefined;}
+function online(id?: string) {
+  return (
+    id === state.value?.me.id || !!state.value?.devices.some((d) => d.id === id)
+  );
 }
-async function decide(transfer:Transfer,accept:boolean){try{await api(`/api/transfers/${transfer.id}/decision`,{accept});await refresh();}catch(error){notify((error as Error).message,true);}}
-async function cancel(transfer:Transfer){try{await api(`/api/transfers/${transfer.id}/cancel`,{});await refresh();}catch(error){notify((error as Error).message,true);}}
-async function download(transfer:Transfer,file:FileMeta){try{const result=await api<{url:string}>(`/api/transfers/${transfer.id}/files/${file.id}/ticket`,{});const url=address()+result.url;if(native){const {openUrl}=await import('@tauri-apps/plugin-opener');await openUrl(url);}else{const a=document.createElement('a');a.href=url;a.download=file.name;document.body.append(a);a.click();a.remove();}}catch(error){notify((error as Error).message,true);}}
-async function viewImage(transfer:Transfer,file:FileMeta){
- if(file.size>20*1024**2){notify('大于 20 MB 的图片请下载后查看');return;}
- try{const result=await api<{url:string}>(`/api/transfers/${transfer.id}/files/${file.id}/ticket`,{});const response=await fetch(address()+result.url);if(!response.ok)throw new Error('图片预览失败');const blob=await response.blob();if(preview.value)URL.revokeObjectURL(preview.value.url);preview.value={url:URL.createObjectURL(new Blob([blob],{type:file.mime})),name:file.name};}catch(error){notify((error as Error).message,true);}
+function summary(message: Message) {
+  const ds = message.deliveries;
+  const done = ds.filter((d) => d.status === "completed").length;
+  if (ds.length && done === ds.length) return "已送达";
+  if (done && ds.every((d) => terminal(d.status)))
+    return `部分送达 ${done}/${ds.length}`;
+  if (ds.some((d) => d.status === "transferring" || d.status === "accepted"))
+    return "正在传输";
+  if (ds.some((d) => d.status === "pending")) return "等待接收";
+  if (ds.some((d) => d.status === "interrupted")) return "传输中断";
+  if (ds.every((d) => d.status === "rejected")) return "已拒绝";
+  if (ds.every((d) => d.status === "cancelled")) return "已取消";
+  return "未送达";
 }
-function closePreview(){if(preview.value)URL.revokeObjectURL(preview.value.url);preview.value=undefined;}
-async function copy(value:string){try{if(navigator.clipboard&&window.isSecureContext)await navigator.clipboard.writeText(value);else{const input=document.createElement('textarea');input.value=value;input.style.position='fixed';input.style.opacity='0';document.body.append(input);input.select();const ok=document.execCommand('copy');input.remove();if(!ok)throw new Error('copy');}notify('已复制');}catch{notify('当前浏览器无法自动复制，请长按或选中文字复制',true);}}
-async function showConnection(){connection.value=true;qr.value=await QRCode.toDataURL(shareAddress.value,{width:240,margin:1,color:{dark:'#25334d',light:'#ffffff'}});}
-async function changeAddress(){qr.value=await QRCode.toDataURL(shareAddress.value,{width:240,margin:1});}
-async function connectPeer(){manualBusy.value=true;try{const result=await api<{id:string}>('/api/peers',{address:manualAddress.value.trim()});await refresh();if(!selected.value.includes(result.id))selected.value.push(result.id);manual.value=false;manualAddress.value='';notify('设备已连接');}catch(error){notify((error as Error).message,true);}finally{manualBusy.value=false;}}
-async function saveName(){try{await api('/api/settings',{name:newName.value});editName.value=false;await refresh();notify('名称已更新，设备发现名称将在下次启动后更新');}catch(error){notify((error as Error).message,true);}}
-onMounted(async()=>{try{await bootstrap();const info=await api<{name:string}>('/api/info');hostName.value=info.name;if(token())await refresh();else loading.value=false;if(ready.value)openEvents();poll=setInterval(()=>{if(token()){void refresh();if(ready.value)openEvents();}},3000);}catch(error){bootError.value=(error as Error).message;loading.value=false;}});
-onUnmounted(()=>{disposed=true;clearInterval(poll);clearTimeout(toastTimer);socket?.close();controller.value?.abort();closePreview();});
+function statusLabel(status: string) {
+  return (
+    (
+      {
+        pending: "等待接收",
+        accepted: "已接受",
+        transferring: "正在传输",
+        completed: "已完成",
+        rejected: "已拒绝",
+        cancelled: "已取消",
+        failed: "未送达",
+        interrupted: "传输中断",
+      } as Record<string, string>
+    )[status] || status
+  );
+}
+function incomingPending(message: Message) {
+  return message.deliveries.find(
+    (d) => d.recipient_id === state.value?.me.id && d.status === "pending",
+  );
+}
+function toggleExpanded(id: string) {
+  const result = new Set(expanded.value);
+  result.has(id) ? result.delete(id) : result.add(id);
+  expanded.value = result;
+}
+function scrollBottom() {
+  void nextTick(() => {
+    if (timeline.value) timeline.value.scrollTop = timeline.value.scrollHeight;
+  });
+}
+async function refresh() {
+  if (refreshing || disposed) return;
+  refreshing = true;
+  try {
+    state.value = await api<AppState>("/api/state");
+    if (disposed) return;
+    connected.value = true;
+    ready.value = true;
+    if (!shareAddress.value)
+      shareAddress.value = state.value.info.addresses[0] || address();
+    if (selected.value && mode.value === "devices") await loadMessages(false);
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401 && !native) {
+      forget();
+      ready.value = false;
+      socket?.close();
+    } else connected.value = false;
+  } finally {
+    loading.value = false;
+    refreshing = false;
+  }
+}
+function events() {
+  if (
+    socket &&
+    (socket.readyState === WebSocket.OPEN ||
+      socket.readyState === WebSocket.CONNECTING)
+  )
+    return;
+  socket = new WebSocket(address().replace(/^http/, "ws") + "/api/events");
+  socket.onopen = () => socket?.send(JSON.stringify({ token: token() }));
+  socket.onmessage = () => {
+    clearTimeout(eventTimer);
+    eventTimer = setTimeout(() => void refresh(), 120);
+  };
+  socket.onerror = () => {};
+}
+async function pair() {
+  pairing.value = true;
+  pairError.value = "";
+  try {
+    const value = await api<{ token: string }>("/api/pair", {
+      name: browserName.value,
+      code: code.value,
+    });
+    setToken(value.token);
+    await refresh();
+    if (ready.value) events();
+  } catch (error) {
+    pairError.value = (error as Error).message;
+  } finally {
+    pairing.value = false;
+  }
+}
+function releaseThumbnails() {
+  for (const url of Object.values(thumbnails.value)) URL.revokeObjectURL(url);
+  thumbnails.value = {};
+  thumbnailRequests.clear();
+  thumbnailBytes = 0;
+}
+async function selectConversation(c: Conversation) {
+  if (selected.value === c.id) {
+    mode.value = "devices";
+    return;
+  }
+  flushDraft();
+  fileCache.set(selected.value, [...files.value]);
+  selected.value = c.id;
+  mode.value = "devices";
+  messages.value = [];
+  before.value = null;
+  markedPosition = 0;
+  text.value = "";
+  files.value = fileCache.get(c.id) || [];
+  releaseThumbnails();
+  await loadMessages(true);
+  scrollBottom();
+}
+async function selectDevice(device: Device) {
+  try {
+    const c = await api<Conversation>("/api/conversations/direct", {
+      device_id: device.id,
+    });
+    await refresh();
+    await selectConversation(
+      state.value!.conversations.find((v) => v.id === c.id) || c,
+    );
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
+async function loadMessages(initial: boolean, older = false) {
+  const id = selected.value;
+  if (!id) return;
+  const request = ++timelineRequest;
+  if (initial || older) historyBusy.value = true;
+  const keepBottom =
+    !timeline.value ||
+    timeline.value.scrollHeight -
+      timeline.value.scrollTop -
+      timeline.value.clientHeight <
+      100;
+  const oldHeight = timeline.value?.scrollHeight || 0;
+  try {
+    const page = await api<{
+      messages: Message[];
+      next_before: number | null;
+      draft: string;
+    }>(
+      `/api/conversations/${encodeURIComponent(id)}/messages${older && before.value ? `?before=${before.value}` : ""}`,
+    );
+    if (id !== selected.value || request !== timelineRequest) return;
+    if (older) {
+      messages.value = [
+        ...page.messages,
+        ...messages.value.filter(
+          (m) => !page.messages.some((v) => v.id === m.id),
+        ),
+      ];
+      before.value = page.next_before;
+      void nextTick(() => {
+        if (timeline.value)
+          timeline.value.scrollTop = timeline.value.scrollHeight - oldHeight;
+      });
+    } else {
+      const olderMessages = messages.value.filter(
+        (m) => page.messages.length && m.position < page.messages[0].position,
+      );
+      messages.value = [...olderMessages, ...page.messages];
+      if (initial || !olderMessages.length) before.value = page.next_before;
+      if (initial) text.value = page.draft;
+      if (initial || keepBottom) scrollBottom();
+    }
+    const last = messages.value[messages.value.length - 1]?.position || 0;
+    if (last > markedPosition && mode.value === "devices") {
+      markedPosition = last;
+      void api(`/api/conversations/${encodeURIComponent(id)}/read`, {
+        through_position: last,
+      }).catch(() => {});
+    }
+    void loadThumbnails(id, page.messages);
+  } catch (error) {
+    if (initial || older) notify((error as Error).message, true);
+  } finally {
+    if (request === timelineRequest) historyBusy.value = false;
+  }
+}
+function queueDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(flushDraft, 450);
+}
+function flushDraft() {
+  clearTimeout(draftTimer);
+  const id = selected.value;
+  const value = text.value;
+  if (!id || !ready.value) return;
+  draftWrites = draftWrites
+    .catch(() => {})
+    .then(() =>
+      api(`/api/conversations/${encodeURIComponent(id)}/draft`, {
+        text: value,
+      }),
+    )
+    .catch(() => {
+      if (connected.value) notify("草稿未保存，请检查连接", true);
+    });
+}
+function addFiles(items: File[]) {
+  if (sending.value || !canWrite.value) return;
+  for (const file of items) {
+    if (file.size > 2 * 1024 ** 3) {
+      notify(`${file.name} 超过 2 GiB`, true);
+      continue;
+    }
+    if (files.value.length >= 64) {
+      notify("一次最多添加 64 个文件", true);
+      break;
+    }
+    files.value.push(file);
+  }
+  fileCache.set(selected.value, [...files.value]);
+}
+function fileChange(event: Event) {
+  const element = event.target as HTMLInputElement;
+  addFiles(Array.from(element.files || []));
+  element.value = "";
+}
+function paste(event: ClipboardEvent) {
+  const images = Array.from(event.clipboardData?.items || [])
+    .filter((i) => i.kind === "file")
+    .map((i) => i.getAsFile())
+    .filter((f): f is File => f !== null);
+  if (images.length) {
+    event.preventDefault();
+    addFiles(images);
+  }
+}
+function drop(event: DragEvent) {
+  event.preventDefault();
+  dragging.value = false;
+  addFiles(Array.from(event.dataTransfer?.files || []));
+}
+async function send() {
+  if (!canSend.value || !current.value) return;
+  const conversation = current.value;
+  const body = text.value;
+  const selectedFiles = [...files.value];
+  clearTimeout(draftTimer);
+  await draftWrites;
+  sending.value = true;
+  progress.value = 0;
+  uploadTotal.value = selectedFiles.reduce((n, f) => n + f.size, 0);
+  controller = new AbortController();
+  const signal = controller.signal;
+  try {
+    const draft = await api<{ id: string; files: FileMeta[] }>("/api/drafts", {
+      files: selectedFiles.map((f) => ({
+        name: f.name,
+        size: f.size,
+        mime: f.type,
+      })),
+    });
+    let count = 0;
+    for (let i = 0; i < selectedFiles.length; i++) {
+      await upload(
+        `/api/drafts/${draft.id}/files/${draft.files[i].id}`,
+        selectedFiles[i],
+        (bytes) => (progress.value = count + bytes),
+        signal,
+      );
+      count += selectedFiles[i].size;
+    }
+    if (signal.aborted) throw new Error("已取消上传");
+    await api(`/api/drafts/${draft.id}/send`, {
+      text: body,
+      targets: conversation.kind === "direct" ? [conversation.peer_id] : [],
+      group_id: conversation.group_id,
+    });
+    fileCache.set(conversation.id, []);
+    if (selected.value === conversation.id) {
+      text.value = "";
+      files.value = [];
+    }
+    await refresh();
+    scrollBottom();
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    sending.value = false;
+    controller = undefined;
+  }
+}
+async function decide(transfer: Transfer, accept: boolean) {
+  try {
+    await api(`/api/transfers/${transfer.id}/decision`, { accept });
+    await refresh();
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
+async function cancel(transfer: Transfer) {
+  try {
+    await api(`/api/transfers/${transfer.id}/cancel`, {});
+    await refresh();
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
+async function fileUrl(file: MessageFile) {
+  const value = await api<{ url: string }>(
+    `/api/transfers/${file.transfer_id}/files/${file.id}/ticket`,
+    {},
+  );
+  return address() + value.url;
+}
+async function download(file: MessageFile) {
+  try {
+    const url = await fileUrl(file);
+    if (native) {
+      const { openUrl } = await import("@tauri-apps/plugin-opener");
+      await openUrl(url);
+    } else {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.name;
+      document.body.append(a);
+      a.click();
+      a.remove();
+    }
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
+const raster = (file: FileMeta) =>
+  /^image\/(png|jpeg|gif|webp|bmp)$/.test(file.mime);
+async function blobUrl(file: MessageFile) {
+  const response = await fetch(await fileUrl(file));
+  if (!response.ok) throw new Error("文件已过期或无法读取");
+  return URL.createObjectURL(
+    new Blob([await response.blob()], { type: file.mime }),
+  );
+}
+async function loadThumbnails(id: string, list: Message[]) {
+  for (const message of list) {
+    for (const file of message.files) {
+      const key = message.id + file.id;
+      if (
+        !file.available ||
+        !raster(file) ||
+        file.size > 4 * 1024 ** 2 ||
+        thumbnailBytes + file.size > 32 * 1024 ** 2 ||
+        thumbnails.value[key] ||
+        thumbnailRequests.has(key)
+      )
+        continue;
+      thumbnailRequests.add(key);
+      thumbnailBytes += file.size;
+      try {
+        const url = await blobUrl(file);
+        if (id !== selected.value || disposed) {
+          URL.revokeObjectURL(url);
+          continue;
+        }
+        thumbnails.value[key] = url;
+      } catch {}
+    }
+  }
+}
+async function viewImage(file: MessageFile) {
+  if (file.size > 20 * 1024 ** 2) {
+    notify("大于 20 MB 的图片请下载后查看");
+    return;
+  }
+  try {
+    closePreview();
+    preview.value = { url: await blobUrl(file), name: file.name };
+    modal.value = "preview";
+  } catch (error) {
+    notify((error as Error).message, true);
+  }
+}
+function closePreview() {
+  if (preview.value) URL.revokeObjectURL(preview.value.url);
+  preview.value = undefined;
+}
+function closeModal() {
+  modal.value = "";
+  closePreview();
+}
+async function copy(value: string) {
+  try {
+    if (navigator.clipboard && window.isSecureContext)
+      await navigator.clipboard.writeText(value);
+    else {
+      const input = document.createElement("textarea");
+      input.value = value;
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.append(input);
+      input.select();
+      const ok = document.execCommand("copy");
+      input.remove();
+      if (!ok) throw new Error();
+    }
+    notify("已复制");
+  } catch {
+    notify("请选中文字后手动复制", true);
+  }
+}
+async function showConnection() {
+  addMenu.value = false;
+  modal.value = "connect";
+  await updateQr();
+}
+async function updateQr() {
+  qr.value = await QRCode.toDataURL(shareAddress.value, {
+    width: 240,
+    margin: 1,
+    color: { dark: "#24334d", light: "#ffffff" },
+  });
+}
+async function connectPeer() {
+  modalBusy.value = true;
+  try {
+    const result = await api<{ id: string }>("/api/peers", {
+      address: manualAddress.value.trim(),
+    });
+    modal.value = "";
+    manualAddress.value = "";
+    await refresh();
+    const device = state.value?.devices.find((d) => d.id === result.id);
+    if (device) await selectDevice(device);
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+function newGroup(edit = false) {
+  addMenu.value = false;
+  editingGroup.value = edit ? group.value?.id || "" : "";
+  groupName.value = edit ? group.value?.name || "" : "";
+  memberIds.value = [];
+  modal.value = "group";
+}
+async function saveGroup() {
+  modalBusy.value = true;
+  try {
+    if (editingGroup.value) {
+      await api(`/api/groups/${editingGroup.value}/invite`, {
+        name: groupName.value,
+        members: memberIds.value,
+      });
+      modal.value = "";
+      await refresh();
+    } else {
+      const result = await api<{ group: Group; unreachable: string[] }>(
+        "/api/groups",
+        { name: groupName.value, members: memberIds.value },
+      );
+      modal.value = "";
+      await refresh();
+      const c = state.value?.conversations.find(
+        (c) => c.group_id === result.group.id,
+      );
+      if (c) await selectConversation(c);
+      if (result.unreachable.length)
+        notify(
+          `群已创建，${result.unreachable.length} 位成员暂未收到邀请，可在群设置中重新发送`,
+        );
+    }
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+async function groupDecision(accept: boolean) {
+  if (!group.value) return;
+  modalBusy.value = true;
+  try {
+    await api(`/api/groups/${group.value.id}/decision`, { accept });
+    await refresh();
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+async function resendInvitations() {
+  if (!group.value) return;
+  modalBusy.value = true;
+  try {
+    const value = await api<{ unreachable: string[] }>(
+      `/api/groups/${group.value.id}/invite`,
+      { members: [], name: group.value.name },
+    );
+    await refresh();
+    notify(
+      value.unreachable.length
+        ? `${value.unreachable.length} 位成员暂不可达，其余邀请已发送`
+        : "邀请已重新发送",
+    );
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+async function leaveGroup() {
+  if (!group.value) return;
+  modalBusy.value = true;
+  try {
+    await api(`/api/groups/${group.value.id}/leave`, {});
+    modal.value = "";
+    await refresh();
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+async function saveName() {
+  nameBusy.value = true;
+  try {
+    await api("/api/settings", { name: newName.value });
+    await refresh();
+    notify("设备名称已保存");
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    nameBusy.value = false;
+  }
+}
+async function clearFiles() {
+  modalBusy.value = true;
+  try {
+    const result = await api<{ freed: number }>("/api/storage/clear", {});
+    modal.value = "";
+    releaseThumbnails();
+    await refresh();
+    notify(`已清理 ${size(result.freed)}，历史记录已保留`);
+  } catch (error) {
+    notify((error as Error).message, true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
+async function disconnect() {
+  try {
+    await api("/api/session/logout", {});
+  } catch {}
+  forget();
+  ready.value = false;
+  selected.value = "";
+  socket?.close();
+}
+function setMode(value: Mode) {
+  flushDraft();
+  mode.value = value;
+  if (value === "settings") newName.value = state.value?.me.name || "";
+}
+onMounted(async () => {
+  try {
+    await bootstrap();
+    const info = await api<{ name: string }>("/api/info");
+    hostName.value = info.name;
+    if (token()) await refresh();
+    else loading.value = false;
+    if (ready.value) events();
+    poll = setInterval(() => {
+      if (token()) {
+        void refresh();
+        if (ready.value) events();
+      }
+    }, 3000);
+  } catch (error) {
+    bootError.value = (error as Error).message;
+    loading.value = false;
+  }
+});
+onUnmounted(() => {
+  disposed = true;
+  clearInterval(poll);
+  clearTimeout(draftTimer);
+  clearTimeout(eventTimer);
+  clearTimeout(toastTimer);
+  socket?.close();
+  controller?.abort();
+  releaseThumbnails();
+  closePreview();
+});
 </script>
 
 <template>
- <div v-if="loading || bootError" class="launch"><div class="brand-mark">邻</div><h1>邻传</h1><p v-if="bootError" class="error">启动失败：{{ bootError }}</p><template v-else><LoaderCircle class="spin"/><p>正在准备你的传送空间…</p></template></div>
- <main v-else-if="!ready" class="pair-page"><div class="pair-card"><div class="brand-mark">邻</div><div class="eyebrow">LINCHUAN / 邻传</div><h1>连接设备</h1><p>连接 <strong>{{ hostName }}</strong>，传送文字、图片和文件。</p><form @submit.prevent="pair"><label>你的设备名称<input v-model="name" required maxlength="64" placeholder="例如：小林的手机" autocomplete="nickname"/></label><label>六位配对码<input v-model="code" required inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="查看对方应用中的配对码" autocomplete="off"/></label><p v-if="pairError" class="error" role="alert">{{ pairError }}</p><button class="primary wide" :disabled="pairing"><LoaderCircle v-if="pairing" class="spin" :size="18"/><Link v-else :size="18"/>{{ pairing?'正在连接':'连接设备' }}</button></form><div class="privacy-note"><ShieldCheck :size="16"/>无需账号 · 无云端中转</div><small>仅在可信局域网使用 · HTTP 传输</small></div></main>
- <div v-else class="app-shell">
-  <aside class="sidebar">
-   <a class="brand" href="#" @click.prevent="tab='send'"><span class="brand-mark">邻</span><span><b>邻传</b><small>LINCHUAN</small></span><span class="version">0.1</span></a>
-   <div class="workspace-label">工作区</div>
-   <nav class="navigation"><button :class="{current:tab==='send'}" @click="tab='send'"><Send :size="18"/>发送内容<ArrowUpRight v-if="tab==='send'" :size="16"/></button><button :class="{current:tab==='inbox'}" @click="tab='inbox'"><Inbox :size="18"/>收件箱<span v-if="pending.length" class="badge">{{ pending.length }}</span></button><button :class="{current:tab==='history'}" @click="tab='history'"><Radio :size="18"/>传输记录<span v-if="active.length" class="count">{{ active.length }}</span></button></nav>
-   <div class="device-heading"><span>附近的设备</span><span class="online-dot" title="设备在线"/><span class="device-count">{{ state!.devices.length }}</span></div>
-   <div class="device-list"><button v-for="device in state!.devices" :key="device.id" class="device" :class="{selected:selected.includes(device.id)}" @click="toggle(device.id);tab='send'"><span class="device-icon"><Globe v-if="device.kind==='browser'" :size="21"/><Smartphone v-else-if="device.platform==='Android'" :size="21"/><Monitor v-else :size="21"/></span><span class="device-text"><b>{{ device.name }}</b><small>{{ device.platform }}<template v-if="device.kind==='host'"> · 当前连接</template></small></span><span class="selection"><Check v-if="selected.includes(device.id)" :size="13"/></span></button><div v-if="!state!.devices.length" class="device-empty"><Wifi :size="26"/><p>等待附近设备加入</p><small>打开另一台设备上的邻传，或让浏览器访问本机地址。</small></div></div>
-   <button class="manual-connect" @click="manual=true"><Plus :size="16"/>通过地址连接</button>
-   <div class="sidebar-bottom"><div class="local-device"><span class="local-avatar"><Laptop :size="20"/></span><span><b>{{ state!.me.name }}</b><small><i/>{{ state!.me.owner?'本机设备':'浏览器会话' }}</small></span><button v-if="state!.me.owner" class="icon-button" title="修改设备名称" @click="newName=state!.me.name;editName=true"><Settings :size="16"/></button></div><button v-if="state!.me.owner" class="connection-button" @click="showConnection"><QrCode :size="17"/>让其他设备连接<ArrowUpRight :size="15"/></button><button v-else class="connection-button" @click="forget();ready=false;socket?.close()"><ArrowLeft :size="16"/>断开当前会话</button></div>
-  </aside>
-  <section class="main-panel">
-   <header class="topbar"><div class="breadcrumb">我的空间<span>/</span><b>{{ tab==='send'?'发送内容':tab==='inbox'?'收件箱':'传输记录' }}</b></div><div class="network-status" :class="{offline:!connected}"><span class="online-dot"/>{{ connected?'局域网已连接':'连接中断，正在重试' }}</div></header>
-   <div class="content">
-    <template v-if="tab==='send'">
-     <div class="page-heading"><h1>发送内容</h1><p>选择附近设备，发送文字、图片或文件。</p></div>
-     <div v-if="pending.length" class="incoming-banner" @click="tab='inbox'" role="button" tabindex="0" @keydown.enter="tab='inbox'"><Inbox :size="20"/><span>你有 <b>{{ pending.length }}</b> 个待接收请求</span><ArrowUpRight :size="18"/></div>
-     <div class="compose-card">
-      <div class="compose-top"><span class="step-label"><span>01</span>添加想发送的内容</span><span class="muted small">文字 / 图片 / 文件</span></div>
-      <textarea v-model="text" aria-label="发送文字" placeholder="写点什么，或粘贴一段文字、网址…" :disabled="busy" @paste="paste"/>
-      <div class="drop-zone" :class="{dragging}" @dragover.prevent="dragging=true" @dragleave.prevent="dragging=false" @drop="drop" @paste="paste"><span class="upload-icon"><Upload :size="23"/></span><div><b>把文件拖到这里，或 <button class="text-button" :disabled="busy" @click="fileInput?.click()">选择文件</button></b><p>支持多文件、原图，也可以直接粘贴截图</p></div><span class="file-limit">单文件 ≤ 2 GiB</span><input ref="fileInput" type="file" multiple hidden :disabled="busy" @change="fileChange"/></div>
-      <div v-if="files.length" class="selected-files"><div v-for="(file,index) in files" :key="index" class="file-row"><FileImage v-if="file.type.startsWith('image/')" :size="19"/><File v-else :size="19"/><span>{{ file.name }}<small>{{ size(file.size) }}</small></span><button :disabled="busy" class="icon-button" :aria-label="`移除 ${file.name}`" @click="files.splice(index,1)"><X :size="16"/></button></div></div>
-      <div class="compose-bottom"><span><Clipboard :size="14"/>内容只在你的局域网内传输</span><span v-if="files.length">{{ files.length }} 个文件 · {{ size(totalSize) }}</span><span v-else>{{ textBytes.toLocaleString() }} / 65,536 字节</span></div>
-     </div>
-     <div class="recipient-card"><div class="recipient-info"><span class="step-label"><span>02</span>发送给谁</span><p v-if="selected.length">已选择 {{ selected.length }} 台设备 · 每位接收者独立确认</p><p v-else>从{{ state!.devices.length?'设备列表':'附近设备列表' }}中选择一台或多台设备</p></div><div class="recipient-chips"><button v-for="id in selected" :key="id" @click="toggle(id)">{{ state!.devices.find(d=>d.id===id)?.name }}<X :size="12"/></button><span v-if="!selected.length" class="muted small">尚未选择</span></div></div>
-     <div v-if="busy" class="upload-progress"><div><span>正在准备文件… {{ size(uploaded) }} / {{ size(uploadTotal) }}</span><button class="text-button" @click="controller?.abort()">取消上传</button></div><progress :max="uploadTotal||1" :value="uploaded"/></div>
-     <div class="send-actions"><div class="hint"><ShieldCheck :size="18"/><span>无需账号，无云端中转。<small>应用与浏览器均可连接。</small></span></div><button class="primary send-button" :disabled="!canSend" @click="send"><LoaderCircle v-if="busy" class="spin" :size="18"/><Send v-else :size="18"/>{{ busy?'正在准备':'发送内容' }}<span v-if="selected.length&&!busy">{{ selected.length }}</span></button></div>
-
-    </template>
-    <template v-else>
-     <div class="page-heading"><h1>{{ tab==='inbox'?'收件箱':'传输记录' }}</h1><p>{{ tab==='inbox'?'先确认，再接收。收到的内容都在这里。':'查看本次运行的收发进度与结果。' }}</p></div>
-     <div v-if="!visible.length" class="empty-state"><span><Inbox v-if="tab==='inbox'" :size="34"/><Radio v-else :size="34"/></span><h3>{{ tab==='inbox'?'收件箱还是空的':'还没有传输记录' }}</h3><p>让附近的设备给你发送内容，或开始你的第一次分享。</p><button class="secondary" @click="tab='send'">去发送内容<ArrowUpRight :size="16"/></button></div>
-     <article v-for="transfer in visible" :key="transfer.id" class="transfer-card"><div class="transfer-header"><span class="transfer-direction"><ArrowDownLeft v-if="transfer.recipient_id===state!.me.id" :size="19"/><ArrowUpRight v-else :size="19"/></span><div><b>{{ transfer.recipient_id===state!.me.id?transfer.sender_name:transfer.recipient_name }}</b><small>{{ transfer.recipient_id===state!.me.id?'发给你':'你发送给对方' }} · {{ time(transfer.created) }}</small></div><span class="status" :class="transfer.status"><CheckCheck v-if="transfer.status==='completed'" :size="14"/><LoaderCircle v-if="transfer.status==='transferring'" class="spin" :size="14"/>{{ statusLabel(transfer.status) }}</span></div>
-      <div v-if="transfer.text" class="received-text"><p>{{ transfer.text }}</p><button v-if="transfer.status==='completed'" class="icon-button" title="复制文字" @click="copy(transfer.text)"><Copy :size="16"/></button></div>
-      <div v-for="file in transfer.files" :key="file.id" class="received-file"><span class="file-type"><FileImage v-if="file.mime.startsWith('image/')" :size="21"/><File v-else :size="21"/></span><span><b>{{ file.name }}</b><small>{{ size(file.size) }}</small></span><template v-if="transfer.status==='completed'"><button v-if="/^image\/(png|jpeg|gif|webp|bmp)$/.test(file.mime)" class="text-button" @click="viewImage(transfer,file)">预览</button><button class="icon-button" :aria-label="`下载 ${file.name}`" @click="download(transfer,file)"><Download :size="18"/></button></template></div>
-      <p v-if="transfer.error" class="error">{{ transfer.error }}</p><div v-if="transfer.status==='transferring'" class="transfer-progress"><progress :value="transfer.bytes" :max="transfer.total||1"/><small>{{ size(transfer.bytes) }} / {{ size(transfer.total) }}</small></div>
-      <div v-if="transfer.status==='pending'&&transfer.recipient_id===state!.me.id" class="transfer-actions"><span>确认接收来自这台设备的内容？</span><button class="secondary" @click="decide(transfer,false)">拒绝</button><button class="primary" @click="decide(transfer,true)"><Check :size="16"/>接收</button></div><div v-else-if="!terminal(transfer.status)" class="transfer-actions"><span>{{ transfer.status==='pending'?'等待对方确认接收…':'保持应用或网页打开，传输正在进行。' }}</span><button class="secondary" @click="cancel(transfer)">取消传输</button></div>
-     </article>
-    </template>
-    <footer><span>邻传 · Linchuan 0.1.0</span><span>局域网传输</span></footer>
-   </div>
-  </section>
-  <nav class="mobile-nav"><button :class="{current:tab==='send'}" @click="tab='send'"><Send :size="20"/>发送</button><button :class="{current:tab==='inbox'}" @click="tab='inbox'"><Inbox :size="20"/>收件箱 {{ pending.length||'' }}</button><button :class="{current:tab==='history'}" @click="tab='history'"><Radio :size="20"/>记录</button><button v-if="state!.me.owner" @click="showConnection"><QrCode :size="20"/>连接</button></nav>
- </div>
- <div v-if="toast" class="toast" :class="{error:toastError}" role="status"><X v-if="toastError" :size="18"/><Check v-else :size="18"/>{{ toast }}</div>
- <div v-if="connection||manual||editName||preview" class="modal-backdrop" @click.self="connection=false;manual=false;editName=false;closePreview()">
-  <section v-if="connection" class="modal connection-modal"><button class="modal-close icon-button" aria-label="关闭" @click="connection=false"><X :size="20"/></button><div class="modal-icon"><QrCode :size="25"/></div><h2>连接其他设备</h2><p>另一台设备打开浏览器，扫码或输入下方地址。</p><div class="connection-device-name"><span>{{ state?.me.name }}</span><button class="text-button" @click="newName=state!.me.name;connection=false;editName=true">修改名称</button></div><img :src="qr" alt="本机浏览器访问二维码" class="qr-image"/><select v-if="(state?.info.addresses.length||0)>1" v-model="shareAddress" aria-label="选择网络地址" @change="changeAddress"><option v-for="item in state?.info.addresses" :key="item">{{ item }}</option></select><button class="address-copy" @click="copy(shareAddress)"><span>{{ shareAddress }}</span><Copy :size="16"/></button><div class="pairing-code"><span>本次配对码</span><b>{{ pairingCode }}</b><small>仅分享给你希望连接的人</small></div><div class="notice">保持应用运行。仅在可信局域网使用，首版采用 HTTP 传输。</div></section>
-  <section v-else-if="manual" class="modal"><button class="modal-close icon-button" aria-label="关闭" @click="manual=false"><X :size="20"/></button><div class="modal-icon"><Link :size="24"/></div><h2>通过地址连接</h2><p>在对方应用的连接面板中找到完整访问地址。</p><form @submit.prevent="connectPeer"><label>对方设备地址<input v-model="manualAddress" required placeholder="http://192.168.1.20:52783" type="url"/></label><button class="primary wide" :disabled="manualBusy"><LoaderCircle v-if="manualBusy" class="spin" :size="18"/>{{ manualBusy?'正在连接':'连接设备' }}</button></form></section>
-  <section v-else-if="editName" class="modal"><button class="modal-close icon-button" aria-label="关闭" @click="editName=false"><X :size="20"/></button><h2>给设备起个名字</h2><p>设备名称会显示在附近设备列表中。</p><form @submit.prevent="saveName"><label>设备名称<input v-model="newName" required maxlength="64"/></label><button class="primary wide">保存名称</button></form></section>
-  <section v-else-if="preview" class="modal image-modal"><button class="modal-close icon-button" aria-label="关闭" @click="closePreview"><X :size="20"/></button><h3>{{ preview.name }}</h3><img :src="preview.url" :alt="preview.name"/></section>
- </div>
+  <div v-if="loading || bootError" class="launch">
+    <div class="brand-icon">邻</div>
+    <h1>邻传</h1>
+    <p v-if="bootError" class="error">{{ bootError }}</p>
+    <LoaderCircle v-else class="spin" :size="22" />
+  </div>
+  <main v-else-if="!ready" class="pair-page">
+    <section class="pair-card">
+      <div class="brand-icon">邻</div>
+      <h1>连接设备</h1>
+      <p>配对 {{ hostName }}，开始传送文字和文件。</p>
+      <form @submit.prevent="pair">
+        <label
+          >你的设备名称<input
+            v-model="browserName"
+            required
+            maxlength="64"
+            placeholder="例如：我的手机"
+            autocomplete="nickname" /></label
+        ><label
+          >六位配对码<input
+            v-model="code"
+            required
+            pattern="[0-9]{6}"
+            inputmode="numeric"
+            maxlength="6"
+            placeholder="查看对方应用中的配对码"
+        /></label>
+        <p v-if="pairError" class="error" role="alert">{{ pairError }}</p>
+        <button class="primary wide" :disabled="pairing">
+          <LoaderCircle v-if="pairing" class="spin" :size="17" /><Link
+            v-else
+            :size="17"
+          />{{ pairing ? "正在连接" : "连接设备" }}
+        </button>
+      </form>
+      <small>同一局域网 · 无需账号 · HTTP 传输</small>
+    </section>
+  </main>
+  <div
+    v-else
+    class="workspace"
+    :class="{
+      'chat-open': !!selected && mode === 'devices',
+      'section-open': mode !== 'devices',
+    }"
+  >
+    <nav class="function-rail" aria-label="主要功能">
+      <button class="rail-brand" title="邻传" @click="setMode('devices')">
+        邻</button
+      ><button
+        class="rail-button"
+        :class="{ active: mode === 'devices' }"
+        aria-label="设备"
+        title="设备"
+        @click="setMode('devices')"
+      >
+        <MessageSquare :size="23" /><span>设备</span
+        ><i v-if="unread" class="rail-unread" />
+      </button>
+      <div class="rail-spacer" />
+      <button
+        class="rail-button"
+        :class="{ active: mode === 'settings' }"
+        aria-label="设置"
+        title="设置"
+        @click="setMode('settings')"
+      >
+        <Settings :size="22" /><span>设置</span></button
+      ><button
+        class="rail-button"
+        :class="{ active: mode === 'about' }"
+        aria-label="关于"
+        title="关于"
+        @click="setMode('about')"
+      >
+        <Info :size="22" /><span>关于</span>
+      </button>
+    </nav>
+    <aside v-if="mode === 'devices'" class="conversation-panel">
+      <header class="list-header">
+        <div>
+          <h1>设备</h1>
+          <span
+            class="connection-dot"
+            :class="{ offline: !connected }"
+            :title="connected ? '局域网已连接' : '连接中断'"
+          />
+        </div>
+        <div class="add-wrapper">
+          <button
+            class="icon-button"
+            aria-label="添加"
+            @click="addMenu = !addMenu"
+          >
+            <Plus :size="20" />
+          </button>
+          <div v-if="addMenu" class="popup-menu">
+            <button
+              @click="
+                addMenu = false;
+                modal = 'manual';
+              "
+            >
+              <Link :size="16" />通过地址连接</button
+            ><button @click="newGroup()"><Users :size="16" />新建群聊</button
+            ><button v-if="state!.me.owner" @click="showConnection">
+              <QrCode :size="16" />连接浏览器
+            </button>
+          </div>
+        </div>
+      </header>
+      <div class="search-field">
+        <Search :size="15" /><input
+          v-model="search"
+          aria-label="搜索设备或群聊"
+          placeholder="搜索设备或群聊"
+        />
+      </div>
+      <div class="conversation-scroll">
+        <div v-if="conversations.length" class="list-label">会话</div>
+        <button
+          v-for="conversation in conversations"
+          :key="conversation.id"
+          class="conversation-row"
+          :class="{ selected: conversation.id === selected }"
+          :aria-label="`打开 ${conversation.name}`"
+          @click="selectConversation(conversation)"
+        >
+          <span class="avatar" :class="{ group: conversation.kind === 'group' }"
+            ><Users v-if="conversation.kind === 'group'" :size="23" /><Monitor
+              v-else
+              :size="23" /><i
+              v-if="
+                conversation.kind === 'direct' && online(conversation.peer_id)
+              " /></span
+          ><span class="row-copy"
+            ><span class="row-title"
+              ><b>{{ conversation.name }}</b
+              ><time v-if="conversation.last_message_at">{{
+                timestamp(conversation.last_message_at)
+              }}</time></span
+            ><span class="row-preview"
+              ><span>{{
+                conversation.preview ||
+                (conversation.kind === "group" ? "群聊" : "还没有传输记录")
+              }}</span
+              ><em v-if="conversation.unread">{{
+                conversation.unread > 99 ? "99+" : conversation.unread
+              }}</em></span
+            ></span
+          >
+        </button>
+        <div v-if="nearby.length" class="list-label nearby-label">
+          附近设备 <span>{{ nearby.length }}</span>
+        </div>
+        <button
+          v-for="device in nearby"
+          :key="device.id"
+          class="conversation-row"
+          :aria-label="`连接 ${device.name}`"
+          @click="selectDevice(device)"
+        >
+          <span class="avatar"
+            ><Smartphone
+              v-if="device.platform === 'Android'"
+              :size="23" /><Globe
+              v-else-if="device.kind === 'browser'"
+              :size="23" /><Monitor v-else :size="23" /><i /></span
+          ><span class="row-copy"
+            ><span class="row-title"
+              ><b>{{ device.name }}</b></span
+            ><span class="row-preview">{{ device.platform }} · 在线</span></span
+          >
+        </button>
+        <div v-if="!conversations.length && !nearby.length" class="list-empty">
+          <Wifi :size="28" />
+          <p>{{ search ? "没有找到相关设备" : "等待附近设备加入" }}</p>
+          <span v-if="!search"
+            >打开另一台设备上的邻传，<br />也可以通过地址连接。</span
+          ><button v-if="!search" class="text-button" @click="modal = 'manual'">
+            通过地址连接
+          </button>
+        </div>
+      </div>
+      <footer class="list-footer">
+        <span class="self-avatar">{{ state!.me.name.slice(0, 1) }}</span
+        ><span
+          ><b>{{ state!.me.name }}</b
+          ><small>{{
+            state!.me.owner ? "本机设备" : "浏览器会话"
+          }}</small></span
+        ><button
+          v-if="state!.me.owner"
+          class="icon-button"
+          title="连接其他设备"
+          aria-label="连接其他设备"
+          @click="showConnection"
+        >
+          <QrCode :size="18" />
+        </button>
+      </footer>
+    </aside>
+    <main v-if="mode === 'devices'" class="chat-panel">
+      <template v-if="current"
+        ><header class="chat-header">
+          <button
+            class="icon-button mobile-back"
+            aria-label="返回设备列表"
+            @click="
+              flushDraft();
+              selected = '';
+            "
+          >
+            <ArrowLeft :size="21" />
+          </button>
+          <div class="chat-title">
+            <h2>{{ current.name }}</h2>
+            <p v-if="current.kind === 'group'">
+              {{
+                group?.members.filter((m) => m.state === "joined").length || 0
+              }}
+              位成员<template v-if="membership?.state === 'left'">
+                · 已退出</template
+              >
+            </p>
+            <p v-else>
+              <span
+                class="connection-dot"
+                :class="{ offline: !online(current.peer_id) }"
+              />{{ online(current.peer_id) ? "在线" : "离线 · 历史记录保留" }}
+            </p>
+          </div>
+          <button
+            v-if="group"
+            class="icon-button"
+            aria-label="群成员与设置"
+            @click="modal = 'members'"
+          >
+            <MoreHorizontal :size="23" /></button
+          ><span v-else class="local-note">局域网直传</span>
+        </header>
+        <div
+          v-if="group && membership?.state === 'invited'"
+          class="invitation-banner"
+        >
+          <Users :size="19" /><span
+            ><b>你收到一个群邀请</b
+            ><small>加入后可与群内成员直接传输。</small></span
+          ><button
+            class="secondary"
+            :disabled="modalBusy"
+            @click="groupDecision(false)"
+          >
+            拒绝</button
+          ><button
+            class="primary"
+            :disabled="modalBusy"
+            @click="groupDecision(true)"
+          >
+            加入群聊
+          </button>
+        </div>
+        <div
+          ref="timeline"
+          class="message-timeline"
+          @dragover.prevent="dragging = canWrite"
+          @dragleave.prevent="dragging = false"
+          @drop="drop"
+        >
+          <button
+            v-if="before"
+            class="load-history"
+            :disabled="historyBusy"
+            @click="loadMessages(false, true)"
+          >
+            <LoaderCircle
+              v-if="historyBusy"
+              class="spin"
+              :size="14"
+            />加载更早记录
+          </button>
+          <div v-if="!messages.length && !historyBusy" class="timeline-empty">
+            <MessageSquare :size="30" />
+            <p>
+              {{
+                membership?.state === "invited"
+                  ? "等待你确认加入群聊"
+                  : "还没有消息，发送第一条内容。"
+              }}
+            </p>
+          </div>
+          <article
+            v-for="message in messages"
+            :key="message.id"
+            class="message"
+            :class="{ outgoing: message.sender_id === state!.me.id }"
+            :data-message-id="message.id"
+          >
+            <div class="message-avatar">
+              {{ message.sender_name.slice(0, 1) }}
+            </div>
+            <div class="message-main">
+              <div class="message-meta">
+                <span>{{
+                  message.sender_id === state!.me.id
+                    ? "我"
+                    : message.sender_name
+                }}</span
+                ><time>{{ timestamp(message.created_at) }}</time>
+              </div>
+              <div v-if="message.text" class="text-bubble">
+                <p>{{ message.text }}</p>
+                <button
+                  class="copy-message"
+                  aria-label="复制文字"
+                  @click="copy(message.text)"
+                >
+                  <Copy :size="14" />
+                </button>
+              </div>
+              <div
+                v-for="file in message.files"
+                :key="file.id"
+                class="attachment-card"
+                :class="{
+                  expired:
+                    !file.available &&
+                    message.deliveries.every((d) => terminal(d.status)),
+                }"
+              >
+                <button
+                  v-if="thumbnails[message.id + file.id]"
+                  class="image-thumbnail"
+                  :aria-label="`预览 ${file.name}`"
+                  @click="viewImage(file)"
+                >
+                  <img
+                    :src="thumbnails[message.id + file.id]"
+                    :alt="file.name"
+                  />
+                </button>
+                <div class="attachment-body">
+                  <span class="file-icon"
+                    ><ImageIcon
+                      v-if="file.mime.startsWith('image/')"
+                      :size="24" /><File v-else :size="24" /></span
+                  ><span class="file-label"
+                    ><b>{{ file.name }}</b
+                    ><small
+                      >{{ size(file.size)
+                      }}<template
+                        v-if="
+                          !file.available &&
+                          message.deliveries.every((d) => terminal(d.status))
+                        "
+                      >
+                        · 文件不可用或已过期</template
+                      ></small
+                    ></span
+                  ><template v-if="file.available"
+                    ><button
+                      v-if="raster(file) && !thumbnails[message.id + file.id]"
+                      class="icon-button"
+                      :aria-label="`预览 ${file.name}`"
+                      @click="viewImage(file)"
+                    >
+                      <ImageIcon :size="17" /></button
+                    ><button
+                      class="icon-button"
+                      :aria-label="`下载 ${file.name}`"
+                      @click="download(file)"
+                    >
+                      <Download :size="18" /></button
+                  ></template>
+                </div>
+              </div>
+              <div v-if="incomingPending(message)" class="receive-actions">
+                <span
+                  >是否接收{{
+                    message.files.length ? "这些内容" : "这条文字"
+                  }}？</span
+                ><button
+                  class="secondary"
+                  @click="decide(incomingPending(message)!, false)"
+                >
+                  拒绝</button
+                ><button
+                  class="primary"
+                  @click="decide(incomingPending(message)!, true)"
+                >
+                  接收
+                </button>
+              </div>
+              <button
+                v-if="message.sender_id === state!.me.id"
+                class="delivery-summary"
+                :class="{ success: summary(message) === '已送达' }"
+                @click="toggleExpanded(message.id)"
+              >
+                <CheckCheck
+                  v-if="summary(message) === '已送达'"
+                  :size="13"
+                /><LoaderCircle
+                  v-else-if="summary(message) === '正在传输'"
+                  class="spin"
+                  :size="13"
+                />{{ summary(message)
+                }}<ChevronDown v-if="message.deliveries.length" :size="12" />
+              </button>
+              <div
+                v-if="
+                  expanded.has(message.id) ||
+                  message.deliveries.some(
+                    (d) => d.status === 'transferring' || d.error,
+                  )
+                "
+                class="delivery-details"
+              >
+                <div v-for="delivery in message.deliveries" :key="delivery.id">
+                  <span>{{
+                    delivery.recipient_id === state!.me.id
+                      ? "本机"
+                      : delivery.recipient_name
+                  }}</span
+                  ><span>{{ statusLabel(delivery.status) }}</span
+                  ><button
+                    v-if="!terminal(delivery.status)"
+                    class="text-button"
+                    @click="cancel(delivery)"
+                  >
+                    取消</button
+                  ><progress
+                    v-if="delivery.status === 'transferring'"
+                    :value="delivery.bytes"
+                    :max="delivery.total || 1"
+                  />
+                  <p v-if="delivery.error">{{ delivery.error }}</p>
+                </div>
+              </div>
+            </div>
+          </article>
+          <div v-if="dragging" class="drop-overlay">
+            <Paperclip :size="29" /><span>松开以添加文件</span>
+          </div>
+        </div>
+        <div class="composer" :class="{ disabled: !canWrite }">
+          <div v-if="files.length" class="composer-files">
+            <div v-for="(file, index) in files" :key="index">
+              <File :size="17" /><span>{{ file.name }}</span
+              ><small>{{ size(file.size) }}</small
+              ><button
+                :disabled="sending"
+                class="icon-button"
+                :aria-label="`移除 ${file.name}`"
+                @click="files.splice(index, 1)"
+              >
+                <X :size="14" />
+              </button>
+            </div>
+          </div>
+          <div class="composer-toolbar">
+            <button
+              class="icon-button"
+              title="添加文件或图片"
+              aria-label="添加文件或图片"
+              :disabled="!canWrite || sending"
+              @click="input?.click()"
+            >
+              <Paperclip :size="20" /></button
+            ><span>{{
+              sending ? "正在准备文件…" : "可粘贴截图或拖入文件"
+            }}</span
+            ><span v-if="sending" class="upload-count"
+              >{{ size(progress) }} / {{ size(uploadTotal)
+              }}<button class="text-button" @click="controller?.abort()">
+                取消
+              </button></span
+            ><input
+              ref="input"
+              type="file"
+              multiple
+              hidden
+              :disabled="!canWrite || sending"
+              @change="fileChange"
+            />
+          </div>
+          <progress
+            v-if="sending && uploadTotal"
+            :value="progress"
+            :max="uploadTotal"
+          /><textarea
+            ref="composer"
+            v-model="text"
+            aria-label="发送文字"
+            :disabled="!canWrite || sending"
+            :placeholder="
+              canWrite
+                ? '输入文字…'
+                : membership?.state === 'invited'
+                  ? '加入群聊后即可发送'
+                  : '已退出群聊，可继续查看本机历史'
+            "
+            @input="queueDraft"
+            @paste="paste"
+            @keydown.ctrl.enter.prevent="send"
+            @keydown.meta.enter.prevent="send"
+          />
+          <div class="composer-footer">
+            <small>Ctrl / ⌘ + Enter 发送</small
+            ><button
+              class="primary send-button"
+              :disabled="!canSend"
+              @click="send"
+            >
+              <LoaderCircle v-if="sending" class="spin" :size="15" /><Send
+                v-else
+                :size="15"
+              />{{ sending ? "准备中" : "发送" }}
+            </button>
+          </div>
+        </div>
+      </template>
+      <div v-else class="welcome">
+        <div class="brand-icon">邻</div>
+        <h2>邻传</h2>
+        <p>选择设备或群聊，开始传输。</p>
+        <button class="secondary" @click="modal = 'manual'">
+          <Link :size="16" />通过地址连接
+        </button>
+      </div>
+    </main>
+    <main v-else-if="mode === 'settings'" class="settings-page">
+      <header class="section-header">
+        <h1>设置</h1>
+        <p>管理本机设备与本地存储</p>
+      </header>
+      <section class="settings-card">
+        <h2>设备名称</h2>
+        <p>附近设备将通过这个名字识别你。</p>
+        <form
+          v-if="state!.me.owner"
+          class="name-form"
+          @submit.prevent="saveName"
+        >
+          <label class="sr-only" for="device-name">设备名称</label
+          ><input
+            id="device-name"
+            v-model="newName"
+            required
+            maxlength="64"
+          /><button class="primary" :disabled="nameBusy">
+            <LoaderCircle v-if="nameBusy" class="spin" :size="15" />保存名称
+          </button>
+        </form>
+        <p v-else class="browser-label">{{ state!.me.name }} · 浏览器会话</p>
+      </section>
+      <section v-if="state!.me.owner" class="settings-card">
+        <div class="card-heading">
+          <div>
+            <h2>连接其他设备</h2>
+            <p>让未安装应用的设备通过浏览器加入。</p>
+          </div>
+          <button class="secondary" @click="showConnection">
+            <QrCode :size="17" />二维码与配对码
+          </button>
+        </div>
+      </section>
+      <section class="settings-card">
+        <div class="card-heading">
+          <div>
+            <h2>本地存储</h2>
+            <p>
+              已使用 {{ size(state!.storage_used) }} /
+              {{ size(state!.storage_limit) }}
+            </p>
+          </div>
+          <button
+            v-if="state!.me.owner"
+            class="secondary"
+            @click="modal = 'clear'"
+          >
+            <Trash2 :size="16" />清理文件缓存
+          </button>
+        </div>
+        <progress
+          :value="state!.storage_used"
+          :max="state!.storage_limit"
+        /><small>文字和历史记录保存在本机。清理缓存后，原文件卡片保留。</small>
+      </section>
+      <section v-if="!state!.me.owner" class="settings-card">
+        <button class="secondary" @click="disconnect">
+          <LogOut :size="16" />断开连接
+        </button>
+      </section>
+    </main>
+    <main v-else class="about-page">
+      <div class="brand-icon">邻</div>
+      <h1>邻传 · Linchuan</h1>
+      <span class="version-label">{{ state!.info.version }}</span>
+      <p>同一网络，随手互传。</p>
+      <div class="about-facts">
+        <div>
+          <Monitor :size="18" /><span>Android、Linux、Windows 与浏览器</span>
+        </div>
+        <div>
+          <Users :size="18" /><span>设备直传与群聊，历史保存在本机</span>
+        </div>
+        <div><ShieldCheck :size="18" /><span>无需账号，无云端中转</span></div>
+      </div>
+      <p class="about-note">
+        仅在可信局域网使用，当前采用 HTTP 传输。<br />保持应用运行；群聊暂不自动补发离线消息。
+      </p>
+      <a
+        href="https://github.com/whoarei/linchuan"
+        target="_blank"
+        rel="noreferrer"
+        >GitHub 项目<ArrowUpRight :size="14"
+      /></a>
+    </main>
+  </div>
+  <div v-if="toast" class="toast" :class="{ error: toastError }" role="status">
+    <X v-if="toastError" :size="17" /><Check v-else :size="17" />{{ toast }}
+  </div>
+  <div v-if="modal" class="modal-backdrop" @click.self="closeModal">
+    <section
+      class="modal"
+      :class="{ 'image-modal': modal === 'preview' }"
+      role="dialog"
+      aria-modal="true"
+    >
+      <button
+        class="modal-close icon-button"
+        aria-label="关闭"
+        @click="closeModal"
+      >
+        <X :size="20" />
+      </button>
+      <template v-if="modal === 'connect'"
+        ><div class="modal-icon"><QrCode :size="24" /></div>
+        <h2>连接其他设备</h2>
+        <p>在同一网络中，扫码或用浏览器打开地址。</p>
+        <img :src="qr" class="qr-image" alt="浏览器访问二维码" /><select
+          v-if="state!.info.addresses.length > 1"
+          v-model="shareAddress"
+          aria-label="选择网络地址"
+          @change="updateQr"
+        >
+          <option v-for="item in state!.info.addresses" :key="item">
+            {{ item }}
+          </option></select
+        ><button class="address-copy" @click="copy(shareAddress)">
+          <span>{{ shareAddress }}</span
+          ><Copy :size="16" />
+        </button>
+        <div class="pairing-code">
+          <small>本次配对码</small><b>{{ pairingCode }}</b>
+        </div></template
+      >
+      <template v-else-if="modal === 'manual'"
+        ><div class="modal-icon"><Link :size="24" /></div>
+        <h2>通过地址连接</h2>
+        <p>输入对方应用展示的完整访问地址。</p>
+        <form @submit.prevent="connectPeer">
+          <label
+            >对方设备地址<input
+              v-model="manualAddress"
+              type="url"
+              required
+              placeholder="http://192.168.1.20:52783" /></label
+          ><button class="primary wide" :disabled="modalBusy">
+            <LoaderCircle v-if="modalBusy" class="spin" :size="16" />{{
+              modalBusy ? "连接中" : "连接设备"
+            }}
+          </button>
+        </form></template
+      >
+      <template v-else-if="modal === 'group'"
+        ><div class="modal-icon"><Users :size="24" /></div>
+        <h2>{{ editingGroup ? "管理群聊" : "新建群聊" }}</h2>
+        <p>
+          {{
+            editingGroup
+              ? "修改群名，或邀请附近设备加入。"
+              : "选择成员，对方确认加入后即可收发。"
+          }}
+        </p>
+        <form @submit.prevent="saveGroup">
+          <label
+            >群名称<input
+              v-model="groupName"
+              required
+              maxlength="64"
+              placeholder="例如：家里的设备"
+          /></label>
+          <div class="member-selector">
+            <label
+              v-for="device in eligible"
+              :key="device.id"
+              class="member-option"
+              ><input
+                v-model="memberIds"
+                type="checkbox"
+                :value="device.id"
+              /><span class="avatar small-avatar"><Monitor :size="18" /></span
+              ><span
+                >{{ device.name }}<small>{{ device.platform }}</small></span
+              ></label
+            >
+            <p v-if="!eligible.length">暂无支持群聊的附近设备</p>
+          </div>
+          <button
+            class="primary wide"
+            :disabled="modalBusy || (!editingGroup && !memberIds.length)"
+          >
+            <LoaderCircle v-if="modalBusy" class="spin" :size="16" />{{
+              editingGroup ? "保存并发送邀请" : "创建群聊"
+            }}
+          </button>
+        </form></template
+      >
+      <template v-else-if="modal === 'members' && group"
+        ><h2>{{ group.name }}</h2>
+        <p>
+          {{ group.members.length }} 位成员 ·
+          {{ group.members.filter((m) => m.state === "joined").length }}
+          位已加入
+        </p>
+        <div class="member-list">
+          <div v-for="member in group.members" :key="member.device.id">
+            <span class="avatar small-avatar">{{
+              member.device.name.slice(0, 1)
+            }}</span
+            ><span
+              >{{ member.device.name
+              }}<small
+                >{{ member.role === "owner" ? "群主 · " : ""
+                }}{{
+                  member.state === "joined"
+                    ? "已加入"
+                    : member.state === "invited"
+                      ? "等待确认"
+                      : "已退出"
+                }}</small
+              ></span
+            >
+          </div>
+        </div>
+        <button
+          v-if="owner && membership?.state === 'joined'"
+          class="secondary wide"
+          @click="newGroup(true)"
+        >
+          <Users :size="16" />修改群名或邀请成员</button
+        ><button
+          v-if="owner && membership?.state === 'joined'"
+          class="text-button wide"
+          @click="resendInvitations"
+          :disabled="modalBusy"
+        >
+          重新发送邀请</button
+        ><button
+          v-if="membership?.state === 'joined'"
+          class="danger-button wide"
+          @click="modal = 'leave'"
+        >
+          退出群聊
+        </button></template
+      >
+      <template v-else-if="modal === 'leave'"
+        ><h2>退出群聊？</h2>
+        <p>本机历史会保留。再次加入需要群主重新邀请。</p>
+        <div class="modal-actions">
+          <button class="secondary" @click="modal = 'members'">取消</button
+          ><button class="primary" :disabled="modalBusy" @click="leaveGroup">
+            确认退出
+          </button>
+        </div></template
+      >
+      <template v-else-if="modal === 'clear'"
+        ><h2>清理文件缓存？</h2>
+        <p>
+          文字和历史卡片会保留，正在传输的文件会跳过。已清理的附件需向发送者重新获取。
+        </p>
+        <div class="modal-actions">
+          <button class="secondary" @click="closeModal">取消</button
+          ><button class="primary" :disabled="modalBusy" @click="clearFiles">
+            确认清理
+          </button>
+        </div></template
+      >
+      <template v-else-if="modal === 'preview' && preview"
+        ><h3>{{ preview.name }}</h3>
+        <img :src="preview.url" :alt="preview.name" class="preview-image"
+      /></template>
+    </section>
+  </div>
 </template>

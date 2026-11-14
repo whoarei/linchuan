@@ -1,6 +1,6 @@
 [package]
 name = "linchuan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -16,3 +16,6 @@ tauri-plugin-opener = "2"
 linchuan-core = { path = "../crates/core" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["sync"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-single-instance = "2"

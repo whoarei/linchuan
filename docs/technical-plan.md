@@ -1,93 +1,55 @@
-# 邻传 Linchuan 技术方案
+# 邻传技术方案
 
-版本：0.1.0 · 技术基线：Tauri 2 + Vue 3 + TypeScript + Rust
+当前开发基线为 0.2.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
-## 1. 架构
+## 模块
 
-```text
-应用 A                                  应用 B
-Vue UI                                  Vue UI
-  │                                       │
-Rust 核心 ───── HTTP 直接传输 ───────── Rust 核心
-  │                                       │
-随机 TCP 端口 + 内嵌网页                 随机 TCP 端口 + 内嵌网页
-  ↑                                       ↑
-浏览器会话 A                            浏览器会话 B
+- `crates/core/src/model.rs`：设备、会话、消息、传输、群和签名数据类型。
+- `store.rs` / `migrations/`：SQLite 版本迁移、事务写入、分页查询和启动恢复。
+- `identity.rs`：本机 Ed25519 签名和校验；浏览器 token 的 SHA-256。
+- `groups.rs`：群主签名名单、成员签名决定、邀请及成员通知、直连地址核对。
+- `conversations.rs`：会话创建、历史分页、已读位置、文字草稿和缓存清理。
+- `api.rs`：配对、授权、文件流、直接传输兼容接口、WebSocket。
+- `transport.rs` / `discovery.rs`：逐人传输、取消、mDNS、在线探测。
+- `src-tauri/`：原生生命周期、私有目录、下载打开、Android 权限、桌面单实例与打包。
+- `src/`：三列/移动会话界面、设置、关于及共用 API。
 
-各应用通过 mDNS/DNS-SD 发布和发现实际地址、端口；没有中心注册或中转节点。
-```
+## 持久化
 
-浏览器访问某应用后，由该应用提供网页及该会话的收发能力。浏览器到宿主是直接连接；浏览器通过宿主发送到其他应用时，宿主作为该次发送的本地代理。应用到应用不经过第三台机器。多目标分别发送，不宣称局域网广播文件。
+完整数据模型和关系约束见[数据模型文档](data-model.md)，已在实现前单独提交。
 
-## 2. 模块与目录
+应用私有目录包含 `linchuan.db`、`files/` 和运行期 staging。SQLite 使用 WAL、foreign_keys、synchronous=FULL、busy_timeout；schema 通过事务和 user_version 迁移。数据库操作通过 spawn_blocking 和连接互斥执行。
 
-- `src/`：共用 Vue 界面、API 客户端、类型、样式；不引用 CDN。
-- `crates/core/`：不依赖 Tauri 的收发核心，便于运行集成测试和无界面实例。
-- `src-tauri/`：生命周期、设备数据目录、原生桥接、系统打开下载链接、打包配置。
-- `src-tauri/gen/android/`：Android 原生工程、权限与组播锁。
-- `tests/`：浏览器端到端测试；Rust 协议测试放在核心 crate。
-- `.github/workflows/`：验证、跨平台构建、发布。
+热数据保存在内存，持久化以规范化表事务提交。元数据比较跳过未改变的传输行；进度节流保存在内存，状态变化及最终结果提交后才确认成功。提交失败回滚内存中的持久状态，上传草稿保留以便重试。最多缓存约 500 条近期/活动传输，旧历史通过数据库分页查询；游标为本机递增 position。
 
-## 3. 网络与发现
+重启将活动任务标为 interrupted，重新探测在线状态，保留完成文件、历史和群成员。未提交完成的文件副本与 `.part` 在恢复时清理。文件完成会 flush/sync 后重命名，在 Unix 上同步父目录，再提交完成状态。文件系统和 SQLite 不是同一个事务，不宣称两者具有原子提交。
 
-HTTP 服务采用 Axum/Tokio，绑定 `0.0.0.0:0`，从 listener 获取真实端口后才发布地址。不自行随机挑端口，避免检查与绑定间竞争。服务端口每次启动可变化；设备 ID 在应用数据目录持久化。
+## 设备发现与协议
 
-使用 mDNS/DNS-SD `_linchuan._tcp.local.`，TXT 包含协议版本、设备 ID、名称与平台；端口在 SRV 中发布。底层 mDNS 使用标准发现端口，与随机业务端口分开。维护带过期时间的设备表，提供手动地址探测作为回退。不把发现信息当作身份认证。
+HTTP 服务绑定 `0.0.0.0:0`，从 listener 读取真实端口。mDNS `_linchuan._tcp.local.` 发布设备 ID、名称、版本能力、公钥及实际端口，手动地址作为回退。地址和端口是当前连接信息，不是身份；离线设备记录不会被删掉。
 
-只向本地子网提供功能；不自动配置 UPnP、不启用公网隧道。手动连接只允许局域网/回环 IPv4 地址和合法端口，拒绝 URL 凭据、重定向及非 HTTP 协议，降低本地 API 被当作任意 URL 代理的风险。
+基础 protocol=1 保持 0.1 直接传输接口兼容。新增 capabilities 声明 groups-v1、signed-offers-v1、history-v1；新客户端用 message_id、sender_id、target_id、group_id、created_at 和签名识别消息。旧版未签名来源作为兼容身份保存，不凭名称合并新身份，不能发送群消息。
 
-## 4. 身份与会话
+每次群发送展开为多个 delivery，发送者直接连接接收者。群主维护名单，不中转数据；接收者缓存已验证名单及加入事件，因此群主离线不阻止其他成员互传。浏览器由自己的宿主代理；其他原生成员不依赖该宿主存在。
 
-原生 UI 通过 Tauri command 获取回环地址与仅存内存的 owner token；远程网页无法获得该 token。网页输入本次启动配对码，服务签发随机浏览器 token，所有业务请求携带 Bearer token。配对有速率限制，token 不写日志、不放查询串。
+## 权限与签名
 
-设备 ID 是展示与发现标识，首版不具备密码学身份认证。远端 offer 无需永久信任，但有大小、并发与速率限制；每个 offer 返回随机传输凭证，仅授权该次传输状态查询、上传和取消。接收确认必须由 owner 或目标浏览器会话执行。
+原生 UI 通过 Tauri command 获得本机 owner token；owner token 和配对码每次启动生成。浏览器配对使用随机 Bearer token，数据库仅存 SHA-256 和期限。退出会话撤销凭证，重启后也不会重新授权。
 
-下载使用短时、限定到单个文件的随机 ticket，避免普通浏览器下载 API 不能设置 Authorization 的问题。响应加 no-store、nosniff 和安全的 Content-Disposition。图片不直接以内联 HTML/SVG 执行。
+宿主的 Ed25519 私钥保存在私有数据库，不通过 HTTP 暴露。它与 Android APK 发布签名密钥是两套不同用途的密钥。群邀请绑定群主及不可变成员身份，成员只能签署自己的加入/退出；群名单版本、成员事件序号和 invite_id 防止旧事件覆盖新状态。收到消息时校验签名、宿主公钥固定记录、群成员资格及消息一致性。
 
-HTTP 首版不加密；这是明确的版本限制，不用随机端口或配对码代替加密。TLS 与可信身份配对在后续版本实现。
+历史、草稿、确认和下载按 principal_id 检查；不能仅凭会话或文件 ID 访问其他浏览器记录。下载使用短时单文件 ticket，附件作为下载或受控图片预览，不执行用户 HTML/SVG。
 
-## 5. 传输模型
+HTTP 不加密，发现及首次信任仍受网络环境影响。本轮不宣称端到端加密、可信设备永久配对或完全防御中间人攻击。
 
-文件先以流式 HTTP 上传到发送宿主的 draft 目录，再向一个或多个接收方发送元数据请求。这样浏览器和应用采用同一协议；代价是发送端会额外占用临时磁盘，并非零拷贝。发送前检查文件数、单文件大小及存储预算。
+## 文件与状态
 
-状态机：`pending → accepted → transferring → completed`；另外允许 `rejected / cancelled / failed` 终态。只有所有声明的文件均按期望字节数落盘后才能完成。上传写入 `.part`，完整后重命名；实际路径只使用服务端 UUID，原始文件名仅用于展示与下载。
+文件先通过 HTTP 流式上传到发送宿主，完整后移动到持久文件区。向多个目标发送复用同一个源文件；每位接收者有独立结果和接收副本。群里纯文字在加入确认后直接收录，文件仍需确认；单设备接收保留既有确认行为。
 
-应用间传输由后台 task 查询接收状态并流式上传，带连接、确认及传输超时，不跟随 HTTP 重定向；多人逐个维护状态。接收方未同意前不接受远程内容上传。取消与完成提交需要检查当前状态，避免并发覆盖终态。
+状态为 pending → accepted → transferring → completed，另有 rejected/cancelled/failed/interrupted。只有声明文件完整后才能完成。文件可用性独立于结果；清理缓存保留历史和状态，跳过活动任务。
 
-浏览器收件使用本地宿主中的会话级收件箱。文字直接作为受限 JSON，文件通过受保护下载。实时状态使用认证 WebSocket 通知触发重新拉取；断线后重连，定期刷新兜底。WebSocket 连接建立后先发送 token，认证前不发送业务数据。
+## 平台与验证
 
-## 6. API 概览
+Windows 使用 WebView2、NSIS；Linux 使用 WebKitGTK 4.1、DEB/AppImage；Android 使用 JDK 21、SDK 36、NDK 27.2，允许局域网 HTTP，前台持有组播锁，arm64 原生库和 APK 支持 16 KiB 对齐。桌面第二次启动聚焦已有窗口，避免原生应用并发访问同一个数据目录。
 
-- `GET /api/info`：公开名称、版本及配对需求，不包含配对码或 token。
-- `POST /api/pair`：配对码、浏览器名称换取会话凭证。
-- `GET /api/state`：当前身份可见设备与传输记录。
-- `POST /api/peers`：手动连接并探测局域网设备。
-- `POST /api/drafts`、`PUT /api/drafts/{id}/files/{file}`：创建草稿及流式上传。
-- `POST /api/drafts/{id}/send`：创建单个或多个目标传输。
-- `POST /api/transfers/{id}/decision`：接收或拒绝。
-- `POST /api/transfers/{id}/cancel`：取消。
-- `POST /api/transfers/{id}/files/{file}/ticket`：获取短时下载地址。
-- `/api/peer/*`：受传输凭证保护的应用间 offer、状态、上传接口。
-- `GET /api/events`：WebSocket，先认证后订阅变化。
-
-具体字段以代码中的 serde 类型为准；通过发现元数据、info 和 offer 中的 protocol 字段识别版本；遇到未知协议版本拒绝传输并提示升级。
-
-## 7. 存储与资源
-
-持久目录只保存设备 ID、名称与设置。临时传输目录按进程启动隔离，每个运行目录持有独占文件锁，下次启动只清理没有活跃锁的残留，避免多实例互相删除文件；运行时定期清理过期草稿、会话和传输，用户手动保存的文件不受影响。使用计数预算限制临时总量，不将所有文件读入内存。文件流并发和 API 请求体均设上限。
-
-## 8. 平台适配
-
-- Windows x64：NSIS 安装包；需要 WebView2，安装流程处理缺失环境；首次运行允许应用通过防火墙。
-- Linux x64：DEB + AppImage，基于 Ubuntu 22.04 构建以兼顾兼容性；运行依赖 WebKitGTK 4.1。
-- Android arm64：Tauri 2 原生工程，INTERNET、网络状态和 Wi-Fi 组播权限；应用前台持有 multicast lock，退出释放；允许局域网 HTTP。文件通过系统选择器获取，不申请全盘存储权限。保存入口调用系统浏览器的下载功能。
-
-首版不提供后台常驻保证，不把 Android 网页入口包装成单独中心服务。应用关闭后监听与发现一并停止。
-
-## 9. 验证与发布
-
-本地：TypeScript 检查、生产构建、Rust fmt/clippy/test、两个独立核心实例的真实 HTTP 集成测试、Playwright 浏览器测试。集成测试覆盖配对隔离、接收确认、中文文件、多文件字节一致、拒绝、取消、非法路径、超限、随机端口与设备 ID 持久化。
-
-CI：Linux 跑检查与集成测试，Windows/Linux 构建桌面安装包，Linux runner 使用 Android SDK/NDK 构建 arm64 release APK。所有构建成功后汇总产物、生成 SHA256SUMS，再创建 GitHub `v0.1.0` Release；不先发布空 Release。Android 使用持久发布密钥，绝不提交仓库。自动发布工作流从 GitHub Actions secrets 读取密钥；若当前凭证不能管理 Secrets，首版由 CI 生成未签名 APK，在受控工作区使用专用发布密钥签名、验证，再上传 Release，并将私钥备份交给维护者。后续沿用同一密钥以支持覆盖升级。
-
-发布说明列出功能、安装方法、HTTP/前台运行限制、自动化与真机验证范围。三端编译通过不等价于三端真机验收。
+本轮运行 Rust 核心与数据库集成测试、clippy、TypeScript/Vite、Playwright 会话流程；CI 构建三平台安装产物，检查 Linux 原生启动和 Android ELF 对齐。真机与复杂网络测试范围单独记录，不以浏览器模拟替代 Android 原生真机验收。

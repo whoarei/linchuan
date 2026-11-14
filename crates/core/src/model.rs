@@ -31,7 +31,7 @@ pub struct Config {
     pub id: String,
     pub name: String,
 }
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -41,6 +41,12 @@ pub struct Device {
     pub last_seen: u64,
     #[serde(default = "default_kind")]
     pub kind: String,
+    #[serde(default)]
+    pub host_device_id: String,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 fn default_kind() -> String {
     "app".into()
@@ -53,6 +59,8 @@ pub struct Info {
     pub version: String,
     pub protocol: u8,
     pub addresses: Vec<String>,
+    pub public_key: String,
+    pub capabilities: Vec<String>,
 }
 #[derive(Clone, Serialize)]
 pub struct Bootstrap {
@@ -60,11 +68,12 @@ pub struct Bootstrap {
     pub token: String,
     pub pairing_code: String,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
     pub name: String,
     pub last_seen: u64,
+    pub expires: u64,
 }
 #[derive(Clone)]
 pub struct Principal {
@@ -104,6 +113,12 @@ pub struct Draft {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct TransferView {
     pub id: String,
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub created_at: u64,
     pub sender_id: String,
     pub sender_name: String,
     pub recipient_id: String,
@@ -120,7 +135,7 @@ impl TransferView {
     pub fn terminal(&self) -> bool {
         matches!(
             self.status.as_str(),
-            "completed" | "rejected" | "cancelled" | "failed"
+            "completed" | "rejected" | "cancelled" | "failed" | "interrupted"
         )
     }
 }
@@ -138,8 +153,12 @@ pub struct Ticket {
     pub name: String,
     pub expires: u64,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct State {
+    pub groups: HashMap<String, Group>,
+    pub conversations: HashMap<String, Conversation>,
+    pub composition: HashMap<String, String>,
+    pub profiles: HashMap<String, Device>,
     pub sessions: HashMap<String, Session>,
     pub peers: HashMap<String, Device>,
     pub drafts: HashMap<String, Draft>,
@@ -165,12 +184,29 @@ pub struct DraftResponse {
 }
 #[derive(Deserialize)]
 pub struct SendRequest {
+    #[serde(default)]
     pub targets: Vec<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
     #[serde(default)]
     pub text: String,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Offer {
+    #[serde(default)]
+    pub message_id: String,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub sender_id: String,
+    #[serde(default)]
+    pub target_id: String,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub identity: Option<SignedEnvelope>,
+    #[serde(default)]
+    pub membership: Option<SignedEnvelope>,
     pub protocol: u8,
     pub sender_name: String,
     pub text: String,
@@ -180,4 +216,141 @@ pub struct Offer {
 pub struct OfferResponse {
     pub id: String,
     pub token: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SignedEnvelope {
+    pub host_id: String,
+    pub public_key: String,
+    pub payload: serde_json::Value,
+    pub signature: String,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct GroupMember {
+    pub device: Device,
+    pub invite_id: String,
+    pub role: String,
+    pub state: String,
+    pub sequence: u64,
+    pub event: Option<SignedEnvelope>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub owner_id: String,
+    pub revision: u64,
+    pub created_at: u64,
+    pub snapshot: Option<SignedEnvelope>,
+    pub members: Vec<GroupMember>,
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct Conversation {
+    pub id: String,
+    pub principal_id: String,
+    pub kind: String,
+    pub peer_id: Option<String>,
+    pub group_id: Option<String>,
+    pub last_read_at: u64,
+    pub created_at: u64,
+}
+impl Conversation {
+    pub fn direct(principal: &str, peer: &str) -> Self {
+        Self {
+            id: format!("direct:{principal}:{peer}"),
+            principal_id: principal.into(),
+            kind: "direct".into(),
+            peer_id: Some(peer.into()),
+            group_id: None,
+            last_read_at: 0,
+            created_at: now_ms(),
+        }
+    }
+    pub fn group(principal: &str, group: &str) -> Self {
+        Self {
+            id: format!("group:{principal}:{group}"),
+            principal_id: principal.into(),
+            kind: "group".into(),
+            peer_id: None,
+            group_id: Some(group.into()),
+            last_read_at: 0,
+            created_at: now_ms(),
+        }
+    }
+}
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+#[derive(Clone, Serialize)]
+pub struct ConversationView {
+    #[serde(flatten)]
+    pub conversation: Conversation,
+    pub name: String,
+    pub preview: String,
+    pub last_message_at: u64,
+    pub unread: u64,
+}
+#[derive(Clone, Serialize)]
+pub struct MessageFile {
+    #[serde(flatten)]
+    pub meta: FileMeta,
+    pub available: bool,
+    pub transfer_id: String,
+}
+#[derive(Clone, Serialize)]
+pub struct MessageView {
+    pub id: String,
+    pub position: u64,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: String,
+    pub created_at: u64,
+    pub direction: String,
+    pub files: Vec<MessageFile>,
+    pub deliveries: Vec<TransferView>,
+}
+
+impl State {
+    pub fn link_conversations(&mut self, owner: &str) {
+        let locals: std::collections::HashSet<_> = self
+            .sessions
+            .values()
+            .map(|s| s.id.clone())
+            .chain(std::iter::once(owner.into()))
+            .collect();
+        for t in self.transfers.values() {
+            for (id, name) in [
+                (&t.view.sender_id, &t.view.sender_name),
+                (&t.view.recipient_id, &t.view.recipient_name),
+            ] {
+                self.profiles.entry(id.clone()).or_insert_with(|| Device {
+                    id: id.clone(),
+                    name: name.clone(),
+                    kind: if id.starts_with("legacy-") {
+                        "legacy".into()
+                    } else {
+                        "app".into()
+                    },
+                    host_device_id: id.clone(),
+                    ..Default::default()
+                });
+            }
+            for (principal, peer) in [
+                (&t.view.sender_id, &t.view.recipient_id),
+                (&t.view.recipient_id, &t.view.sender_id),
+            ] {
+                if locals.contains(principal) {
+                    let c = if let Some(group) = &t.view.group_id {
+                        Conversation::group(principal, group)
+                    } else {
+                        Conversation::direct(principal, peer)
+                    };
+                    self.conversations.entry(c.id.clone()).or_insert(c);
+                }
+            }
+        }
+    }
 }

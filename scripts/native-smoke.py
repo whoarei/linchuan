@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+version = json.loads(pathlib.Path('package.json').read_text())['version']
 process = subprocess.Popen([sys.argv[1]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 try:
     for attempt in range(90):
@@ -27,7 +28,7 @@ try:
             try:
                 with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/info', timeout=2) as response:
                     info = json.load(response)
-                    if info.get('version') == '0.1.0' and info.get('protocol') == 1:
+                    if info.get('version') == version and info.get('protocol') == 1:
                         print(f'Native UI started the LAN service on dynamic port {port}')
                         sys.exit(0)
             except Exception:

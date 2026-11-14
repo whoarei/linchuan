@@ -16,8 +16,15 @@ async fn bootstrap(state: State<'_, Runtime>, app: tauri::AppHandle) -> Result<B
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _, _| {
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+    builder
         .manage(Runtime(tokio::sync::OnceCell::new()))
         .invoke_handler(tauri::generate_handler![bootstrap])
         .build(tauri::generate_context!())

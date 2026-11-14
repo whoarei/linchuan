@@ -13,6 +13,9 @@ pub async fn send(app: App, id: String, address: String) {
                 t.view.error = Some(error.to_string());
             }
         }
+        if let Err(e) = app.commit(&mut state).await {
+            eprintln!("Cannot persist delivery failure: {e}");
+        }
         drop(state);
         app.notify();
     }
@@ -21,8 +24,15 @@ async fn update(app: &App, id: &str, status: &str, bytes: u64) -> bool {
     let mut state = app.0.state.lock().await;
     if let Some(t) = state.transfers.get_mut(id) {
         if !t.view.terminal() {
+            let old = t.view.status.clone();
             t.view.status = status.into();
             t.view.bytes = bytes;
+            if (old != status
+                || matches!(status, "completed" | "rejected" | "cancelled" | "failed"))
+                && app.commit(&mut state).await.is_err()
+            {
+                return false;
+            }
             drop(state);
             app.notify();
             return true;
@@ -50,12 +60,33 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         .get(id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("传输已过期"))?;
-    let offer = Offer {
+    let mut offer = Offer {
         protocol: 1,
-        sender_name: transfer.view.sender_name,
-        text: transfer.view.text,
-        files: transfer.view.files,
+        message_id: transfer.view.message_id.clone(),
+        group_id: transfer.view.group_id.clone(),
+        sender_id: transfer.view.sender_id.clone(),
+        target_id: transfer.view.recipient_id.clone(),
+        created_at: transfer.view.created_at,
+        sender_name: transfer.view.sender_name.clone(),
+        text: transfer.view.text.clone(),
+        files: transfer.view.files.clone(),
+        identity: None,
+        membership: None,
     };
+    if let Some(group_id) = &offer.group_id {
+        let state = app.0.state.lock().await;
+        let group = state
+            .groups
+            .get(group_id)
+            .ok_or_else(|| anyhow::anyhow!("群不存在"))?;
+        let member = group
+            .members
+            .iter()
+            .find(|m| m.device.id == offer.sender_id && m.state == "joined")
+            .ok_or_else(|| anyhow::anyhow!("尚未加入群聊"))?;
+        offer.membership = member.event.clone();
+    }
+    offer.identity = Some(app.signed(crate::identity::offer_payload(&offer)).await);
     let response = app
         .0
         .client
@@ -81,7 +112,8 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
             let status:TransferView=response.json().await?;
             match status.status.as_str(){
                 "accepted"=>break,
-                "rejected"|"cancelled"|"failed"=>{update(app,id,&status.status,0).await;return Ok(());},
+                "completed"=>{update(app,id,"completed",status.total).await;return Ok(());},
+                "rejected"|"cancelled"|"failed"|"interrupted"=>{update(app,id,&status.status,0).await;return Ok(());},
                 _=>tokio::time::sleep(Duration::from_millis(400)).await,
             }
         }
