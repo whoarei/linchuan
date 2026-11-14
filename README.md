@@ -4,7 +4,7 @@
 
 支持 Android、Linux、Windows 的局域网文字、图片与文件传送工具。应用间直接互传；未安装应用的设备可通过浏览器打开对方地址，配对后双向收发。每台应用使用系统分配的可用端口，无需独立服务器。
 
-[下载 v0.1.0](https://github.com/whoarei/linchuan/releases/tag/v0.1.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [开发与发布](docs/development.md) · [验证范围](docs/validation.md)
+[下载 v0.1.0](https://github.com/whoarei/linchuan/releases/tag/v0.1.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [开发与发布](docs/development.md) · [验证范围](docs/validation.md)
 
 ![邻传桌面界面](docs/images/desktop.png)
 
