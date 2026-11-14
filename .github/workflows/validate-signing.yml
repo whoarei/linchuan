@@ -25,6 +25,12 @@ jobs:
         run: |
           test "$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json conclusion --jq .conclusion)" = success
           test "$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json workflowName --jq .workflowName)" = 'Build and verify'
+          test "$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json headBranch --jq .headBranch)" = main
+          event=$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json event --jq .event)
+          case "$event" in
+            push|workflow_dispatch) ;;
+            *) echo '::error::Signing validation only accepts trusted main-branch builds'; exit 1 ;;
+          esac
           echo "sha=$(gh run view "$BUILD_RUN" --repo "$REPOSITORY" --json headSha --jq .headSha)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:

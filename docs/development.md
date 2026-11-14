@@ -97,9 +97,11 @@ Windows PowerShell 示例：
 
 此配置已通过 actionlint、YAML 和 Bash 语法检查，并在本地用临时测试 keystore 执行工作流中的实际签名命令：覆盖默认别名、任意别名、独立 key 密码、密码回退、多 APK 拒绝和临时文件清理。测试仅在临时目录重签公开 APK，原正式版文件未修改。
 
-Secrets 填好后，可运行 `Validate signing configuration`，传入已成功的 `Build and verify` run ID。默认只用 Android 产物测试签名、别名、密码及对齐；勾选 `check_desktop` 后，会对同一构建的 Windows NSIS、Linux AppImage／DEB 实际签名，并验证版本、更新清单和客户端内置公钥是否匹配。源码、签名脚本和公钥取自该构建的同一提交。任务不上传测试安装包、不发布 Release，也不导出密钥，只有 contents/actions 读取权限，结束或失败时删除临时密钥、测试 APK 和桌面签名目录。
+Secrets 填好后，可运行 `Validate signing configuration`，传入 main 分支上由 push 或手动触发且已成功的 `Build and verify` run ID，不接受 PR 构建。默认只用 Android 产物测试签名、别名、密码及对齐；勾选 `check_desktop` 后，会对同一构建的 Windows NSIS、Linux AppImage／DEB 实际签名，并验证版本、更新清单和客户端内置公钥是否匹配。源码、签名脚本和公钥取自该构建的同一提交。任务不上传测试安装包、不发布 Release，也不导出密钥，只有 contents/actions 读取权限，结束或失败时删除临时密钥、测试 APK 和桌面签名目录。
 
 维护者添加的 Android Secrets 已通过[实际 Actions 验证](https://github.com/whoarei/linchuan/actions/runs/43606279174)：以成功构建 43604913154 的 APK 验证密钥、别名、密码、签名和 16 KiB ZIP 对齐，临时文件清理成功。证书名称为 `CN=Pindou`。该任务未发布版本，也未验证桌面更新私钥与内置公钥是否匹配。
+
+桌面更新 Secrets 添加后，[三平台签名验证](https://github.com/whoarei/linchuan/actions/runs/43608444945)使用 main 分支成功构建 43606417234 的四个安装包通过：Android 签名与对齐、三个桌面更新包的实际签名及内置公钥验证、签名版本和更新清单验证。临时文件清理成功，未上传测试包或发布 Release。
 
 ## 发布步骤
 
