@@ -29,6 +29,7 @@ struct Inner {
     config: Mutex<Config>,
     directory: PathBuf,
     work: PathBuf,
+    _run_lock: std::fs::File,
     pub port: u16,
     token: String,
     code: String,
@@ -57,11 +58,31 @@ impl App {
             config.name = clean_name(&name)?;
         }
         tokio::fs::write(&config_path, serde_json::to_vec_pretty(&config)?).await?;
-        let work = options.directory.join("temporary");
-        if work.exists() {
-            tokio::fs::remove_dir_all(&work).await?;
+        let temporary = options.directory.join("temporary");
+        tokio::fs::create_dir_all(&temporary).await?;
+        // An active instance must never lose its files when another instance starts.
+        for entry in std::fs::read_dir(&temporary)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Ok(lock) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(entry.path().join(".active"))
+            {
+                if lock.try_lock().is_ok() {
+                    drop(lock);
+                    let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                }
+            }
         }
+        let work = temporary.join(uid());
         tokio::fs::create_dir_all(&work).await?;
+        let run_lock = std::fs::File::create(work.join(".active"))?;
+        run_lock.try_lock()?;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         let port = listener.local_addr()?.port();
         let (events, _) = broadcast::channel(128);
@@ -71,6 +92,7 @@ impl App {
             config: Mutex::new(config),
             directory: options.directory,
             work,
+            _run_lock: run_lock,
             port,
             token: secret(),
             code: format!("{random:06}"),

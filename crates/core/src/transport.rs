@@ -1,4 +1,5 @@
 use crate::{model::*, App};
+use futures_util::StreamExt;
 use std::time::{Duration, Instant};
 use tokio_util::io::ReaderStream;
 
@@ -89,12 +90,19 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         for file in &transfer.files{
             if !active(app,id).await{return Ok(());}
             let input=tokio::fs::File::open(&file.path).await?;
+            let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let uploaded = progress.clone();
+            let stream = ReaderStream::new(input).map(move |chunk| {
+                if let Ok(bytes) = &chunk { uploaded.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); }
+                chunk
+            });
             let upload=app.0.client.put(format!("{endpoint}/files/{}",file.meta.id)).bearer_auth(&remote.token).header("content-length",file.meta.size)
-                .body(reqwest::Body::wrap_stream(ReaderStream::new(input))).timeout(Duration::from_secs(3600)).send();
+                .body(reqwest::Body::wrap_stream(stream)).timeout(Duration::from_secs(3600)).send();
             tokio::pin!(upload);
             let response=loop{tokio::select!{
                 response=&mut upload=>break response?,
-                _=tokio::time::sleep(Duration::from_millis(300))=>{if !active(app,id).await{return Ok(());}}
+                _=tokio::time::sleep(Duration::from_millis(300))=>{if !active(app,id).await{return Ok(());}
+                    update(app,id,"transferring",bytes+progress.load(std::sync::atomic::Ordering::Relaxed)).await;}
             }};
             anyhow::ensure!(response.status().is_success(),"文件传输失败，对方可能已取消或磁盘空间不足");
             bytes+=file.meta.size;

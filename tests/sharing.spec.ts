@@ -1,8 +1,8 @@
 import { test, expect, type Browser, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 async function boot(index=0){return JSON.parse(await readFile(`.playwright/bootstrap-${index}.json`,'utf8'));}
-async function owner(browser:Browser,index=0){const b=await boot(index);const context=await browser.newContext();await context.addInitScript(token=>sessionStorage.setItem('linchuan-token',token),b.token);const page=await context.newPage();await page.goto(b.address);await expect(page.getByRole('heading',{name:'好东西，随手传。'})).toBeVisible();return {page,context,b};}
-async function pair(page:Page,name:string){const b=await boot();await page.goto(b.address);await page.getByLabel('你的设备名称').fill(name);await page.getByLabel('六位配对码').fill(b.pairing_code);await page.getByRole('button',{name:'连接设备',exact:true}).click();await expect(page.getByRole('heading',{name:'好东西，随手传。'})).toBeVisible();}
+async function owner(browser:Browser,index=0){const b=await boot(index);const context=await browser.newContext();await context.addInitScript(token=>sessionStorage.setItem('linchuan-token',token),b.token);const page=await context.newPage();await page.goto(b.address);await expect(page.getByRole('heading',{name:'发送内容'})).toBeVisible();return {page,context,b};}
+async function pair(page:Page,name:string){const b=await boot();await page.goto(b.address);await page.getByLabel('你的设备名称').fill(name);await page.getByLabel('六位配对码').fill(b.pairing_code);await page.getByRole('button',{name:'连接设备',exact:true}).click();await expect(page.getByRole('heading',{name:'发送内容'})).toBeVisible();}
 
 test('browser pairs, sends text and a Unicode filename; owner accepts; browser downloads original bytes',async({browser,page})=>{
  const host=await owner(browser);await pair(page,'网页手机');await page.getByRole('button',{name:/测试电脑 Linux/}).click();await page.getByRole('textbox',{name:'发送文字'}).fill('来自浏览器的一段文字');
@@ -19,5 +19,5 @@ test('mobile browser layout stays within viewport and can receive owner text',as
  const host=await owner(browser);await host.page.getByRole('button',{name:/移动网页 浏览器/}).click();await host.page.getByRole('textbox',{name:'发送文字'}).fill('发给手机浏览器');await host.page.getByRole('button',{name:/发送内容 1/}).click();await page.locator('.mobile-nav').getByRole('button',{name:/收件箱/}).click();const card=page.locator('.transfer-card').filter({hasText:'发给手机浏览器'});await card.getByRole('button',{name:'接收',exact:true}).click();await expect(card.getByText('已完成',{exact:true})).toBeVisible();await page.screenshot({path:'.playwright/mobile.png',fullPage:true});await host.page.getByRole('button',{name:'发送内容',exact:true}).click();await host.page.screenshot({path:'.playwright/desktop.png',fullPage:true});await host.context.close();await context.close();
 });
 test('wrong pairing code shows a clear error',async({page})=>{
- const b=await boot();await page.goto(b.address);await page.getByLabel('你的设备名称').fill('错误配对');await page.getByLabel('六位配对码').fill(b.pairing_code==='000000'?'111111':'000000');await page.getByRole('button',{name:'连接设备',exact:true}).click();await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByRole('heading',{name:'连接，就在身边。'})).toBeVisible();
+ const b=await boot();await page.goto(b.address);await page.getByLabel('你的设备名称').fill('错误配对');await page.getByLabel('六位配对码').fill(b.pairing_code==='000000'?'111111':'000000');await page.getByRole('button',{name:'连接设备',exact:true}).click();await expect(page.getByRole('alert')).toBeVisible();await expect(page.getByRole('heading',{name:'连接设备'})).toBeVisible();
 });

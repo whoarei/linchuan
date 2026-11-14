@@ -48,6 +48,9 @@ jobs:
           name: android-arm64-unsigned
           path: android
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - run: sdkmanager 'build-tools;35.0.0'
       - name: Sign APK and publish
         env:

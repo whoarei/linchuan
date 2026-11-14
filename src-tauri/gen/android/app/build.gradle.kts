@@ -15,7 +15,7 @@ val tauriProperties = Properties().apply {
 }
 
 android {
-    compileSdk = 37
+    compileSdk = 36
     namespace = "io.github.whoarei.linchuan"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"

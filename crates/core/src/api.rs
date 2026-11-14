@@ -369,12 +369,13 @@ async fn create_draft(
     );
     Ok(Json(response))
 }
-async fn write_file(body: Body, file: &StoredFile) -> Result<()> {
+async fn write_file(body: Body, file: &StoredFile, progress: Option<(App, String)>) -> Result<()> {
     let part = file.path.with_extension("part");
     let result = async {
         let mut output = tokio::fs::File::create(&part).await?;
         let mut stream = body.into_data_stream();
         let mut count = 0u64;
+        let mut last_progress = std::time::Instant::now();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| Error::bad("上传中断，请重新发送"))?;
             count += chunk.len() as u64;
@@ -382,6 +383,25 @@ async fn write_file(body: Body, file: &StoredFile) -> Result<()> {
                 return Err(Error::bad("上传内容超过声明的大小"));
             }
             output.write_all(&chunk).await?;
+            if last_progress.elapsed() >= std::time::Duration::from_millis(200) {
+                if let Some((app, id)) = progress.as_ref() {
+                    let mut state = app.0.state.lock().await;
+                    let transfer = state.transfers.get_mut(id).ok_or_else(Error::missing)?;
+                    if transfer.view.terminal() {
+                        return Err(Error::conflict("传输已结束"));
+                    }
+                    transfer.view.bytes = transfer
+                        .files
+                        .iter()
+                        .filter(|f| f.complete)
+                        .map(|f| f.meta.size)
+                        .sum::<u64>()
+                        + count;
+                    drop(state);
+                    app.notify();
+                }
+                last_progress = std::time::Instant::now();
+            }
         }
         if count != file.meta.size {
             return Err(Error::bad("文件不完整，请重新发送"));
@@ -432,7 +452,7 @@ async fn upload_draft(
     };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3600),
-        write_file(body, &file),
+        write_file(body, &file, None),
     )
     .await
     .unwrap_or_else(|_| Err(Error::bad("上传超时")));
@@ -806,7 +826,7 @@ async fn peer_upload(
     app.notify();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(3600),
-        write_file(body, &file),
+        write_file(body, &file, Some((app.clone(), id.clone()))),
     )
     .await
     .unwrap_or_else(|_| Err(Error::bad("上传超时")));
