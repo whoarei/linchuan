@@ -81,3 +81,9 @@ apksigner verify --verbose --print-certs Linchuan_0.1.0_android_arm64.apk
 4. 签名并验证 APK；运行 `scripts/collect-release.py` 和 `scripts/checksums.py` 汇总安装包。
 5. 发布 GitHub Release，附安装包、校验和及对应版本说明。
 6. 再读取 Release，确认非 draft、版本 tag 正确、安装包齐全。真实设备测试范围应如实记录。
+
+## 已签名产物发布入口
+
+如果工作区凭证在 `uploads.github.com` 返回 401，可使用 `Publish pre-signed release`，让仓库 Actions 的发布权限执行上传。应用源码仍取自版本 tag，并校验其对应构建已全部成功。
+
+在临时分支放入已经签名的 APK、全部安装包的 `SHA256SUMS`、`release-notes.md` 和 `source.json`（tag、source_sha、build_run、apk_name、certificate_sha256），传入该分支的不可变提交 SHA。工作流会核对源码、签名证书、ZIP 对齐和所有安装包摘要，再上传并正式发布。临时分支只包含将公开的安装产物，私钥继续由维护者私下保管。发布完成后可删除该分支。

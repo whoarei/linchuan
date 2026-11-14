@@ -1,0 +1,104 @@
+name: Publish pre-signed release
+on:
+  workflow_dispatch:
+    inputs:
+      build_run:
+        description: Successful Build and verify run for the version tag
+        required: true
+      apk_commit:
+        description: Immutable commit containing the signed APK, source.json and SHA256SUMS
+        required: true
+      tag:
+        description: Existing version tag
+        required: true
+        default: v0.1.0
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_RUN: ${{ inputs.build_run }}
+      TAG: ${{ inputs.tag }}
+      APK_COMMIT: ${{ inputs.apk_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Verify source build
+        run: |
+          test "$(gh run view "$BUILD_RUN" --json conclusion --jq .conclusion)" = success
+          test "$(gh run view "$BUILD_RUN" --json headSha --jq .headSha)" = "$(git rev-parse HEAD)"
+          test "$(gh run view "$BUILD_RUN" --json workflowName --jq .workflowName)" = 'Build and verify'
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.apk_commit }}
+          path: signed
+      - name: Verify signed APK provenance
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          meta = json.loads(pathlib.Path('signed/source.json').read_text())
+          assert meta['source_sha'] == subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip()
+          assert meta['tag'] == os.environ['TAG'] and meta['build_run'] == os.environ['BUILD_RUN']
+          assert pathlib.Path(meta['apk_name']).name == meta['apk_name']
+          assert (pathlib.Path('signed')/meta['apk_name']).is_file()
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run }}
+          pattern: '*-x64'
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: build-tools;35.0.0
+          log-accepted-android-sdk-licenses: false
+      - name: Verify signature and assemble exact release files
+        run: |
+          python3 scripts/collect-release.py artifacts release
+          python3 - <<'PY'
+          import json, pathlib, shutil, subprocess, os
+          meta = json.loads(pathlib.Path('signed/source.json').read_text())
+          apk = pathlib.Path('signed')/meta['apk_name']
+          tools = pathlib.Path(os.environ['ANDROID_HOME'])/'build-tools/35.0.0'
+          result = subprocess.check_output([str(tools/'apksigner'),'verify','--verbose','--print-certs',str(apk)], text=True)
+          assert f"Signer #1 certificate SHA-256 digest: {meta['certificate_sha256']}" in result
+          subprocess.run([str(tools/'zipalign'),'-c','-P','16','4',str(apk)],check=True)
+          shutil.copy2(apk,pathlib.Path('release')/apk.name)
+          print('APK release signature and 16 KiB ZIP alignment verified')
+          PY
+          python3 scripts/checksums.py release
+          cmp release/SHA256SUMS signed/SHA256SUMS
+      - name: Upload installers and publish
+        run: |
+          if gh release view "$TAG" --json isDraft > existing-release.json 2>/dev/null; then
+            python3 -c "import json; assert json.load(open('existing-release.json'))['isDraft'], 'Release is already published; refusing to replace it'"
+            gh release upload "$TAG" release/* --clobber
+          else
+            gh release create "$TAG" release/* --verify-tag --draft --title "邻传 $TAG" --notes-file signed/release-notes.md
+          fi
+          gh release edit "$TAG" --draft=false --latest --title "邻传 $TAG" --notes-file signed/release-notes.md
+      - name: Verify published assets
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > published-release.json
+          python3 - <<'PY'
+          import hashlib,json,pathlib
+          release=json.loads(pathlib.Path('published-release.json').read_text())
+          assert not release['draft'] and not release['prerelease']
+          assets={a['name']:a for a in release['assets']}
+          files=list(pathlib.Path('release').iterdir())
+          assert len(files)==5 and set(assets)=={p.name for p in files}
+          for file in files:
+              assert assets[file.name]['size']==file.stat().st_size
+              expected='sha256:'+hashlib.file_digest(file.open('rb'),'sha256').hexdigest()
+              if assets[file.name].get('digest'): assert assets[file.name]['digest']==expected
+          print('Published four installers and SHA256SUMS:',release['html_url'])
+          PY
