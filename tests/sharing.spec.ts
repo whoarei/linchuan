@@ -94,6 +94,31 @@ test('startup failure offers a compact retry and recovers without reloading', as
  await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
+test('native string startup errors show a retry instead of the pairing screen', async ({ page }) => {
+ const bootstrap = await boot();
+ await page.addInitScript(result => {
+  let attempts = 0;
+  Object.defineProperties(window, {
+   isTauri: { value: true },
+   __TAURI_INTERNALS__: {
+    value: {
+     invoke: (command: string) => {
+      if (command !== 'bootstrap') throw new Error('unexpected invoke: ' + command);
+      if (++attempts === 1) return Promise.reject('原生服务暂时无法启动');
+      return Promise.resolve(result);
+     },
+    },
+   },
+  });
+ }, bootstrap);
+ await page.goto(bootstrap.address);
+ await expect(page.getByRole('alert')).toContainText('原生服务暂时无法启动');
+ await expect(page.getByRole('heading', { name: '连接设备', exact: true })).toHaveCount(0);
+ await page.getByRole('button', { name: '重试', exact: true }).click();
+ await expect(page.getByRole('heading', { name: '发送内容', exact: true })).toBeVisible();
+ await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
 test('initial authenticated state failure is retryable rather than a false pairing screen', async ({ browser }) => {
  const b = await boot();
  const context = await browser.newContext();

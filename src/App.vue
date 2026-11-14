@@ -104,7 +104,11 @@ async function start() {
    }
   }, 3000);
  } catch (error) {
-  if (!disposed) bootError.value = (error as Error).message;
+  if (!disposed) {
+   // Tauri rejects with a plain string for Rust Result errors with a String.
+   const reason = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+   bootError.value = reason || '请检查应用和网络后重试';
+  }
  } finally {
   if (!disposed) loading.value = false;
  }
