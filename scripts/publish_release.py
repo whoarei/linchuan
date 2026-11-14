@@ -18,12 +18,15 @@ def command(args, check=True):
 
 
 def release_info(repository, tag):
-    result = command(["api", f"repos/{repository}/releases/tags/{tag}"], check=False)
-    if result.returncode:
-        if "404" in result.stderr:
-            return None
-        raise RuntimeError(result.stderr.strip() or "Cannot read release metadata")
-    return json.loads(result.stdout)
+    # GitHub's get-by-tag endpoint only returns published releases. The list
+    # endpoint includes drafts when authenticated, including a failed upload
+    # that must be verified and resumed before the release becomes public.
+    result = command(["api", f"repos/{repository}/releases?per_page=100", "--paginate", "--jq", ".[] | @json"])
+    releases = (json.loads(line) for line in result.stdout.splitlines() if line.strip())
+    matches = [release for release in releases if release["tag_name"] == tag]
+    if len(matches) > 1:
+        raise ValueError("Multiple releases use this tag; refusing to choose a draft")
+    return matches[0] if matches else None
 
 
 def digest(path):

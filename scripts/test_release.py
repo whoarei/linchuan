@@ -136,6 +136,33 @@ class PublishPolicyTests(unittest.TestCase):
             publish_release.publish(self.root, tag, 'example/project', self.notes)
             return [call.args[0] for call in command.call_args_list]
 
+    def test_release_lookup_finds_drafts_and_published_versions_across_pages(self):
+        for draft in [True, False]:
+            expected = self.info('v0.4.0', draft)
+            pages = [[self.info('v0.3.0', False)], [expected]]
+            response = subprocess.CompletedProcess([], 0, '\n'.join(json.dumps(info) for page in pages for info in page), '')
+            with self.subTest(draft=draft), patch('publish_release.command', return_value=response) as command:
+                self.assertEqual(publish_release.release_info('example/project', 'v0.4.0'), expected)
+                args = command.call_args.args[0]
+                self.assertIn('--paginate', args)
+                self.assertEqual(args[-2:], ['--jq', '.[] | @json'])
+                self.assertEqual(args[1], 'repos/example/project/releases?per_page=100')
+
+    def test_missing_tag_returns_none_without_creating_a_release(self):
+        response = subprocess.CompletedProcess([], 0, json.dumps(self.info('v0.3.0', False)), '')
+        with patch('publish_release.command', return_value=response) as command:
+            self.assertIsNone(publish_release.release_info('example/project', 'v0.4.0'))
+            self.assertEqual(command.call_count, 1)
+
+    def test_ambiguous_drafts_are_rejected(self):
+        response = subprocess.CompletedProcess([], 0, '\n'.join(json.dumps(self.info('v0.4.0')) for _ in range(2)), '')
+        with patch('publish_release.command', return_value=response), self.assertRaisesRegex(ValueError, 'Multiple releases'):
+            publish_release.release_info('example/project', 'v0.4.0')
+
+    def test_release_lookup_errors_are_not_treated_as_missing_versions(self):
+        with patch('publish_release.command', side_effect=RuntimeError('HTTP 403')), self.assertRaisesRegex(RuntimeError, 'HTTP 403'):
+            publish_release.release_info('example/project', 'v0.4.0')
+
     def test_stable_publishes_as_latest_after_all_uploads_verify(self):
         tag = 'v0.4.0'
         self.files(tag[1:])
