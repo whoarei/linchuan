@@ -36,6 +36,7 @@ import {
 } from "lucide-vue-next";
 import QRCode from "qrcode";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
+import ConversationRow from "./ConversationRow.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
 import {
@@ -98,6 +99,7 @@ const connected = ref(true);
 const mode = ref<Mode>("devices");
 const selected = ref("");
 const search = ref("");
+const showTemporaryHistory = ref(false);
 const messages = ref<Message[]>([]);
 const before = ref<number | null>(null);
 const historyBusy = ref(false);
@@ -164,9 +166,25 @@ const currentDevice = computed(() =>
 const displayNames = computed(() => {
   if (!state.value) return new Map<string, string>();
   return deviceLabels([
-    ...state.value.groups.flatMap((g) => g.members.map((m) => m.device)),
+    ...state.value.groups.flatMap((g) =>
+      g.members
+        .filter(
+          (m) =>
+            m.device.kind !== "browser" ||
+            online(m.device.id) ||
+            g.id === current.value?.group_id,
+        )
+        .map((m) => m.device),
+    ),
     ...state.value.conversations
-      .filter((c) => c.kind === "direct" && c.peer_id)
+      .filter(
+        (c) =>
+          c.kind === "direct" &&
+          c.peer_id &&
+          (!temporaryOffline(c) ||
+            ((showTemporaryHistory.value || search.value.trim()) &&
+              (c.last_message_at || c.has_draft))),
+      )
       .map((c) => ({ id: c.peer_id!, name: c.name })),
     ...state.value.devices,
     state.value.me,
@@ -203,12 +221,30 @@ const canSend = computed(
     (text.value.trim().length > 0 || files.value.length > 0) &&
     new TextEncoder().encode(text.value).length <= 65536,
 );
+function temporaryOffline(c: Conversation) {
+  return c.kind === "direct" && c.peer_kind === "browser" && !online(c.peer_id);
+}
+function matchesSearch(c: Conversation) {
+  return `${c.name} ${c.preview}`
+    .toLowerCase()
+    .includes(search.value.toLowerCase());
+}
+const temporaryHistory = computed(
+  () =>
+    state.value?.conversations.filter(
+      (c) =>
+        temporaryOffline(c) &&
+        (c.last_message_at || c.has_draft) &&
+        matchesSearch(c),
+    ) || [],
+);
+const historyUnread = computed(() =>
+  temporaryHistory.value.reduce((sum, c) => sum + c.unread, 0),
+);
 const conversations = computed(
   () =>
-    state.value?.conversations.filter((c) =>
-      `${c.name} ${c.preview}`
-        .toLowerCase()
-        .includes(search.value.toLowerCase()),
+    state.value?.conversations.filter(
+      (c) => !temporaryOffline(c) && matchesSearch(c),
     ) || [],
 );
 const nearby = computed(
@@ -309,19 +345,22 @@ function scrollBottom() {
 async function refresh() {
   if (refreshing || disposed) return;
   refreshing = true;
+  const requestToken = token();
   try {
-    state.value = await api<AppState>("/api/state");
-    if (disposed) return;
+    const next = await api<AppState>("/api/state");
+    if (disposed || requestToken !== token()) return;
+    state.value = next;
     connected.value = true;
     ready.value = true;
     if (!shareAddress.value)
       shareAddress.value = state.value.info.addresses[0] || address();
-    if (selected.value && mode.value === "devices") await loadMessages(false);
+    if (selected.value && mode.value === "devices" && !historyBusy.value)
+      await loadMessages(false);
   } catch (error) {
+    if (requestToken !== token()) return;
     if (error instanceof ApiError && error.status === 401 && !native) {
-      forget();
-      ready.value = false;
-      socket?.close();
+      forget(requestToken);
+      sessionChanged();
     } else connected.value = false;
   } finally {
     loading.value = false;
@@ -404,6 +443,7 @@ async function loadMessages(initial: boolean, older = false) {
   const id = selected.value;
   if (!id) return;
   const request = ++timelineRequest;
+  const draftBeforeRequest = text.value;
   if (initial || older) historyBusy.value = true;
   const keepBottom =
     !timeline.value ||
@@ -439,7 +479,7 @@ async function loadMessages(initial: boolean, older = false) {
       );
       messages.value = [...olderMessages, ...page.messages];
       if (initial || !olderMessages.length) before.value = page.next_before;
-      if (initial) text.value = page.draft;
+      if (initial && text.value === draftBeforeRequest) text.value = page.draft;
       if (initial || keepBottom) scrollBottom();
     }
     const last = messages.value[messages.value.length - 1]?.position || 0;
@@ -843,9 +883,31 @@ async function disconnect() {
     await api("/api/session/logout", {});
   } catch {}
   forget();
-  ready.value = false;
-  selected.value = "";
+  sessionChanged();
+}
+function sessionChanged() {
+  clearTimeout(draftTimer);
+  clearTimeout(eventTimer);
   socket?.close();
+  socket = undefined;
+  controller?.abort();
+  selected.value = "";
+  modal.value = "";
+  code.value = "";
+  showTemporaryHistory.value = false;
+  messages.value = [];
+  text.value = "";
+  files.value = [];
+  fileCache.clear();
+  releaseThumbnails();
+  closePreview();
+  state.value = undefined;
+  ready.value = false;
+  mode.value = "devices";
+  if (token())
+    void refresh().then(() => {
+      if (ready.value) events();
+    });
 }
 function setMode(value: Mode) {
   flushDraft();
@@ -853,6 +915,7 @@ function setMode(value: Mode) {
   if (value === "settings") newName.value = state.value?.me.name || "";
 }
 onMounted(async () => {
+  window.addEventListener("linchuan-session-change", sessionChanged);
   try {
     await bootstrap();
     void loadReceiveSettings();
@@ -874,6 +937,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   disposed = true;
+  window.removeEventListener("linchuan-session-change", sessionChanged);
   clearInterval(poll);
   clearTimeout(draftTimer);
   clearTimeout(eventTimer);
@@ -1013,38 +1077,15 @@ onUnmounted(() => {
       </div>
       <div class="conversation-scroll">
         <div v-if="conversations.length" class="list-label">会话</div>
-        <button
+        <ConversationRow
           v-for="conversation in conversations"
           :key="conversation.id"
-          class="conversation-row"
-          :class="{ selected: conversation.id === selected }"
-          :aria-label="`打开 ${conversationLabel(conversation)}`"
-          @click="selectConversation(conversation)"
-        >
-          <span class="avatar" :class="{ group: conversation.kind === 'group' }"
-            ><Users v-if="conversation.kind === 'group'" :size="23" /><Monitor
-              v-else
-              :size="23" /><i
-              v-if="
-                conversation.kind === 'direct' && online(conversation.peer_id)
-              " /></span
-          ><span class="row-copy"
-            ><span class="row-title"
-              ><b>{{ conversationLabel(conversation) }}</b
-              ><time v-if="conversation.last_message_at">{{
-                timestamp(conversation.last_message_at)
-              }}</time></span
-            ><span class="row-preview"
-              ><span>{{
-                conversation.preview ||
-                (conversation.kind === "group" ? "群聊" : "还没有传输记录")
-              }}</span
-              ><em v-if="conversation.unread">{{
-                conversation.unread > 99 ? "99+" : conversation.unread
-              }}</em></span
-            ></span
-          >
-        </button>
+          :conversation="conversation"
+          :selected="conversation.id === selected"
+          :label="conversationLabel(conversation)"
+          :online="online(conversation.peer_id)"
+          @select="selectConversation(conversation)"
+        />
         <div v-if="nearby.length" class="list-label nearby-label">
           附近设备 <span>{{ nearby.length }}</span>
         </div>
@@ -1067,7 +1108,47 @@ onUnmounted(() => {
             ><span class="row-preview">{{ device.platform }} · 在线</span></span
           >
         </button>
-        <div v-if="!conversations.length && !nearby.length" class="list-empty">
+        <section
+          v-if="temporaryHistory.length"
+          class="temporary-history"
+          aria-label="临时会话记录"
+        >
+          <button
+            class="history-toggle"
+            :aria-expanded="showTemporaryHistory || !!search.trim()"
+            aria-controls="temporary-history-list"
+            @click="showTemporaryHistory = !showTemporaryHistory"
+          >
+            <ChevronDown
+              v-if="showTemporaryHistory || search.trim()"
+              :size="14"
+            /><ChevronRight v-else :size="14" />临时会话记录
+            <span>{{ temporaryHistory.length }}</span><em
+              v-if="historyUnread"
+              >{{ historyUnread > 99 ? "99+" : historyUnread }}</em
+            >
+          </button>
+          <div
+            v-if="showTemporaryHistory || search.trim()"
+            id="temporary-history-list"
+          >
+            <ConversationRow
+              v-for="conversation in temporaryHistory"
+              :key="conversation.id"
+              :conversation="conversation"
+              :label="conversationLabel(conversation)"
+              :selected="conversation.id === selected"
+              :online="false"
+              @select="selectConversation(conversation)"
+            />
+          </div>
+        </section>
+        <div
+          v-if="
+            !conversations.length && !nearby.length && !temporaryHistory.length
+          "
+          class="list-empty"
+        >
           <Wifi :size="28" />
           <p>{{ search ? "没有找到相关设备" : "等待附近设备加入" }}</p>
           <span v-if="!search"

@@ -290,6 +290,8 @@ pub struct ConversationView {
     #[serde(flatten)]
     pub conversation: Conversation,
     pub name: String,
+    pub peer_kind: Option<String>,
+    pub has_draft: bool,
     pub preview: String,
     pub last_message_at: u64,
     pub unread: u64,

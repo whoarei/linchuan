@@ -190,11 +190,12 @@ impl Store {
         self.run(move |conn,_| {
             let cs=query_conversations(conn,Some(&principal))?;let mut views=Vec::new();
             for c in cs {
-                let name:String=if let Some(peer)=&c.peer_id {conn.query_row("SELECT name FROM devices WHERE id=?1",[peer],|r|r.get(0))?}else{conn.query_row("SELECT name FROM groups WHERE id=?1",[c.group_id.as_ref().unwrap()],|r|r.get(0))?};
+                let (name,peer_kind):(String,Option<String>)=if let Some(peer)=&c.peer_id {conn.query_row("SELECT name,kind FROM devices WHERE id=?1",[peer],|r|Ok((r.get(0)?,Some(r.get(1)?))))?}else{(conn.query_row("SELECT name FROM groups WHERE id=?1",[c.group_id.as_ref().unwrap()],|r|r.get(0))?,None)};
+                let has_draft:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM conversation_drafts WHERE conversation_id=?1 AND text<>'')",[&c.id],|r|r.get(0))?;
                 let latest:Option<(String,u64,u64)>=conn.query_row("SELECT m.text,m.received_at,(SELECT COUNT(*) FROM attachments a WHERE a.message_id=m.id) FROM conversation_messages cm JOIN messages m ON m.id=cm.message_id WHERE cm.conversation_id=?1 ORDER BY cm.position DESC LIMIT 1",[&c.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
                 let unread:u64=conn.query_row("SELECT COUNT(*) FROM conversation_messages WHERE conversation_id=?1 AND direction='incoming' AND read_at IS NULL",[&c.id],|r|r.get(0))?;
                 let (text,at,count)=latest.unwrap_or_default();let preview=if text.is_empty()&&count>0{format!("[文件] {count} 个附件")}else{text.chars().take(100).collect()};
-                views.push(ConversationView{conversation:c,name,preview,last_message_at:at,unread});
+                views.push(ConversationView{conversation:c,name,peer_kind,has_draft,preview,last_message_at:at,unread});
             }
             views.sort_by(|a,b|b.last_message_at.cmp(&a.last_message_at).then(a.conversation.id.cmp(&b.conversation.id)));Ok(views)
         }).await

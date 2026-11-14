@@ -372,6 +372,19 @@ small {
   line-height: 16px;
   text-align: center;
 }
+.history-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 18px 18px 10px;
+  color: #8792a5;
+  font-size: 11px;
+}
+.history-toggle > span { margin-left: auto; }
+.history-toggle > em {
+  font-style: normal;
+  color: #6483d9;
+}
 .list-empty {
   color: #a0aabc;
   padding: 44px 12px;

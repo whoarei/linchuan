@@ -711,6 +711,73 @@ async fn migration_rename_credentials_and_logout_are_durable() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn temporary_conversation_metadata_and_history_survive_expiry_without_authorizing_a_new_browser(
+) {
+    let mut host = Host::new("宿主").await;
+    let browser = host.pair("临时网页").await;
+    let browser_state: Value = host.get("/api/state", &browser).await.json().await.unwrap();
+    let id = browser_state["me"]["id"].as_str().unwrap();
+    let conversation = host
+        .post("/api/conversations/direct", json!({"device_id":id}))
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let state = host.state().await;
+    let view = state["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == conversation)
+        .unwrap();
+    assert_eq!(view["peer_kind"], "browser");
+    assert_eq!(view["has_draft"], false);
+    assert_eq!(view["last_message_at"], 0);
+    host.send(Some(id.into()), None, "保留传输记录", None).await;
+    host.post(
+        &format!("/api/conversations/{conversation}/draft"),
+        json!({"text":"保留文字草稿"}),
+    )
+    .await;
+    {
+        let conn = rusqlite::Connection::open(host.dir.path().join("linchuan.db")).unwrap();
+        conn.execute("UPDATE browser_sessions SET expires_at=1", [])
+            .unwrap();
+    }
+    host.restart().await;
+    assert_eq!(
+        host.get("/api/state", &browser).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let state = host.state().await;
+    assert!(state["devices"].as_array().unwrap().is_empty());
+    let view = state["conversations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == conversation)
+        .unwrap();
+    assert_eq!(view["peer_kind"], "browser");
+    assert_eq!(view["has_draft"], true);
+    assert!(view["last_message_at"].as_u64().unwrap() > 0);
+    let page = host.timeline(&conversation, &host.token).await;
+    assert_eq!(page["draft"], "保留文字草稿");
+    assert_eq!(page["messages"][0]["text"], "保留传输记录");
+    let other = host.pair("临时网页").await;
+    let other_state: Value = host.get("/api/state", &other).await.json().await.unwrap();
+    assert_ne!(other_state["me"]["id"], id);
+    assert_eq!(
+        host.get(
+            &format!("/api/conversations/{conversation}/messages"),
+            &other
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+}
 #[tokio::test]
 async fn default_native_name_is_saved_and_manual_name_takes_precedence() {
     let dir = TempDir::new().unwrap();

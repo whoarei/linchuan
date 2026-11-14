@@ -36,6 +36,8 @@ export interface Conversation {
   principal_id: string;
   kind: "direct" | "group";
   peer_id?: string;
+  peer_kind?: string | null;
+  has_draft?: boolean;
   group_id?: string;
   name: string;
   preview: string;
