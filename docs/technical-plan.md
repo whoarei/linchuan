@@ -1,8 +1,8 @@
 # 邻传技术方案
 
-当前版本为 0.4.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
+当前版本为 0.5.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
-主分支在 0.4.0 之后加入 [HTTPS 设备连接](https-connections.md)，下述连接方案描述该开发状态；已发布 0.4.0 的 HTTP 安装包不因此改变。
+0.5.0 加入 [HTTPS 设备连接](https-connections.md)，旧 HTTP 设备需要升级；0.4.0 历史安装包继续保留。
 
 0.4.0 的[固定接收目录](receive-storage.md)已实现。`receiving.rs` 在完成接收的事务内创建保存队列，后台流式导出文件；原生 IPC 提供目录设置、保存状态和文件打开。Windows／Linux 使用系统下载目录和目录选择器；Android 使用 MediaStore Downloads、持久授权的 SAF 目录及旧系统存储权限。浏览器下载规则保持由浏览器管理。
 
