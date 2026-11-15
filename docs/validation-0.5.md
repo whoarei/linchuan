@@ -19,6 +19,14 @@
 
 上传四个安装包、三个桌面签名、latest.json 和 SHA256SUMS，核对全部九个资产的名称、长度和 SHA-256 后公开，正式版设为 Latest。发布后回读公共下载与更新端点，验证内容、签名、APK 证书和版本。
 
+## 实际发布记录
+
+- [v0.5.0 正式版](https://github.com/whoarei/linchuan/releases/tag/v0.5.0)于 2026-11-15 公开并设为 Latest；发布源码为 `49aec984a884229d1eb2d52ca0d6671edc80430d`。
+- [完整 Release 流水线](https://github.com/whoarei/linchuan/actions/runs/43662243644)全部通过：同一提交的 Checks、Windows NSIS、Linux DEB／AppImage、Android arm64、统一签名及发布回读。Linux 正常启动和 --autostart 静默启动均通过 CA 验证 HTTPS 服务。
+- 发布后从公开下载地址重新下载全部九个资产，核对远端摘要、SHA256SUMS、三个桌面更新签名、精确版本和 Debian 包版本；公开 Latest 与 latest.json 均指向 0.5.0。
+- Android APK 验签、应用 ID、版本名 0.5.0、版本码 500999 和 ZIP 16 KiB 对齐均通过。证书主题为 `CN=Pindou, OU=Mobile, O=Pindou, L=Shanghai, ST=Shanghai, C=CN`，SHA-256 指纹为 `28c461e4f2f8612f9d7717d727e772177474798fd7c48b03ca3ffbca8c81bf0a`，与已发布 0.4.0 一致。
+- 旧版 Release 与公开资产保留，未替换已公开的标签或文件。
+
 ## 实机边界
 
 真实 Windows／Android 证书导入、系统安装升级、跨设备 Wi-Fi、Linux 桌面托盘及登录启动仍需实机验收。自动化原生服务启动、受信任 CA 的浏览器流程和接口模拟不替代这些验收。
