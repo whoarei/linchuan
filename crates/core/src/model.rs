@@ -61,10 +61,12 @@ pub struct Info {
     pub addresses: Vec<String>,
     pub public_key: String,
     pub capabilities: Vec<String>,
+    pub certificate_fingerprint: String,
 }
 #[derive(Clone, Serialize)]
 pub struct Bootstrap {
     pub address: String,
+    pub https_address: String,
     pub token: String,
     pub pairing_code: String,
 }

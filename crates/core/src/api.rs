@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -64,7 +64,7 @@ pub(crate) fn token(headers: &HeaderMap) -> Result<&str> {
         .ok_or_else(Error::unauthorized)
 }
 
-pub fn router(app: App) -> Router {
+pub fn router(app: App, secure: bool) -> Router {
     let cors = CorsLayer::new()
         .allow_origin([
             "tauri://localhost".parse::<HeaderValue>().unwrap(),
@@ -80,6 +80,7 @@ pub fn router(app: App) -> Router {
         ]);
     Router::new()
         .route("/api/info", get(info))
+        .route("/api/certificate", get(certificate))
         .route("/api/pair", post(pair))
         .route("/api/session/logout", post(logout))
         .route("/api/state", get(state))
@@ -130,6 +131,7 @@ pub fn router(app: App) -> Router {
         .route("/api/peer/transfers/{id}/complete", post(peer_complete))
         .route("/api/peer/transfers/{id}/cancel", post(peer_cancel))
         .fallback(get(asset))
+        .layer(Extension(ConnectionScheme(secure)))
         .layer(cors)
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -143,6 +145,19 @@ pub fn router(app: App) -> Router {
 }
 async fn info(AxState(app): AxState<App>) -> Json<Info> {
     Json(app.info().await)
+}
+async fn certificate(AxState(app): AxState<App>) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-pem-file"),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=linchuan-local-ca.crt",
+            ),
+        ],
+        app.0.tls.certificate_pem.clone(),
+    )
+        .into_response()
 }
 async fn pair(
     AxState(app): AxState<App>,
@@ -338,15 +353,17 @@ async fn settings(
 }
 pub(crate) fn local_address(address: &str) -> Result<String> {
     let url = url::Url::parse(address)
-        .map_err(|_| Error::bad("请输入完整局域网地址，例如 http://192.168.1.20:52783"))?;
-    if url.scheme() != "http"
+        .map_err(|_| Error::bad("请输入完整局域网地址，例如 https://192.168.1.20:52783"))?;
+    if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
         || url.path() != "/"
     {
-        return Err(Error::bad("仅支持不带路径的局域网 HTTP 地址"));
+        return Err(Error::bad(
+            "仅支持不带路径的局域网 HTTPS 地址；旧版设备请先升级",
+        ));
     }
     let Some(url::Host::Ipv4(ip)) = url.host() else {
         return Err(Error::bad("请使用局域网 IPv4 地址"));
@@ -365,53 +382,20 @@ async fn add_peer(
 ) -> Result<Json<Value>> {
     app.principal(token(&headers)?).await?;
     let address = local_address(value["address"].as_str().unwrap_or(""))?;
-    let response = app
+    let expected = app
         .0
-        .client
-        .get(format!("{address}/api/info"))
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
+        .state
+        .lock()
         .await
-        .map_err(|_| Error::bad("连接失败，请检查地址、网络和防火墙"))?;
-    if !response.status().is_success() || response.content_length().unwrap_or(0) > 64 * 1024 {
-        return Err(Error::bad("对方没有返回有效设备信息"));
-    }
-    let info: Value = response
-        .json()
-        .await
-        .map_err(|_| Error::bad("对方不是邻传设备"))?;
-    if info["protocol"] != 1 {
-        return Err(Error::bad("协议版本不兼容，请升级应用"));
-    }
-    let id = info["id"]
-        .as_str()
-        .filter(|s| uuid::Uuid::parse_str(s).is_ok())
-        .ok_or_else(|| Error::bad("设备 ID 无效"))?
-        .to_owned();
+        .profiles
+        .values()
+        .find(|device| device.address == address)
+        .cloned();
+    let device = app.inspect_peer(&address, expected.as_ref()).await?;
+    let id = device.id.clone();
     if id == app.info().await.id {
         return Err(Error::bad("这是当前设备的地址"));
     }
-    let device = Device {
-        id: id.clone(),
-        name: info["name"]
-            .as_str()
-            .unwrap_or("邻传设备")
-            .chars()
-            .take(64)
-            .collect(),
-        platform: info["platform"]
-            .as_str()
-            .unwrap_or("设备")
-            .chars()
-            .take(20)
-            .collect(),
-        address,
-        last_seen: now(),
-        kind: "app".into(),
-        host_device_id: id.clone(),
-        public_key: info["public_key"].as_str().unwrap_or("").into(),
-        capabilities: serde_json::from_value(info["capabilities"].clone()).unwrap_or_default(),
-    };
     app.remember_peer(device).await?;
     Ok(Json(json!({"id":id})))
 }
@@ -1236,8 +1220,11 @@ async fn peer_cancel(
     app.notify();
     Ok(Json(json!({"ok":true})))
 }
+#[derive(Clone)]
+struct ConnectionScheme(bool);
 async fn events(
     AxState(app): AxState<App>,
+    Extension(ConnectionScheme(secure)): Extension<ConnectionScheme>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
@@ -1253,7 +1240,7 @@ async fn events(
                 | "https://tauri.localhost"
                 | "http://localhost:1420"
                 | "http://127.0.0.1:1420"
-        ) && origin != format!("http://{host}")
+        ) && origin != format!("{}://{host}", if secure { "https" } else { "http" })
         {
             return Err(Error::unauthorized());
         }

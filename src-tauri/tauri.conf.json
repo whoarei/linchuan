@@ -38,6 +38,9 @@
                   "url": "http://127.0.0.1:*/download/*"
                 },
                 {
+                  "url": "http://127.0.0.1:*/api/certificate"
+                },
+                {
                   "url": "https://github.com/whoarei/linchuan"
                 },
                 {

@@ -65,7 +65,11 @@ impl Host {
             .unwrap()
     }
     async fn connect(&self, other: &Host) -> String {
-        self.post("/api/peers", json!({"address":other.url})).await["id"]
+        self.post(
+            "/api/peers",
+            json!({"address":other.app.bootstrap().https_address}),
+        )
+        .await["id"]
             .as_str()
             .unwrap()
             .into()

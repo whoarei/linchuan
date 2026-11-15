@@ -8,6 +8,7 @@ mod names;
 mod preferences;
 pub mod receiving;
 mod store;
+mod tls;
 mod transport;
 pub mod updates;
 use model::*;
@@ -44,11 +45,13 @@ struct Inner {
     work: PathBuf,
     _run_lock: std::fs::File,
     pub port: u16,
+    local_port: u16,
+    tls: tls::LocalTls,
     token: String,
     code: String,
     pub state: Mutex<State>,
     events: broadcast::Sender<()>,
-    client: reqwest::Client,
+    peer_clients: std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
     streams: Semaphore,
     mdns: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
     stop: tokio::sync::watch::Sender<bool>,
@@ -79,6 +82,7 @@ impl App {
             tokio::task::spawn_blocking(move || store::Store::open(&directory, fallback, name))
                 .await??;
         let identity = identity::signing_key(&key)?;
+        let tls = tls::LocalTls::load(&store, &identity, &config.id, tls_names(&config.id)).await?;
         let mut restored = store.load(config.id.clone()).await?;
         restored.profiles.insert(
             config.id.clone(),
@@ -122,6 +126,8 @@ impl App {
         run_lock.try_lock()?;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         let port = listener.local_addr()?.port();
+        let local_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let local_port = local_listener.local_addr()?.port();
         let (events, _) = broadcast::channel(128);
         let (stop, _) = tokio::sync::watch::channel(false);
         let random = uuid::Uuid::new_v4().as_u128() % 1_000_000;
@@ -135,15 +141,13 @@ impl App {
             work,
             _run_lock: run_lock,
             port,
+            local_port,
+            tls,
             token: secret(),
             code: format!("{random:06}"),
             state: Mutex::new(restored),
             events,
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .build()?,
+            peer_clients: std::sync::Mutex::new(std::collections::HashMap::new()),
             streams: Semaphore::new(MAX_STREAMS),
             mdns: std::sync::Mutex::new(None),
             stop,
@@ -159,11 +163,28 @@ impl App {
             }
             app.commit(&mut state).await?;
         }
-        let router = api::router(app.clone());
+        let router = api::router(app.clone(), true);
+        let tls_handle = axum_server::Handle::new();
+        let server = axum_server::from_tcp_rustls(listener.into_std()?, app.0.tls.server.clone())?
+            .handle(tls_handle.clone());
+        let mut shutdown = app.0.stop.subscribe();
+        tokio::spawn(async move {
+            let _ = shutdown.changed().await;
+            tls_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+        tokio::spawn(async move {
+            if let Err(error) = server
+                .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
+                .await
+            {
+                eprintln!("HTTPS service failed: {error}");
+            }
+        });
+        let router = api::router(app.clone(), false);
         let mut shutdown = app.0.stop.subscribe();
         tokio::spawn(async move {
             let _ = axum::serve(
-                listener,
+                local_listener,
                 router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
@@ -183,7 +204,12 @@ impl App {
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
-                    _ = interval.tick() => sweeper.sweep().await,
+                    _ = interval.tick() => {
+                        sweeper.sweep().await;
+                        if let Err(error) = sweeper.0.tls.refresh(tls_names(&sweeper.0.device_id)).await {
+                            eprintln!("TLS certificate refresh failed: {error}");
+                        }
+                    },
                 }
             }
         });
@@ -293,20 +319,25 @@ impl App {
     }
     pub async fn info(&self) -> Info {
         let config = self.0.config.lock().await.clone();
+        if let Err(error) = self.0.tls.refresh(tls_names(&config.id)).await {
+            eprintln!("TLS certificate refresh failed: {error}");
+        }
         Info {
             id: config.id,
             name: config.name,
             platform: platform().into(),
             version: VERSION.into(),
-            protocol: 1,
+            protocol: 2,
             addresses: addresses(self.0.port),
             public_key: hex::encode(self.0.identity.verifying_key().to_bytes()),
             capabilities: capabilities(),
+            certificate_fingerprint: self.0.tls.fingerprint.clone(),
         }
     }
     pub fn bootstrap(&self) -> Bootstrap {
         Bootstrap {
-            address: format!("http://127.0.0.1:{}", self.0.port),
+            address: format!("http://127.0.0.1:{}", self.0.local_port),
+            https_address: format!("https://127.0.0.1:{}", self.0.port),
             token: self.0.token.clone(),
             pairing_code: self.0.code.clone(),
         }
@@ -426,14 +457,14 @@ fn addresses(port: u16) -> Vec<String> {
             } else {
                 2
             };
-            Some((rank, format!("http://{ip}:{port}")))
+            Some((rank, format!("https://{ip}:{port}")))
         })
         .collect();
     candidates.sort();
     let mut addresses: Vec<_> = candidates.into_iter().map(|(_, address)| address).collect();
     addresses.dedup();
     if addresses.is_empty() {
-        addresses.push(format!("http://127.0.0.1:{port}"));
+        addresses.push(format!("https://127.0.0.1:{port}"));
     }
     addresses
 }
@@ -472,10 +503,121 @@ fn safe_filename(value: &str) -> bool {
 
 fn capabilities() -> Vec<String> {
     vec![
+        "https-v1".into(),
         "groups-v1".into(),
         "signed-offers-v1".into(),
         "history-v1".into(),
     ]
+}
+
+fn tls_names(id: &str) -> Vec<String> {
+    let mut names = vec![
+        "127.0.0.1".into(),
+        "localhost".into(),
+        format!("linchuan-{}.local", &id[..8]),
+    ];
+    names.extend(
+        addresses(0)
+            .into_iter()
+            .filter_map(|address| url::Url::parse(&address).ok()?.host_str().map(String::from)),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+impl App {
+    fn peer_client(&self, device: &Device) -> anyhow::Result<reqwest::Client> {
+        anyhow::ensure!(
+            uuid::Uuid::parse_str(&device.host_device_id).is_ok()
+                && hex::decode(&device.public_key).is_ok_and(|key| key.len() == 32),
+            "设备缺少有效身份，请重新连接"
+        );
+        let cache_key = format!("{}:{}", device.host_device_id, device.public_key);
+        let mut clients = self
+            .0
+            .peer_clients
+            .lock()
+            .map_err(|_| anyhow::anyhow!("连接状态不可用"))?;
+        if let Some(client) = clients.get(&cache_key) {
+            return Ok(client.clone());
+        }
+        let client = tls::PeerClient::new(Some(tls::PeerIdentity {
+            id: device.host_device_id.clone(),
+            public_key: device.public_key.clone(),
+        }))?
+        .client;
+        if clients.len() >= 128 {
+            clients.clear();
+        }
+        clients.insert(cache_key, client.clone());
+        Ok(client)
+    }
+
+    async fn inspect_peer(&self, address: &str, expected: Option<&Device>) -> api::Result<Device> {
+        use futures_util::StreamExt;
+        use serde_json::Value;
+        let address = api::local_address(address)?;
+        let expected = expected.map(|device| tls::PeerIdentity {
+            id: device.host_device_id.clone(),
+            public_key: device.public_key.clone(),
+        });
+        let connection =
+            tls::PeerClient::new(expected).map_err(|error| api::Error::bad(error.to_string()))?;
+        let response = connection
+            .client
+            .get(format!("{address}/api/info"))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                api::Error::bad("HTTPS 连接失败，请检查设备地址、证书身份、网络和应用版本")
+            })?;
+        if !response.status().is_success() {
+            return Err(api::Error::bad("对方没有返回有效设备信息"));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| api::Error::bad("读取设备信息失败"))?;
+            if bytes.len() + chunk.len() > 64 * 1024 {
+                return Err(api::Error::bad("设备信息过大"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let info: Value =
+            serde_json::from_slice(&bytes).map_err(|_| api::Error::bad("对方不是邻传设备"))?;
+        if info["protocol"] != 2 {
+            return Err(api::Error::bad("连接协议不兼容，请升级双方应用"));
+        }
+        let identity = connection
+            .identity()
+            .map_err(|error| api::Error::bad(error.to_string()))?;
+        if info["id"] != identity.id || info["public_key"] != identity.public_key {
+            return Err(api::Error::bad("设备信息与 HTTPS 证书身份不匹配"));
+        }
+        Ok(Device {
+            id: identity.id.clone(),
+            name: info["name"]
+                .as_str()
+                .unwrap_or("邻传设备")
+                .chars()
+                .take(64)
+                .collect(),
+            platform: info["platform"]
+                .as_str()
+                .unwrap_or("设备")
+                .chars()
+                .take(20)
+                .collect(),
+            address,
+            last_seen: now(),
+            kind: "app".into(),
+            host_device_id: identity.id,
+            public_key: identity.public_key,
+            capabilities: serde_json::from_value(info["capabilities"].clone()).unwrap_or_default(),
+        })
+    }
 }
 
 async fn sync_directory(path: PathBuf) -> std::io::Result<()> {

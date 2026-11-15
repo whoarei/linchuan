@@ -100,7 +100,7 @@ test("two applications exchange directly in the new three-column layout", async 
 }) => {
   const a = await owner(browser);
   const b = await owner(browser, 1);
-  await addPeer(a.page, b.b.address);
+  await addPeer(a.page, b.b.https_address);
   await a.page
     .getByRole("textbox", { name: "发送文字" })
     .fill("应用之间直接传输");

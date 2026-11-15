@@ -2,6 +2,8 @@
 
 当前版本为 0.4.0；Tauri 2 + Vue 3 + TypeScript + Rust，覆盖 Android、Linux、Windows，前端同时用于内置 WebView 和浏览器。
 
+主分支在 0.4.0 之后加入 [HTTPS 设备连接](https-connections.md)，下述连接方案描述该开发状态；已发布 0.4.0 的 HTTP 安装包不因此改变。
+
 0.4.0 的[固定接收目录](receive-storage.md)已实现。`receiving.rs` 在完成接收的事务内创建保存队列，后台流式导出文件；原生 IPC 提供目录设置、保存状态和文件打开。Windows／Linux 使用系统下载目录和目录选择器；Android 使用 MediaStore Downloads、持久授权的 SAF 目录及旧系统存储权限。浏览器下载规则保持由浏览器管理。
 
 0.4.0 的[浏览器临时会话](browser-sessions.md)将现有 24 小时凭证保存在当前 origin 的 localStorage 并同步标签页退出，会话列表根据持久化的 peer_kind 和 has_draft 收起离线浏览器历史，不推断物理设备身份或删除传输记录。
@@ -15,6 +17,7 @@ Windows／Linux 的[开机启动与托盘](desktop-background.md)使用原生生
 - `crates/core/src/model.rs`：设备、会话、消息、传输、群和签名数据类型。
 - `store.rs` / `migrations/`：SQLite 版本迁移、事务写入、分页查询和启动恢复。
 - `identity.rs`：本机 Ed25519 签名和校验；浏览器 token 的 SHA-256。
+- `tls.rs`：持久化本地 CA、设备身份绑定、短期服务证书、地址变更续签及身份固定的 HTTPS 客户端。
 - `groups.rs`：群主签名名单、成员签名决定、邀请及成员通知、直连地址核对。
 - `conversations.rs`：会话创建、历史分页、已读位置、文字草稿和缓存清理。
 - `receiving.rs`：接收目录、附件保存队列、保存记录、失败重试和安全重名处理；Tauri 与 Android 插件负责平台目录访问。
@@ -35,9 +38,9 @@ Windows／Linux 的[开机启动与托盘](desktop-background.md)使用原生生
 
 ## 设备发现与协议
 
-HTTP 服务绑定 `0.0.0.0:0`，从 listener 读取真实端口。mDNS `_linchuan._tcp.local.` 发布设备 ID、名称、版本能力、公钥及实际端口，手动地址作为回退。地址和端口是当前连接信息，不是身份；离线设备记录不会被删掉。
+HTTPS 服务绑定 `0.0.0.0:0`，从 listener 读取真实端口。mDNS `_linchuan._tcp.local.` 发布设备 ID、名称、公钥、HTTPS 能力、证书指纹及实际端口；验证证书和信息接口后才保存设备资料，手动 HTTPS 地址作为回退。地址和端口是当前连接信息，不是身份；离线设备记录不会被删掉。本机 WebView 使用另一个仅绑定 `127.0.0.1:0` 的 HTTP 桥接接口，不向局域网暴露或广播。
 
-基础 protocol=1 保持 0.1 直接传输接口兼容。新增 capabilities 声明 groups-v1、signed-offers-v1、history-v1；新客户端用 message_id、sender_id、target_id、group_id、created_at 和签名识别消息。旧版未签名来源作为兼容身份保存，不凭名称合并新身份，不能发送群消息。
+发现和设备信息使用 protocol=2，新增 https-v1 能力；旧 HTTP 设备须升级，不自动降级。消息载荷仍使用 protocol=1，保留 groups-v1、signed-offers-v1、history-v1 语义；通过 message_id、sender_id、target_id、group_id、created_at 和签名识别消息。旧历史继续保留，不凭名称合并身份。
 
 每次群发送展开为多个 delivery，发送者直接连接接收者。群主维护名单，不中转数据；接收者缓存已验证名单及加入事件，因此群主离线不阻止其他成员互传。浏览器由自己的宿主代理；其他原生成员不依赖该宿主存在。
 
@@ -49,11 +52,11 @@ HTTP 服务绑定 `0.0.0.0:0`，从 listener 读取真实端口。mDNS `_linchua
 
 历史、草稿、确认和下载按 principal_id 检查；不能仅凭会话或文件 ID 访问其他浏览器记录。下载使用短时单文件 ticket，附件作为下载或受控图片预览，不执行用户 HTML/SVG。
 
-HTTP 不加密，发现及首次信任仍受网络环境影响。本轮不宣称端到端加密、可信设备永久配对或完全防御中间人攻击。
+局域网内容通过 TLS 加密。每台设备的 ECDSA CA 公钥由既有 Ed25519 身份签名，原生连接校验证书链、地址、有效期和已记录身份；浏览器须显式信任本地 CA。首次设备发现仍属于首次使用信任，不宣称对首次中间人攻击完全免疫。浏览器经宿主代理时，宿主可处理消息，不能将逐段 HTTPS 描述为浏览器到远端成员的端到端加密。
 
 ## 文件与状态
 
-文件先通过 HTTP 流式上传到发送宿主，完整后移动到持久文件区。向多个目标发送复用同一个源文件；每位接收者有独立结果和接收副本。群里纯文字在加入确认后直接收录，文件仍需确认；单设备接收保留既有确认行为。
+文件先通过 HTTPS 流式上传到发送宿主（本机 WebView 经回环桥接），完整后移动到持久文件区。向多个目标发送复用同一个源文件；每位接收者有独立结果和接收副本。群里纯文字在加入确认后直接收录，文件仍需确认；单设备接收保留既有确认行为。
 
 状态为 pending → accepted → transferring → completed，另有 rejected/cancelled/failed/interrupted。只有声明文件完整后才能完成。文件可用性独立于结果；清理缓存保留历史和状态，跳过活动任务。
 
@@ -71,6 +74,6 @@ Windows、Linux 关闭原生窗口装饰，使用 `DesktopTitleBar.vue` 自绘�
 
 ### 安装与验证范围
 
-Windows 使用 WebView2、NSIS；Linux 使用 WebKitGTK 4.1、DEB/AppImage；Android 使用 JDK 21、SDK 36、NDK 27.2，允许局域网 HTTP，前台持有组播锁，arm64 原生库和 APK 支持 16 KiB 对齐。桌面第二次启动聚焦已有窗口，避免原生应用并发访问同一个数据目录。
+Windows 使用 WebView2、NSIS；Linux 使用 WebKitGTK 4.1、DEB/AppImage；Android 使用 JDK 21、SDK 36、NDK 27.2，保留本机 HTTP 桥接、局域网使用 HTTPS，前台持有组播锁，arm64 原生库和 APK 支持 16 KiB 对齐。桌面第二次启动聚焦已有窗口，避免原生应用并发访问同一个数据目录。
 
 本轮运行 Rust 核心与数据库集成测试、clippy、TypeScript/Vite、Playwright 会话流程；CI 构建三平台安装产物，检查 Linux 原生启动和 Android ELF 对齐。真机与复杂网络测试范围单独记录，不以浏览器模拟替代 Android 原生真机验收。

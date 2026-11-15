@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "Linchuan {} listening on {}",
         linchuan_core::VERSION,
-        app.bootstrap().address
+        app.info().await.addresses[0]
     );
     tokio::signal::ctrl_c().await?;
     app.stop();

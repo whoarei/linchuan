@@ -36,13 +36,13 @@ cargo fmt --all -- --check
 cargo clippy -p linchuan-core --all-targets -- -D warnings
 cargo test -p linchuan-core --locked
 cargo build -p linchuan-core --locked
-npx playwright install chromium
+npx playwright install chromium firefox
 npm run test:e2e
 python3 -m pip install cryptography
 python3 scripts/test_updates.py
 ```
 
-`rust-embed` 会嵌入 `dist`；先构建前端再构建 Rust。首次 Linux 浏览器测试可使用 `npx playwright install --with-deps chromium` 安装系统依赖。
+`rust-embed` 会嵌入 `dist`；先构建前端再构建 Rust。首次 Linux 浏览器测试可使用 `npx playwright install --with-deps chromium firefox` 安装系统依赖，并安装 `libnss3-tools` 提供 certutil。HTTPS 测试只在临时 Firefox 配置中导入测试 CA，不修改系统或用户浏览器信任；验证真实安全上下文、配对、WSS 和文件完整性。开发实例的 ready.json 中 address 是本机桥接接口，https_address 才是 TLS 地址；分享给局域网设备时使用信息接口的 addresses。
 
 ## 打包
 

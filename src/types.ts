@@ -87,6 +87,7 @@ export interface AppState {
     addresses: string[];
     version: string;
     platform: string;
+    certificate_fingerprint: string;
   };
   devices: Device[];
   conversations: Conversation[];
