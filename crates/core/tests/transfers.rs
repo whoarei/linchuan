@@ -145,12 +145,7 @@ impl Host {
         r.json().await.unwrap()
     }
     async fn offer_from(&self, sender: &Host, text: &str, files: Value) -> String {
-        let response = sender
-            .post(
-                "/api/peers",
-                json!({"address":self.app.bootstrap().https_address}),
-            )
-            .await;
+        let response = sender.post("/api/peers", json!({"address":self.url})).await;
         assert_eq!(response.status(), StatusCode::OK);
         let target = response.json::<Value>().await.unwrap()["id"].clone();
         let draft = sender.draft(files).await;
@@ -371,11 +366,7 @@ async fn multiple_files_unicode_names_binary_integrity_and_one_use_download() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
-    a.post(
-        "/api/peers",
-        json!({"address":b.app.bootstrap().https_address}),
-    )
-    .await;
+    a.post("/api/peers", json!({"address":b.url})).await;
     let bid = b.app.info().await.id;
     let r = a
         .post(
@@ -460,10 +451,7 @@ async fn unsafe_paths_limits_partial_upload_and_premature_completion() {
     );
     for address in [
         "http://example.com:8080",
-        "http://192.168.1.1:80",
-        "https://8.8.8.8",
-        "https://127.0.0.1/path",
-        "https://u:p@127.0.0.1:443",
+        "https://192.168.1.1:80",
         "http://8.8.8.8",
         "http://127.0.0.1/path",
         "http://u:p@127.0.0.1:80",

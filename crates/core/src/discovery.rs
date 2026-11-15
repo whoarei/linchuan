@@ -20,13 +20,9 @@ pub async fn announce(app: &App) -> anyhow::Result<()> {
         ("id", info.id.as_str()),
         ("name", info.name.as_str()),
         ("platform", info.platform.as_str()),
-        ("protocol", "2"),
-        ("scheme", "https"),
+        ("protocol", "1"),
+        ("scheme", "http"),
         ("public_key", info.public_key.as_str()),
-        (
-            "certificate_fingerprint",
-            info.certificate_fingerprint.as_str(),
-        ),
         ("capabilities", capabilities.as_str()),
     ];
     let service = ServiceInfo::new(
@@ -66,8 +62,10 @@ pub async fn start(app: App) -> anyhow::Result<()> {
             let ServiceEvent::ServiceResolved(service) = event else {
                 continue;
             };
-            if service.get_property_val_str("protocol") != Some("2")
-                || service.get_property_val_str("scheme") != Some("https")
+            if service.get_property_val_str("protocol") != Some("1")
+                || service
+                    .get_property_val_str("scheme")
+                    .is_some_and(|scheme| scheme != "http")
             {
                 continue;
             }
@@ -105,11 +103,11 @@ pub async fn start(app: App) -> anyhow::Result<()> {
                 id: id.into(),
                 host_device_id: id.into(),
                 public_key: public_key.into(),
-                address: format!("https://{ip}:{}", service.get_port()),
+                address: format!("http://{ip}:{}", service.get_port()),
                 ..Device::default()
             };
             // Advertisements only locate a candidate. Persist names, keys and capabilities
-            // after verifying the HTTPS certificate and the matching info response.
+            // after checking the info response against the advertised identity.
             if let Ok(device) = app.inspect_peer(&hint.address, Some(&hint)).await {
                 let _ = app.remember_peer(device).await;
             }

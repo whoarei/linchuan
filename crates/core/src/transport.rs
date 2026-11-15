@@ -60,16 +60,6 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         .get(id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("传输已过期"))?;
-    let target = app
-        .0
-        .state
-        .lock()
-        .await
-        .profiles
-        .get(&transfer.view.recipient_id)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("接收设备身份不存在，请重新连接"))?;
-    let client = app.peer_client(&target)?;
     let mut offer = Offer {
         protocol: 1,
         message_id: transfer.view.message_id.clone(),
@@ -97,7 +87,9 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         offer.membership = member.event.clone();
     }
     offer.identity = Some(app.signed(crate::identity::offer_payload(&offer)).await);
-    let response = client
+    let response = app
+        .0
+        .client
         .post(format!("{address}/api/peer/offer"))
         .json(&offer)
         .timeout(Duration::from_secs(10))
@@ -115,7 +107,7 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         loop{
             if !active(app,id).await{return Ok(());}
             anyhow::ensure!(start.elapsed()<Duration::from_secs(300),"等待接收确认超时，请重新发送");
-            let response=client.get(&endpoint).bearer_auth(&remote.token).timeout(Duration::from_secs(5)).send().await?;
+            let response=app.0.client.get(&endpoint).bearer_auth(&remote.token).timeout(Duration::from_secs(5)).send().await?;
             anyhow::ensure!(response.status().is_success(),"接收请求已过期");
             let status:TransferView=response.json().await?;
             match status.status.as_str(){
@@ -136,7 +128,7 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
                 if let Ok(bytes) = &chunk { uploaded.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed); }
                 chunk
             });
-            let upload=client.put(format!("{endpoint}/files/{}",file.meta.id)).bearer_auth(&remote.token).header("content-length",file.meta.size)
+            let upload=app.0.client.put(format!("{endpoint}/files/{}",file.meta.id)).bearer_auth(&remote.token).header("content-length",file.meta.size)
                 .body(reqwest::Body::wrap_stream(stream)).timeout(Duration::from_secs(3600)).send();
             tokio::pin!(upload);
             let response=loop{tokio::select!{
@@ -149,7 +141,7 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
             if !update(app,id,"transferring",bytes).await{return Ok(());}
         }
         if !active(app,id).await{return Ok(());}
-        let response=client.post(format!("{endpoint}/complete")).bearer_auth(&remote.token).timeout(Duration::from_secs(10)).send().await?;
+        let response=app.0.client.post(format!("{endpoint}/complete")).bearer_auth(&remote.token).timeout(Duration::from_secs(10)).send().await?;
         anyhow::ensure!(response.status().is_success(),"接收方未确认传输完成");
         update(app,id,"completed",bytes).await;
         Ok::<_,anyhow::Error>(())
@@ -163,7 +155,9 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         .get(id)
         .is_some_and(|t| t.view.status == "completed");
     if !completed {
-        let _ = client
+        let _ = app
+            .0
+            .client
             .post(format!("{endpoint}/cancel"))
             .bearer_auth(&remote.token)
             .timeout(Duration::from_secs(3))

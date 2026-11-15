@@ -128,9 +128,6 @@ const browserIdentityName = browserIdentity();
 const browserName = ref(browserIdentityName.preferred);
 const code = ref("");
 const hostName = ref("邻传设备");
-const hostFingerprint = ref("");
-const httpsPage = window.location.protocol === "https:";
-const secureContext = window.isSecureContext;
 const pairError = ref("");
 const modal = ref<
   | ""
@@ -890,22 +887,6 @@ async function openProject() {
     notify((error as Error).message, true);
   }
 }
-async function downloadCertificate() {
-  const url = address() + "/api/certificate";
-  try {
-    if (native) {
-      const { openUrl } = await import("@tauri-apps/plugin-opener");
-      await openUrl(url);
-    } else {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = "linchuan-local-ca.crt";
-      link.click();
-    }
-  } catch (error) {
-    notify((error as Error).message, true);
-  }
-}
 async function disconnect() {
   try {
     await api("/api/session/logout", {});
@@ -951,9 +932,8 @@ onMounted(async () => {
     await bootstrap();
     void loadDesktopSettings();
     void loadReceiveSettings();
-    const info = await api<{ name: string; certificate_fingerprint: string }>("/api/info");
+    const info = await api<{ name: string }>("/api/info");
     hostName.value = info.name;
-    hostFingerprint.value = info.certificate_fingerprint;
     if (token()) await refresh();
     else loading.value = false;
     if (ready.value) events();
@@ -1019,13 +999,7 @@ onUnmounted(() => {
           />{{ pairing ? "正在连接" : "连接设备" }}
         </button>
       </form>
-      <small>同一局域网 · 无需账号 · {{ httpsPage ? "HTTPS 加密连接" : "本机连接" }}</small>
-      <details v-if="httpsPage" class="connection-help">
-        <summary>HTTPS 连接说明</summary>
-        <p>首次访问请与对方核对证书指纹，并将对方导出的本地 CA 证书加入浏览器信任。</p>
-        <p data-testid="secure-context">{{ secureContext ? "浏览器安全上下文已就绪" : "浏览器尚未确认安全上下文，请检查证书信任" }}。音视频权限仍需单独授权。</p>
-        <code class="certificate-fingerprint">{{ hostFingerprint }}</code>
-      </details>
+      <small>同一局域网 · 无需账号 · HTTP 传输</small>
       <div v-if="!native" class="client-download">
         <a :href="downloadsUrl" target="_blank" rel="noopener noreferrer">
           <Download :size="15" />下载客户端<ArrowUpRight :size="13" />
@@ -1630,20 +1604,6 @@ onUnmounted(() => {
           </button>
         </form>
       </section>
-      <section class="settings-card" aria-label="连接安全">
-        <h2>连接安全</h2>
-        <p v-if="native">设备间通过 HTTPS 加密连接。浏览器首次访问时，需要信任本设备的本地 CA 证书。</p>
-        <p v-else-if="httpsPage" data-testid="secure-context">HTTPS 加密连接 · {{ secureContext ? "浏览器安全上下文已就绪" : "请检查证书信任" }}</p>
-        <p v-else>当前通过本机地址访问。分享给其他设备时，请使用应用展示的 HTTPS 地址。</p>
-        <details class="connection-help">
-          <summary>证书与首次信任</summary>
-          <p>在对方浏览器中导入本设备的公共 CA 证书，并核对下方 SHA-256 指纹。证书仅用于连接本设备，请从可信设备取得。</p>
-          <p>Windows 可导入当前用户的受信任根证书；Linux／Firefox 按浏览器的证书管理设置导入；Android 在系统安全设置中安装 CA 证书。各浏览器的信任规则可能不同，安装后重新打开 HTTPS 地址。</p>
-          <p>只越过证书警告不保证音视频权限可用。清除应用数据后需重新核对证书，并移除旧证书信任。</p>
-          <code class="certificate-fingerprint">{{ state?.info.certificate_fingerprint || hostFingerprint }}</code>
-          <button class="secondary" @click="downloadCertificate"><Download :size="15" />下载本设备证书</button>
-        </details>
-      </section>
       <section
         v-if="desktopSettings?.supported"
         class="settings-card"
@@ -1844,7 +1804,7 @@ onUnmounted(() => {
         <div><ShieldCheck :size="18" /><span>无需账号，无云端中转</span></div>
       </div>
       <p class="about-note">
-        局域网连接采用 HTTPS 加密，首次浏览器访问需信任设备证书。<br />保持应用运行；群聊暂不自动补发离线消息。
+        仅在可信局域网使用，当前采用 HTTP 传输。<br />保持应用运行；群聊暂不自动补发离线消息。
       </p>
       <div class="about-links">
         <a
@@ -1900,13 +1860,7 @@ onUnmounted(() => {
         </button>
         <div class="pairing-code">
           <small>本次配对码</small><b>{{ pairingCode }}</b>
-        </div>
-        <details class="connection-help">
-          <summary>浏览器首次连接</summary>
-          <p>请先在对方浏览器中导入本设备的本地 CA 证书，核对 SHA-256 指纹后，重新打开上方 HTTPS 地址。证书信任不会由邻传自动设置。</p>
-          <code class="certificate-fingerprint">{{ state?.info.certificate_fingerprint || hostFingerprint }}</code>
-          <button class="secondary" @click="downloadCertificate"><Download :size="15" />下载本设备证书</button>
-        </details></template
+        </div></template
       >
       <template v-else-if="modal === 'manual'"
         ><div class="modal-icon"><Link :size="24" /></div>
@@ -1918,7 +1872,7 @@ onUnmounted(() => {
               v-model="manualAddress"
               type="url"
               required
-              placeholder="https://192.168.1.20:52783" /></label
+              placeholder="http://192.168.1.20:52783" /></label
           ><button class="primary wide" :disabled="modalBusy">
             <LoaderCircle v-if="modalBusy" class="spin" :size="16" />{{
               modalBusy ? "连接中" : "连接设备"

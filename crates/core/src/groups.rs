@@ -258,8 +258,8 @@ pub async fn resolve(app: &App, device: &Device) -> Result<Option<String>> {
     };
     let address = crate::api::local_address(&address)?;
     let response = app
-        .peer_client(device)
-        .map_err(bad)?
+        .0
+        .client
         .get(format!("{address}/api/info"))
         .timeout(std::time::Duration::from_secs(3))
         .send()
@@ -277,8 +277,8 @@ pub async fn resolve(app: &App, device: &Device) -> Result<Option<String>> {
 async fn transmit(app: &App, device: &Device, env: &SignedEnvelope) -> Result<()> {
     if let Some(address) = resolve(app, device).await? {
         let response = app
-            .peer_client(device)
-            .map_err(bad)?
+            .0
+            .client
             .post(format!("{address}/api/peer/group"))
             .json(env)
             .timeout(std::time::Duration::from_secs(5))

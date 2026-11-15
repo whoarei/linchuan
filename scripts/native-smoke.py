@@ -2,7 +2,6 @@
 import json
 import os
 import pathlib
-import ssl
 import subprocess
 import sys
 import time
@@ -30,16 +29,13 @@ try:
             try:
                 with direct.open(f'http://127.0.0.1:{port}/api/info', timeout=2) as response:
                     info = json.load(response)
-                    if info.get('version') == version and info.get('protocol') == 2:
-                        with direct.open(f'http://127.0.0.1:{port}/api/certificate', timeout=2) as certificate:
-                            context = ssl.create_default_context(cadata=certificate.read().decode('ascii'))
+                    if info.get('version') == version and info.get('protocol') == 1:
                         address = info['addresses'][0]
-                        assert address.startswith('https://')
-                        secure = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
-                        with secure.open(address + '/api/info', timeout=3) as secure_response:
-                            secure_info = json.load(secure_response)
-                        assert secure_info['id'] == info['id'] and secure_info['protocol'] == 2
-                        print(f'Native UI started its HTTPS LAN service at {address}')
+                        assert address.startswith('http://')
+                        with direct.open(address + '/api/info', timeout=3) as lan_response:
+                            lan_info = json.load(lan_response)
+                        assert lan_info['id'] == info['id'] and lan_info['protocol'] == 1
+                        print(f'Native UI started its HTTP LAN service at {address}')
                         sys.exit(0)
             except Exception:
                 pass
