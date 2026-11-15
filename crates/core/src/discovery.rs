@@ -62,7 +62,8 @@ pub async fn start(app: App) -> anyhow::Result<()> {
         let mut stop = app.0.stop.subscribe();
         loop {
             let event = tokio::select! { _ = stop.changed() => break, event = receiver.recv_async() => event };
-            let Ok(ServiceEvent::ServiceResolved(service)) = event else {
+            let Ok(event) = event else { break };
+            let ServiceEvent::ServiceResolved(service) = event else {
                 continue;
             };
             if service.get_property_val_str("protocol") != Some("2")
