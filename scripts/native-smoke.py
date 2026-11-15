@@ -8,6 +8,7 @@ import sys
 import time
 import urllib.request
 version = json.loads(pathlib.Path('package.json').read_text())['version']
+direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 process = subprocess.Popen([sys.argv[1], *sys.argv[2:]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 try:
     for attempt in range(90):
@@ -27,14 +28,15 @@ try:
                 continue
             port = int(values[1].split(':')[1], 16)
             try:
-                with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/info', timeout=2) as response:
+                with direct.open(f'http://127.0.0.1:{port}/api/info', timeout=2) as response:
                     info = json.load(response)
                     if info.get('version') == version and info.get('protocol') == 2:
-                        with urllib.request.urlopen(f'http://127.0.0.1:{port}/api/certificate', timeout=2) as certificate:
+                        with direct.open(f'http://127.0.0.1:{port}/api/certificate', timeout=2) as certificate:
                             context = ssl.create_default_context(cadata=certificate.read().decode('ascii'))
                         address = info['addresses'][0]
                         assert address.startswith('https://')
-                        with urllib.request.urlopen(address + '/api/info', context=context, timeout=3) as secure_response:
+                        secure = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
+                        with secure.open(address + '/api/info', timeout=3) as secure_response:
                             secure_info = json.load(secure_response)
                         assert secure_info['id'] == info['id'] and secure_info['protocol'] == 2
                         print(f'Native UI started its HTTPS LAN service at {address}')
