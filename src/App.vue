@@ -1347,7 +1347,9 @@ onUnmounted(() => {
               <div v-if="message.files.length" class="message-attachments">
                 <div
                   v-if="incomingPending(message)"
-                  class="attachment-receive-actions"
+                  class="attachment-actions attachment-receive-actions"
+                  role="group"
+                  aria-label="接收文件"
                 >
                   <span
                     >待接收<template v-if="message.files.length > 1">
@@ -1355,22 +1357,26 @@ onUnmounted(() => {
                     ></span
                   >
                   <button
-                    class="secondary"
+                    class="icon-button"
+                    aria-label="拒绝"
+                    title="拒绝"
                     :disabled="decisionBusy.has(incomingPending(message)!.id)"
                     @click="decide(incomingPending(message)!, false)"
                   >
-                    拒绝
+                    <X :size="18" />
                   </button>
                   <button
-                    class="primary"
+                    class="icon-button"
+                    aria-label="接收"
+                    title="接收"
                     :disabled="decisionBusy.has(incomingPending(message)!.id)"
                     @click="decide(incomingPending(message)!, true)"
                   >
                     <LoaderCircle
                       v-if="decisionBusy.has(incomingPending(message)!.id)"
                       class="spin"
-                      :size="13"
-                    />接收
+                      :size="18"
+                    /><Check v-else :size="18" />
                   </button>
                 </div>
                 <div

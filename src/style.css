@@ -633,23 +633,11 @@ small {
   min-width: 32px;
   min-height: 32px;
 }
-.attachment-receive-actions {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 10px 12px;
-  border-bottom: 1px solid #edf0f5;
-}
 .attachment-receive-actions > span {
   flex: 1;
   min-width: 0;
   color: #8795ab;
   font-size: 10px;
-}
-.attachment-receive-actions button {
-  flex-shrink: 0;
-  padding: 6px 10px;
-  font-size: 11px;
 }
 .attachment-transfer {
   padding: 10px 12px;
@@ -1715,9 +1703,6 @@ input::placeholder {
   }
   .attachment-actions .icon-button {
     min-width: 36px;
-    min-height: 36px;
-  }
-  .attachment-receive-actions button {
     min-height: 36px;
   }
   .image-thumbnail,
