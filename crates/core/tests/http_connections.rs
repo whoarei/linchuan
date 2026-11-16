@@ -152,18 +152,7 @@ async fn an_old_ca_setting_does_not_block_http_or_erase_identity_and_browser_his
         .iter()
         .find(|item| item["text"] == "HTTPS 版本留下的历史继续保留")
         .unwrap();
-    assert!(host
-        .post(
-            &format!(
-                "/api/transfers/{}/decision",
-                transfer["id"].as_str().unwrap()
-            ),
-            json!({"accept":true}),
-            &owner
-        )
-        .await
-        .status()
-        .is_success());
+    assert_eq!(transfer["status"], "completed");
     host.app.stop();
     {
         let database =

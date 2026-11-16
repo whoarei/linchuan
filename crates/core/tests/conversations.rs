@@ -832,7 +832,9 @@ async fn interrupted_transfer_is_not_completed_after_restart() {
     let sender = Host::new("发送").await;
     let mut receiver = Host::new("接收").await;
     let target = sender.connect(&receiver).await;
-    sender.send(Some(target), None, "尚未确认", None).await;
+    sender
+        .send(Some(target), None, "尚未确认", Some(b"ordinary file"))
+        .await;
     receiver
         .wait(|s| !s["transfers"].as_array().unwrap().is_empty())
         .await;

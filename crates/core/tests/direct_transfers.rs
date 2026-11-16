@@ -690,3 +690,210 @@ async fn files_above_two_gib_use_original_and_final_target_without_full_cache() 
     assert_eq!(bytes_in(&receiver.dir.path().join("files")), 0);
     assert_eq!(std::fs::metadata(&saved[0].location).unwrap().len(), length);
 }
+
+#[tokio::test]
+async fn browser_image_stream_is_accepted_automatically_and_mixed_attachments_wait() {
+    let host = Host::new("图片接收").await;
+    let folder = TempDir::new().unwrap();
+    host.app
+        .configure_receiving(folder.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let (token, _) = host.pair().await;
+    for (files, status) in [
+        (
+            json!([{"name":"photo.png","size":3,"mime":"image/png"}]),
+            "accepted",
+        ),
+        (
+            json!([{"name":"photo.heic","size":32*1024*1024,"mime":"image/heic"}]),
+            "accepted",
+        ),
+        (
+            json!([{"name":"photo.png","size":3,"mime":"image/png"},{"name":"notes.txt","size":1,"mime":"text/plain"}]),
+            "pending",
+        ),
+    ] {
+        let draft: Value = host
+            .post(
+                "/api/drafts",
+                json!({"streaming":true,"files":files}),
+                &token,
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+        let sent = host
+            .send(&draft, json!([host.app.info().await.id]), None, &token)
+            .await;
+        let id = sent["ids"][0].as_str().unwrap();
+        host.wait(sent["message_id"].as_str().unwrap(), status)
+            .await;
+        if files[0]["size"] == 3 && files.as_array().unwrap().len() == 1 {
+            let response = Client::new()
+                .put(format!(
+                    "{}/api/transfers/{id}/files/{}/upload",
+                    host.url,
+                    draft["files"][0]["id"].as_str().unwrap()
+                ))
+                .bearer_auth(&token)
+                .body("png")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            host.wait(sent["message_id"].as_str().unwrap(), "completed")
+                .await;
+            let saved = host
+                .app
+                .saved_files(vec![sent["message_id"].as_str().unwrap().into()])
+                .await
+                .unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(std::fs::read(&saved[0].location).unwrap(), b"png");
+        } else {
+            assert_eq!(
+                host.post(&format!("/api/transfers/{id}/cancel"), json!({}), &token)
+                    .await
+                    .status(),
+                StatusCode::OK
+            );
+        }
+    }
+    assert_eq!(std::fs::read_dir(folder.path()).unwrap().count(), 1);
+    assert_eq!(bytes_in(&host.dir.path().join("files")), 0);
+}
+
+#[tokio::test]
+async fn automatic_images_still_check_destination_space_and_can_be_retried() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    let host = Host::new("空间检查").await;
+    let available = Arc::new(AtomicBool::new(false));
+    let probe = available.clone();
+    host.app.set_space_probe(Arc::new(move |path| {
+        let available = probe.load(Ordering::SeqCst);
+        Box::pin(async move {
+            let mut disk = linchuan_core::storage::disk_space(Path::new(&path))?;
+            disk.available = if available { 8 * 1024 * 1024 * 1024 } else { 0 };
+            Ok(disk)
+        })
+    }));
+    let (token, _) = host.pair().await;
+    let draft: Value = host
+        .post(
+            "/api/drafts",
+            json!({"streaming":true,"files":[{"name":"photo.jpg","size":3,"mime":"image/jpeg"}]}),
+            &token,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let sent = host
+        .send(&draft, json!([host.app.info().await.id]), None, &token)
+        .await;
+    let pending = host
+        .wait(sent["message_id"].as_str().unwrap(), "pending")
+        .await;
+    assert!(pending["error"].as_str().unwrap().contains("磁盘空间不足"));
+    available.store(true, Ordering::SeqCst);
+    host.accept(sent["ids"][0].as_str().unwrap(), &host.token)
+        .await;
+    let accepted = host
+        .wait(sent["message_id"].as_str().unwrap(), "accepted")
+        .await;
+    assert!(accepted["error"].is_null());
+}
+
+#[tokio::test]
+async fn host_to_browser_text_is_immediate_but_images_complete_only_after_reading() {
+    let host = Host::new("宿主").await;
+    let (token, browser) = host.pair().await;
+    let draft: Value = host
+        .post("/api/drafts", json!({"files":[]}), &host.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let sent = host.send(&draft, json!([browser]), None, &host.token).await;
+    host.wait(sent["message_id"].as_str().unwrap(), "completed")
+        .await;
+    let folder = TempDir::new().unwrap();
+    let path = folder.path().join("photo.png");
+    std::fs::write(&path, b"image bytes").unwrap();
+    let draft = host.source_draft(&path).await;
+    assert_eq!(draft["files"][0]["mime"], "image/png");
+    let sent = host.send(&draft, json!([browser]), None, &host.token).await;
+    host.wait(sent["message_id"].as_str().unwrap(), "accepted")
+        .await;
+    let response = host
+        .download(
+            sent["ids"][0].as_str().unwrap(),
+            draft["files"][0]["id"].as_str().unwrap(),
+            &token,
+        )
+        .await;
+    assert_eq!(response.bytes().await.unwrap().as_ref(), b"image bytes");
+    host.wait(sent["message_id"].as_str().unwrap(), "completed")
+        .await;
+    assert_eq!(bytes_in(&host.dir.path().join("files")), 0);
+}
+
+#[tokio::test]
+async fn native_group_images_are_received_without_individual_confirmation() {
+    let sender = Host::new("图片发送").await;
+    let one = Host::new("图片接收一").await;
+    let two = Host::new("图片接收二").await;
+    let members = json!([sender.connect(&one).await, sender.connect(&two).await]);
+    let group: Value = sender
+        .post(
+            "/api/groups",
+            json!({"name":"图片群","members":members}),
+            &sender.token,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let group = group["group"]["id"].as_str().unwrap();
+    for receiver in [&one, &two] {
+        assert_eq!(
+            receiver
+                .post(
+                    &format!("/api/groups/{group}/decision"),
+                    json!({"accept":true}),
+                    &receiver.token
+                )
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    let source = TempDir::new().unwrap();
+    let path = source.path().join("group.webp");
+    let data = vec![9; 256 * 1024 + 19];
+    std::fs::write(&path, &data).unwrap();
+    let draft = sender.source_draft(&path).await;
+    let sent = sender
+        .send(&draft, json!([]), Some(group), &sender.token)
+        .await;
+    let message = sent["message_id"].as_str().unwrap();
+    for receiver in [&one, &two] {
+        receiver.wait(message, "completed").await;
+        let saved = receiver
+            .app
+            .saved_files(vec![message.into()])
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read(&saved[0].location).unwrap(), data);
+        assert_eq!(bytes_in(&receiver.dir.path().join("files")), 0);
+    }
+    let state = sender.wait(message, "completed").await;
+    assert_eq!(state["status"], "completed");
+    assert_eq!(bytes_in(&sender.dir.path().join("files")), 0);
+}

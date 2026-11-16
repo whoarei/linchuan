@@ -150,7 +150,7 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
   await host.page
     .getByRole("button", { name: "打开 历史临时网页", exact: true })
     .click();
-  await host.page.getByRole("button", { name: "接收", exact: true }).click();
+  await expect(host.page.locator(".message").filter({hasText:"临时会话留下的文字"}).getByRole("button", { name: "接收", exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByRole("button", { name: "断开连接", exact: true }).click();
   await expect(

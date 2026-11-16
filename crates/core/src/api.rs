@@ -850,8 +850,7 @@ async fn send(
     for (device, address) in resolved {
         let id = uid();
         let offline = address.is_none();
-        let completed =
-            request.group_id.is_some() && draft.files.is_empty() && matches!(address, Some(None));
+
         let view = TransferView {
             id: id.clone(),
             message_id: message_id.clone(),
@@ -863,14 +862,7 @@ async fn send(
             recipient_name: device.name,
             text: request.text.clone(),
             files: draft.files.iter().map(|f| f.meta.clone()).collect(),
-            status: if offline {
-                "failed"
-            } else if completed {
-                "completed"
-            } else {
-                "pending"
-            }
-            .into(),
+            status: if offline { "failed" } else { "pending" }.into(),
             bytes: 0,
             total: draft.files.iter().map(|f| f.meta.size).sum(),
             created: now(),
@@ -890,6 +882,9 @@ async fn send(
                 reserved: 0,
             },
         );
+        if matches!(address, Some(None)) {
+            auto_receive(&app, &mut state, &id).await;
+        }
         if let Some(Some(address)) = address {
             workers.push((id.clone(), address));
         }
@@ -906,6 +901,9 @@ async fn send(
         .composition
         .insert(conversation.id.clone(), String::new());
     if let Err(error) = app.commit(&mut state).await {
+        for id in &ids {
+            release_acceptance(&app, id);
+        }
         if has_cache {
             let _ = tokio::fs::rename(&destination, app.0.work.join(&id)).await;
         }
@@ -932,32 +930,31 @@ async fn send(
         json!({"ids":ids,"message_id":message_id,"conversation_id":conversation.id}),
     ))
 }
-async fn decision(
-    AxState(app): AxState<App>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(value): Json<Value>,
-) -> Result<Json<Value>> {
-    let p = app.principal(token(&headers)?).await?;
-    let accept = value["accept"]
-        .as_bool()
-        .ok_or_else(|| Error::bad("缺少接收决定"))?;
-    app.cache_transfer(&id).await?;
-    let mut state = app.0.state.lock().await;
+// Text and image-only messages use the same acceptance checks as a manual decision.
+fn automatically_received(files: &[FileMeta]) -> bool {
+    files.iter().all(|f| f.mime.starts_with("image/"))
+}
+async fn set_decision(
+    app: &App,
+    state: &mut crate::model::State,
+    id: &str,
+    recipient: &str,
+    owner: bool,
+    accept: bool,
+) -> Result<()> {
     let transfer = state
         .transfers
-        .get_mut(&id)
-        .filter(|t| t.view.recipient_id == p.id)
+        .get_mut(id)
+        .filter(|t| t.view.recipient_id == recipient)
         .ok_or_else(Error::missing)?;
     if transfer.view.status != "pending" {
         return Err(Error::conflict("该请求已处理"));
     }
-    if !p.owner && (transfer.view.group_id.is_some() || transfer.view.sender_id != app.0.device_id)
-    {
+    if !owner && (transfer.view.group_id.is_some() || transfer.view.sender_id != app.0.device_id) {
         return Err(Error::forbidden());
     }
     if accept
-        && p.owner
+        && owner
         && transfer
             .files
             .iter()
@@ -992,13 +989,13 @@ async fn decision(
             .receive_directories
             .lock()
             .unwrap()
-            .insert(id.clone(), directory);
+            .insert(id.to_owned(), directory);
     }
     transfer.view.status = if !accept {
         "rejected"
     } else if transfer.files.is_empty() {
         "completed"
-    } else if !p.owner
+    } else if !owner
         || transfer.incoming_remote
         || transfer
             .files
@@ -1016,12 +1013,45 @@ async fn decision(
     if accept {
         transfer.view.created = now();
     }
+
+    transfer.view.error = None;
+    Ok(())
+}
+async fn auto_receive(app: &App, state: &mut crate::model::State, id: &str) {
+    let transfer = &state.transfers[id];
+    if transfer.view.status != "pending" || !automatically_received(&transfer.view.files) {
+        return;
+    }
+    let recipient = transfer.view.recipient_id.clone();
+    let owner = recipient == app.0.device_id;
+    if let Err(error) = set_decision(app, state, id, &recipient, owner, true).await {
+        // Leave the offer pending so the recipient can retry after fixing storage.
+        state.transfers.get_mut(id).unwrap().view.error = Some(format!("自动接收未完成：{error}"));
+    }
+}
+fn release_acceptance(app: &App, id: &str) {
+    app.0
+        .space_leases
+        .lock()
+        .unwrap()
+        .remove(&format!("incoming:{id}"));
+    app.0.receive_directories.lock().unwrap().remove(id);
+}
+async fn decision(
+    AxState(app): AxState<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(value): Json<Value>,
+) -> Result<Json<Value>> {
+    let p = app.principal(token(&headers)?).await?;
+    let accept = value["accept"]
+        .as_bool()
+        .ok_or_else(|| Error::bad("缺少接收决定"))?;
+    app.cache_transfer(&id).await?;
+    let mut state = app.0.state.lock().await;
+    set_decision(&app, &mut state, &id, &p.id, p.owner, accept).await?;
     if let Err(error) = app.commit(&mut state).await {
-        app.0
-            .space_leases
-            .lock()
-            .unwrap()
-            .remove(&format!("incoming:{id}"));
+        release_acceptance(&app, &id);
         return Err(error);
     }
     drop(state);
@@ -1502,7 +1532,6 @@ async fn peer_offer(
         .get(&recipient)
         .map(|d| d.name.clone())
         .unwrap_or(info.name);
-    let text_only_group = offer.group_id.is_some() && offer.files.is_empty();
     let view = TransferView {
         id: id.clone(),
         message_id: offer.message_id,
@@ -1514,12 +1543,7 @@ async fn peer_offer(
         recipient_name,
         text: offer.text,
         files: offer.files,
-        status: if text_only_group {
-            "completed"
-        } else {
-            "pending"
-        }
-        .into(),
+        status: "pending".into(),
         bytes: 0,
         total,
         created: now(),
@@ -1535,7 +1559,11 @@ async fn peer_offer(
             reserved: 0,
         },
     );
-    app.commit(&mut state).await?;
+    auto_receive(&app, &mut state, &id).await;
+    if let Err(error) = app.commit(&mut state).await {
+        release_acceptance(&app, &id);
+        return Err(error);
+    }
     drop(state);
     app.notify();
     Ok(Json(OfferResponse { id, token }))

@@ -300,6 +300,21 @@ impl Host {
         assert_eq!(response.status(), StatusCode::OK);
         let target = response.json::<Value>().await.unwrap()["id"].clone();
         let draft = sender.draft(files).await;
+        for file in draft["files"].as_array().unwrap() {
+            let response = Client::new()
+                .put(format!(
+                    "{}/api/drafts/{}/files/{}",
+                    sender.url,
+                    draft["id"].as_str().unwrap(),
+                    file["id"].as_str().unwrap()
+                ))
+                .bearer_auth(&sender.token)
+                .body(vec![0u8; file["size"].as_u64().unwrap() as usize])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
         let result = sender
             .post(
                 &format!("/api/drafts/{}/send", draft["id"].as_str().unwrap()),
@@ -369,7 +384,7 @@ async fn random_ports_persistent_identity_and_no_public_credentials() {
     restarted.stop();
 }
 #[tokio::test]
-async fn browser_pairing_isolation_and_text_acceptance() {
+async fn browser_pairing_isolation_and_automatic_text_reception() {
     let host = Host::new("电脑").await;
     let client = Client::new();
     assert_eq!(
@@ -414,6 +429,7 @@ async fn browser_pairing_isolation_and_text_acceptance() {
     assert_eq!(response.status(), StatusCode::OK);
     let incoming = host.wait_incoming().await;
     let id = incoming["id"].as_str().unwrap();
+    assert_eq!(incoming["status"], "completed");
     assert_eq!(
         host.state(&two).await["transfers"]
             .as_array()
@@ -439,7 +455,7 @@ async fn browser_pairing_isolation_and_text_acceptance() {
         )
         .await
         .status(),
-        StatusCode::OK
+        StatusCode::CONFLICT
     );
     assert_eq!(
         host.state(&one).await["transfers"][0]["status"],
@@ -456,23 +472,23 @@ async fn browser_pairing_isolation_and_text_acceptance() {
     );
 }
 #[tokio::test]
-async fn peer_text_accept_reject_and_cancel() {
+async fn peer_text_is_automatic_and_ordinary_files_can_be_rejected_or_cancelled() {
     let sender = Host::new("Windows").await;
     let receiver = Host::new("Android").await;
     let id = receiver.offer_from(&sender, "文字直达", json!([])).await;
     let incoming = receiver.wait_incoming().await;
     let remote = incoming["id"].as_str().unwrap();
-    assert_eq!(incoming["status"], "pending");
-    receiver
-        .post(
-            &format!("/api/transfers/{remote}/decision"),
-            json!({"accept":true}),
-        )
-        .await;
+    assert_eq!(incoming["status"], "completed");
     sender.wait_status(&id, "completed").await;
     receiver.wait_status(remote, "completed").await;
     let other = Host::new("拒绝端").await;
-    let id = other.offer_from(&sender, "拒绝这条", json!([])).await;
+    let id = other
+        .offer_from(
+            &sender,
+            "拒绝这条",
+            json!([{"name":"ordinary.bin","size":0}]),
+        )
+        .await;
     let incoming = other.wait_incoming().await;
     other
         .post(
@@ -485,7 +501,13 @@ async fn peer_text_accept_reject_and_cancel() {
         .await;
     sender.wait_status(&id, "rejected").await;
     let cancel = Host::new("取消端").await;
-    let id = cancel.offer_from(&sender, "取消这条", json!([])).await;
+    let id = cancel
+        .offer_from(
+            &sender,
+            "取消这条",
+            json!([{"name":"ordinary.bin","size":0}]),
+        )
+        .await;
     let incoming = cancel.wait_incoming().await;
     sender
         .post(&format!("/api/transfers/{id}/cancel"), json!({}))
@@ -686,7 +708,23 @@ async fn multiple_browser_recipients_have_independent_decisions() {
     let two = host.pair("二").await;
     let target1 = host.state(&one).await["me"]["id"].clone();
     let target2 = host.state(&two).await["me"]["id"].clone();
-    let draft = host.draft(json!([])).await;
+    let draft = host.draft(json!([{"name":"ordinary.bin","size":0}])).await;
+    assert_eq!(
+        Client::new()
+            .put(format!(
+                "{}/api/drafts/{}/files/{}",
+                host.url,
+                draft["id"].as_str().unwrap(),
+                draft["files"][0]["id"].as_str().unwrap()
+            ))
+            .bearer_auth(&host.token)
+            .body(Vec::<u8>::new())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     let response = host
         .post(
             &format!("/api/drafts/{}/send", draft["id"].as_str().unwrap()),
@@ -719,5 +757,5 @@ async fn multiple_browser_recipients_have_independent_decisions() {
         .iter()
         .map(|t| t["status"].as_str().unwrap())
         .collect();
-    assert!(statuses.contains(&"completed") && statuses.contains(&"rejected"));
+    assert!(statuses.contains(&"accepted") && statuses.contains(&"rejected"));
 }

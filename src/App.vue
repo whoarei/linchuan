@@ -167,6 +167,7 @@ const preview = ref<{ url: string; name: string }>();
 const thumbnails = ref<Record<string, string>>({});
 const decisionBusy = ref(new Set<string>());
 const thumbnailRequests = new Set<string>();
+const autoDownloads = new Set<string>();
 let thumbnailBytes = 0;
 let poll: ReturnType<typeof setInterval>;
 let draftTimer: ReturnType<typeof setTimeout>;
@@ -397,7 +398,7 @@ async function refresh() {
     ready.value = true;
     if (!shareAddress.value)
       shareAddress.value = state.value.info.addresses[0] || address();
-    if (selected.value && mode.value === "devices" && !historyBusy.value)
+    if (selected.value && (mode.value === "devices" || !next.me.owner) && !historyBusy.value)
       await loadMessages(false);
   } catch (error) {
     if (requestToken !== token()) return;
@@ -751,19 +752,26 @@ async function blobUrl(file: MessageFile) {
 }
 async function loadThumbnails(id: string, list: Message[]) {
   for (const message of list) {
+    const delivery = incomingActive(message);
+    const automatic = browserOnly.value && delivery &&
+      message.files.every((file) => file.mime.startsWith("image/"));
     for (const file of message.files) {
+      if (disposed || id !== selected.value) return;
       const key = message.id + file.id;
-      if (
-        !file.available ||
-        !raster(file) ||
-        file.size > 4 * 1024 ** 2 ||
-        thumbnailBytes + file.size > 32 * 1024 ** 2 ||
-        thumbnails.value[key] ||
-        thumbnailRequests.has(key)
-      )
+      if (!file.available || thumbnails.value[key] || thumbnailRequests.has(key)) continue;
+      if (!raster(file) || file.size > 4 * 1024 ** 2 ||
+          thumbnailBytes + file.size > 32 * 1024 ** 2) {
+        // Larger images use the browser download manager instead of an in-memory Blob.
+        const downloadKey = delivery?.id + ":" + file.id;
+        if (automatic && !autoDownloads.has(downloadKey)) {
+          autoDownloads.add(downloadKey);
+          await download(file, message.id);
+        }
         continue;
+      }
       thumbnailRequests.add(key);
       thumbnailBytes += file.size;
+      let retained = false;
       try {
         const url = await blobUrl(file);
         if (id !== selected.value || disposed) {
@@ -771,7 +779,13 @@ async function loadThumbnails(id: string, list: Message[]) {
           continue;
         }
         thumbnails.value[key] = url;
-      } catch {}
+        retained = true;
+      } catch {} finally {
+        if (id === selected.value && !disposed) {
+          thumbnailRequests.delete(key);
+          if (!retained) thumbnailBytes -= file.size;
+        }
+      }
     }
   }
 }
@@ -996,6 +1010,7 @@ function sessionChanged() {
   text.value = "";
   files.value = [];
   fileCache.clear();
+  autoDownloads.clear();
   releaseThumbnails();
   closePreview();
   state.value = undefined;

@@ -102,14 +102,14 @@ test("two applications exchange directly in the new three-column layout", async 
   await a.page
     .getByRole("textbox", { name: "发送文字" })
     .fill("应用之间直接传输");
-  await a.page.getByRole("button", { name: "发送", exact: true }).click();
+  await a.page.getByRole("textbox", { name: "发送文字" }).press("Control+Enter");
   await b.page
     .getByRole("button", { name: "打开 测试电脑", exact: true })
     .click();
   const card = b.page
     .locator(".message")
     .filter({ hasText: "应用之间直接传输" });
-  await card.getByRole("button", { name: "接收", exact: true }).click();
+  await expect(card.getByRole("button", { name: "接收", exact: true })).toHaveCount(0);
   await expect(
     a.page
       .locator(".message")
