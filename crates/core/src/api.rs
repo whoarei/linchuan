@@ -56,6 +56,7 @@ impl From<std::io::Error> for Error {
     }
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
 pub(crate) fn token(headers: &HeaderMap) -> Result<&str> {
     headers
         .get("authorization")
@@ -116,6 +117,7 @@ pub fn router(app: App) -> Router {
             put(upload_draft).layer(DefaultBodyLimit::disable()),
         )
         .route("/api/drafts/{id}/send", post(send))
+        .route("/api/drafts/{id}/cancel", post(discard_draft))
         .route("/api/transfers/{id}/decision", post(decision))
         .route("/api/transfers/{id}/cancel", post(cancel))
         .route("/api/transfers/{id}/files/{file}/ticket", post(ticket))
@@ -294,8 +296,9 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
         .get(&p.id)
         .map(|d| d.platform.as_str())
         .unwrap_or("浏览器");
+    let available = app.0.space.available(app.cache_location()).await.ok();
     Ok(Json(
-        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner,"platform":platform,"auto_name":p.owner.then(|| crate::names::for_id(&p.id))}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_limit":MAX_STORAGE}),
+        json!({"me": {"id":p.id,"name":p.name,"owner":p.owner,"platform":platform,"auto_name":p.owner.then(|| crate::names::for_id(&p.id))}, "info":info,"devices":devices,"transfers":transfers,"conversations":conversations,"groups":groups,"storage_used":state.reserved,"storage_available":available,"storage_headroom":crate::storage::DISK_HEADROOM}),
     ))
 }
 async fn settings(
@@ -379,15 +382,18 @@ fn validate_files(files: &[FileInput]) -> Result<u64> {
     if files.len() > 64 {
         return Err(Error::bad("一次最多发送 64 个文件"));
     }
-    let mut total = 0;
+    let mut total = 0u64;
     for file in files {
-        if !crate::safe_filename(&file.name) || file.size > MAX_FILE || file.mime.len() > 128 {
-            return Err(Error::bad("文件名无效或单文件超过 2 GiB"));
+        if !crate::safe_filename(&file.name)
+            || file.size > crate::storage::MAX_EXACT_SIZE
+            || file.mime.len() > 128
+        {
+            return Err(Error::bad("文件名、大小或类型无效"));
         }
-        total += file.size;
-    }
-    if total > MAX_STORAGE {
-        return Err(Error::bad("本次文件总量超过 10 GiB"));
+        total = total
+            .checked_add(file.size)
+            .filter(|n| *n <= crate::storage::MAX_EXACT_SIZE)
+            .ok_or_else(|| Error::bad("文件总大小超出可表示范围"))?;
     }
     Ok(total)
 }
@@ -400,12 +406,11 @@ async fn create_draft(
     let total = validate_files(&request.files)?;
     let id = uid();
     let mut state = app.0.state.lock().await;
-    if state.reserved + total > MAX_STORAGE || state.drafts.len() >= 256 {
+    if state.drafts.len() >= 256 {
         return Err(Error::conflict(
             "临时空间不足或草稿过多，请稍后重试或重启应用清理",
         ));
     }
-    tokio::fs::create_dir(app.0.work.join(&id)).await?;
     let files: Vec<_> = request
         .files
         .into_iter()
@@ -424,6 +429,18 @@ async fn create_draft(
             }
         })
         .collect();
+    let lease = app
+        .0
+        .space
+        .reserve(
+            files
+                .iter()
+                .map(|f| (f.meta.id.clone(), app.cache_location(), f.meta.size))
+                .collect(),
+        )
+        .await
+        .map_err(Error::conflict)?;
+    tokio::fs::create_dir(app.0.work.join(&id)).await?;
     let response = DraftResponse {
         id: id.clone(),
         files: files.iter().map(|f| f.meta.clone()).collect(),
@@ -432,30 +449,58 @@ async fn create_draft(
     state.drafts.insert(
         id.clone(),
         Draft {
-            id,
+            id: id.clone(),
             owner: p.id,
             files,
             created: now(),
             sent: false,
         },
     );
+    app.0
+        .space_leases
+        .lock()
+        .unwrap()
+        .insert(format!("draft:{id}"), lease);
     Ok(Json(response))
 }
-async fn write_file(body: Body, file: &StoredFile, progress: Option<(App, String)>) -> Result<()> {
+async fn write_file(
+    body: Body,
+    file: &StoredFile,
+    progress: Option<(App, String)>,
+    space: Option<crate::storage::Progress>,
+) -> Result<()> {
     let part = file.path.with_extension("part");
     let result = async {
         let mut output = tokio::fs::File::create(&part).await?;
+        if let Some(space) = &space {
+            space.set(0);
+            space.check().map_err(Error::conflict)?;
+        }
         let mut stream = body.into_data_stream();
         let mut count = 0u64;
         let mut last_progress = std::time::Instant::now();
-        while let Some(chunk) = stream.next().await {
+        let mut idle_deadline = tokio::time::Instant::now() + crate::storage::IDLE_TIMEOUT;
+        while let Some(chunk) = tokio::time::timeout_at(idle_deadline, stream.next())
+            .await
+            .map_err(|_| Error::bad("连续 5 分钟未收到文件数据，请重新发送"))?
+        {
             let chunk = chunk.map_err(|_| Error::bad("上传中断，请重新发送"))?;
+            if chunk.is_empty() {
+                continue;
+            }
+            idle_deadline = tokio::time::Instant::now() + crate::storage::IDLE_TIMEOUT;
             count += chunk.len() as u64;
             if count > file.meta.size {
                 return Err(Error::bad("上传内容超过声明的大小"));
             }
             output.write_all(&chunk).await?;
+            if let Some(space) = &space {
+                space.set(count);
+            }
             if last_progress.elapsed() >= std::time::Duration::from_millis(200) {
+                if let Some(space) = &space {
+                    space.check().map_err(Error::conflict)?;
+                }
                 if let Some((app, id)) = progress.as_ref() {
                     let mut state = app.0.state.lock().await;
                     let transfer = state.transfers.get_mut(id).ok_or_else(Error::missing)?;
@@ -488,6 +533,9 @@ async fn write_file(body: Body, file: &StoredFile, progress: Option<(App, String
     .await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(&part).await;
+        if let Some(space) = &space {
+            space.set(0);
+        }
     }
     result
 }
@@ -524,12 +572,32 @@ async fn upload_draft(
         file.uploading = true;
         file.clone()
     };
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(3600),
-        write_file(body, &file, None),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::bad("上传超时")));
+    let result = async {
+        let space = app.space_progress(&file.meta.id, &app.cache_location());
+        if space.is_some() {
+            write_file(body, &file, None, space).await
+        } else {
+            // A retry after a failed upload must acquire space again.
+            let lease = app
+                .0
+                .space
+                .reserve(vec![(
+                    file.meta.id.clone(),
+                    app.cache_location(),
+                    file.meta.size,
+                )])
+                .await
+                .map_err(Error::conflict)?;
+            write_file(
+                body,
+                &file,
+                None,
+                lease.progress(&file.meta.id, &app.cache_location()),
+            )
+            .await
+        }
+    }
+    .await;
     let mut state = app.0.state.lock().await;
     if let Some(file) = state
         .drafts
@@ -539,7 +607,53 @@ async fn upload_draft(
         file.uploading = false;
         file.complete = result.is_ok();
     }
+    if let Some(draft) = state.drafts.get_mut(&id) {
+        draft.created = now();
+    }
+    if result.is_err() {
+        app.0
+            .space_leases
+            .lock()
+            .unwrap()
+            .remove(&format!("draft:{id}"));
+    }
     result?;
+    Ok(Json(json!({"ok":true})))
+}
+async fn discard_draft(
+    AxState(app): AxState<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let p = app.principal(token(&headers)?).await?;
+    let mut state = app.0.state.lock().await;
+    let draft = state
+        .drafts
+        .get(&id)
+        .filter(|d| d.owner == p.id)
+        .ok_or_else(Error::missing)?;
+    if draft.sent {
+        return Err(Error::conflict("该草稿已发送"));
+    }
+    // Active writers hold their own lease until their request has stopped.
+    app.0
+        .space_leases
+        .lock()
+        .unwrap()
+        .remove(&format!("draft:{id}"));
+    if draft.files.iter().any(|f| f.uploading) {
+        return Err(Error::conflict("上传正在结束，请稍后重试"));
+    }
+    let bytes: u64 = draft.files.iter().map(|f| f.meta.size).sum();
+    match tokio::fs::remove_dir_all(app.0.work.join(&draft.id)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    state.drafts.remove(&id);
+    state.reserved = state.reserved.saturating_sub(bytes);
+    drop(state);
+    app.notify();
     Ok(Json(json!({"ok":true})))
 }
 async fn send(
@@ -751,6 +865,48 @@ async fn decision(
     if transfer.view.status != "pending" {
         return Err(Error::conflict("该请求已处理"));
     }
+    if accept {
+        let incoming_space = app
+            .0
+            .space_leases
+            .lock()
+            .unwrap()
+            .get(&format!("incoming:{id}"))
+            .cloned();
+        if let Some(lease) = incoming_space {
+            lease.check().map_err(Error::conflict)?;
+        }
+        if p.id == app.0.device_id && !transfer.files.is_empty() {
+            let directory = app
+                .receive_directory()
+                .await
+                .map_err(|e| Error::storage(e.to_string()))?;
+            if !directory.is_empty() {
+                let requests = transfer
+                    .files
+                    .iter()
+                    .map(|f| {
+                        (
+                            format!("export:{}:{}", transfer.view.message_id, f.meta.id),
+                            directory.clone(),
+                            f.meta.size,
+                        )
+                    })
+                    .collect();
+                let lease = app
+                    .0
+                    .space
+                    .reserve(requests)
+                    .await
+                    .map_err(Error::conflict)?;
+                app.0
+                    .space_leases
+                    .lock()
+                    .unwrap()
+                    .insert(format!("export:{id}"), lease);
+            }
+        }
+    }
     transfer.view.status = if !accept {
         "rejected"
     } else if transfer.incoming_remote {
@@ -762,7 +918,14 @@ async fn decision(
     if transfer.view.status == "completed" {
         transfer.view.bytes = transfer.view.total;
     }
-    app.commit(&mut state).await?;
+    if let Err(error) = app.commit(&mut state).await {
+        app.0
+            .space_leases
+            .lock()
+            .unwrap()
+            .remove(&format!("export:{id}"));
+        return Err(error);
+    }
     drop(state);
     app.notify();
     Ok(Json(json!({"ok":true})))
@@ -1009,19 +1172,30 @@ async fn peer_offer(
     {
         return Err(Error::conflict("消息已收录，请勿重复发送"));
     }
-    if state.reserved + total > MAX_STORAGE
-        || state
-            .transfers
-            .values()
-            .filter(|t| !t.view.terminal() && t.incoming_remote)
-            .count()
-            >= 32
+    if state
+        .transfers
+        .values()
+        .filter(|t| !t.view.terminal() && t.incoming_remote)
+        .count()
+        >= 32
     {
-        return Err(Error::conflict("接收队列或文件空间已满"));
+        return Err(Error::conflict("接收队列已满"));
     }
     let id = uid();
     let token = secret();
     let path = app.0.directory.join("files").join(&id);
+    let lease = app
+        .0
+        .space
+        .reserve(
+            offer
+                .files
+                .iter()
+                .map(|f| (f.id.clone(), app.cache_location(), f.size))
+                .collect(),
+        )
+        .await
+        .map_err(Error::conflict)?;
     tokio::fs::create_dir(&path).await?;
     let files = offer
         .files
@@ -1073,6 +1247,11 @@ async fn peer_offer(
         },
     );
     app.commit(&mut state).await?;
+    app.0
+        .space_leases
+        .lock()
+        .unwrap()
+        .insert(format!("incoming:{id}"), lease);
     drop(state);
     app.notify();
     Ok(Json(OfferResponse { id, token }))
@@ -1130,12 +1309,8 @@ async fn peer_upload(
         file.clone()
     };
     app.notify();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(3600),
-        write_file(body, &file, Some((app.clone(), id.clone()))),
-    )
-    .await
-    .unwrap_or_else(|_| Err(Error::bad("上传超时")));
+    let space = app.space_progress(&file.meta.id, &app.cache_location());
+    let result = write_file(body, &file, Some((app.clone(), id.clone())), space).await;
     let mut state = app.0.state.lock().await;
     let t = authorized_transfer(&mut state, &id, token(&headers)?)?;
     let active = matches!(t.view.status.as_str(), "accepted" | "transferring");
@@ -1270,4 +1445,50 @@ async fn logout(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<V
     drop(state);
     app.notify();
     Ok(Json(json!({"ok":true})))
+}
+
+#[cfg(test)]
+mod transfer_timeout_tests {
+    use super::*;
+    fn file(path: std::path::PathBuf, size: u64) -> StoredFile {
+        StoredFile {
+            path,
+            meta: FileMeta {
+                id: "file".into(),
+                name: "file".into(),
+                size,
+                mime: String::new(),
+            },
+            complete: false,
+            uploading: true,
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn progressing_upload_can_run_longer_than_one_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = file(dir.path().join("large"), 18);
+        let body = Body::from_stream(futures_util::stream::unfold(0, |n| async move {
+            if n == 18 {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(240)).await;
+            Some((Ok::<_, std::io::Error>(vec![b'x']), n + 1))
+        }));
+        let start = tokio::time::Instant::now();
+        write_file(body, &target, None, None).await.unwrap();
+        assert!(start.elapsed() > std::time::Duration::from_secs(3600));
+        assert_eq!(std::fs::read(target.path).unwrap(), vec![b'x'; 18]);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn idle_upload_times_out_and_removes_partial_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = file(dir.path().join("idle"), 1);
+        let body = Body::from_stream(futures_util::stream::pending::<
+            std::result::Result<Vec<u8>, std::io::Error>,
+        >());
+        let error = write_file(body, &target, None, None).await.unwrap_err();
+        assert!(error.to_string().contains("5 分钟"));
+        assert!(!target.path.exists());
+        assert!(!target.path.with_extension("part").exists());
+    }
 }

@@ -11,6 +11,7 @@ import {
   Download,
   File,
   FolderOpen,
+  FolderInput,
   Image as ImageIcon,
   Info,
   Link,
@@ -82,6 +83,7 @@ const downloadsUrl = "https://github.com/whoarei/linchuan/releases/latest";
 const {
   settings: receiveSettings,
   busy: receiveBusy,
+  fileBusy,
   receipt,
   loadSettings: loadReceiveSettings,
   loadReceipts,
@@ -89,6 +91,7 @@ const {
   openDirectory,
   openFile: openSavedFile,
   saveFile,
+  relocateFile,
 } = useReceiving(notify);
 const {
   state: updateState,
@@ -545,8 +548,8 @@ function flushDraft() {
 function addFiles(items: File[]) {
   if (sending.value || !canWrite.value) return;
   for (const file of items) {
-    if (file.size > 2 * 1024 ** 3) {
-      notify(`${file.name} 超过 2 GiB`, true);
+    if (!Number.isSafeInteger(file.size) || file.size < 0) {
+      notify(`${file.name} 的大小无法读取`, true);
       continue;
     }
     if (files.value.length >= 64) {
@@ -589,6 +592,8 @@ async function send() {
   uploadTotal.value = selectedFiles.reduce((n, f) => n + f.size, 0);
   controller = new AbortController();
   const signal = controller.signal;
+  let preparedDraft = "";
+  let sent = false;
   try {
     const draft = await api<{ id: string; files: FileMeta[] }>("/api/drafts", {
       files: selectedFiles.map((f) => ({
@@ -597,6 +602,7 @@ async function send() {
         mime: f.type,
       })),
     });
+    preparedDraft = draft.id;
     let count = 0;
     for (let i = 0; i < selectedFiles.length; i++) {
       await upload(
@@ -613,6 +619,7 @@ async function send() {
       targets: conversation.kind === "direct" ? [conversation.peer_id] : [],
       group_id: conversation.group_id,
     });
+    sent = true;
     fileCache.set(conversation.id, []);
     if (selected.value === conversation.id) {
       text.value = "";
@@ -623,6 +630,17 @@ async function send() {
   } catch (error) {
     notify((error as Error).message, true);
   } finally {
+    if (preparedDraft && !sent) {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          await api(`/api/drafts/${preparedDraft}/cancel`, {});
+          break;
+        } catch (error) {
+          if (!(error instanceof ApiError) || error.status !== 409) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+    }
     sending.value = false;
     controller = undefined;
   }
@@ -1403,6 +1421,12 @@ onUnmounted(() => {
                     role="group"
                     :aria-label="`${file.name} 的文件操作`"
                   >
+                    <LoaderCircle
+                      v-if="fileBusy.has(`${message.id}:${file.id}`)"
+                      class="spin"
+                      :size="16"
+                      aria-label="正在处理文件"
+                    />
                     <button
                       v-if="
                         file.available &&
@@ -1417,22 +1441,37 @@ onUnmounted(() => {
                       <ImageIcon :size="17" />
                     </button>
                     <button
-                      v-if="file.available"
+                      v-if="
+                        file.available &&
+                        (!native ||
+                          receipt(message.id, file.id)?.status === 'failed')
+                      "
                       class="icon-button"
                       :disabled="
                         receipt(message.id, file.id)?.status === 'pending'
                       "
-                      :aria-label="`${native ? (receipt(message.id, file.id)?.status === 'failed' ? '重新保存' : '保存副本') : '下载'} ${file.name}`"
-                      :title="
-                        native
-                          ? receipt(message.id, file.id)?.status === 'failed'
-                            ? '重新保存到接收目录'
-                            : '保存副本到接收目录'
-                          : '下载'
-                      "
+                      :aria-label="`${native ? '重新保存' : '下载'} ${file.name}`"
+                      :title="native ? '重新保存到接收目录' : '下载'"
                       @click="download(file, message.id)"
                     >
                       <Download :size="18" />
+                    </button>
+                    <button
+                      v-if="
+                        native &&
+                        (file.available ||
+                          receipt(message.id, file.id)?.status === 'saved')
+                      "
+                      class="icon-button"
+                      :disabled="
+                        fileBusy.has(`${message.id}:${file.id}`) ||
+                        receipt(message.id, file.id)?.status === 'pending'
+                      "
+                      :aria-label="`复制到其他位置 ${file.name}`"
+                      title="复制到其他位置"
+                      @click="relocateFile(message.id, file)"
+                    >
+                      <Copy :size="18" />
                     </button>
                     <template
                       v-if="
@@ -1440,6 +1479,15 @@ onUnmounted(() => {
                         receipt(message.id, file.id)?.status === 'saved'
                       "
                     >
+                      <button
+                        class="icon-button"
+                        :disabled="fileBusy.has(`${message.id}:${file.id}`)"
+                        :aria-label="`移动到其他位置 ${file.name}`"
+                        title="移动到其他位置"
+                        @click="relocateFile(message.id, file, true)"
+                      >
+                        <FolderInput :size="18" />
+                      </button>
                       <button
                         class="icon-button"
                         :aria-label="`打开所在文件夹 ${file.name}`"
@@ -1477,6 +1525,11 @@ onUnmounted(() => {
                     ><span class="file-label"
                       ><b>{{ file.name }}</b
                       ><small
+                        :title="
+                          receipt(message.id, file.id)?.status === 'saved'
+                            ? receipt(message.id, file.id)?.location
+                            : undefined
+                        "
                         >{{ size(file.size)
                         }}<template
                           v-if="
@@ -1830,9 +1883,14 @@ onUnmounted(() => {
         <div class="card-heading">
           <div>
             <h2>本地存储</h2>
+            <p>应用文件与任务占用 {{ size(state!.storage_used) }}</p>
             <p>
-              已使用 {{ size(state!.storage_used) }} /
-              {{ size(state!.storage_limit) }}
+              {{
+                state!.storage_available == null
+                  ? "暂时无法读取磁盘剩余空间"
+                  : `当前还可分配 ${size(state!.storage_available)}`
+              }}
+              · 默认预留 2 GiB
             </p>
           </div>
           <button
@@ -1843,10 +1901,7 @@ onUnmounted(() => {
             <Trash2 :size="16" />清理文件缓存
           </button>
         </div>
-        <progress
-          :value="state!.storage_used"
-          :max="state!.storage_limit"
-        /><small
+        <small
           >文字和历史记录保存在本机。清理缓存不会删除接收目录中的文件；待保存或保存失败的副本暂不清理。</small
         >
       </section>

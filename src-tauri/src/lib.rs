@@ -109,6 +109,7 @@ pub fn run() {
             receiving::reset_receive_directory,
             receiving::received_files,
             receiving::save_received_file,
+            receiving::relocate_received_file,
             receiving::open_received_file,
             receiving::open_receive_directory
         ])

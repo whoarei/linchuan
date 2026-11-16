@@ -13,6 +13,8 @@ interface SavedFile {
   name: string;
   status: "pending" | "saved" | "failed";
   error: string | null;
+  location: string;
+  directory: string;
 }
 
 export function useReceiving(
@@ -20,6 +22,7 @@ export function useReceiving(
 ) {
   const settings = ref<ReceiveSettings>();
   const busy = ref(false);
+  const fileBusy = reactive(new Set<string>());
   const records = reactive(new Map<string, SavedFile>());
   const key = (message: string, file: string) => `${message}:${file}`;
   const receipt = (message: string, file: string) =>
@@ -91,9 +94,47 @@ export function useReceiving(
       report(String(error), true);
     }
   }
+  async function relocateFile(
+    message: string,
+    file: MessageFile,
+    moveFile = false,
+  ) {
+    const id = key(message, file.id);
+    if (fileBusy.has(id)) return;
+    fileBusy.add(id);
+    try {
+      const result = await invoke<{ name: string; location: string } | null>(
+        "relocate_received_file",
+        {
+          messageId: message,
+          fileId: file.id,
+          transferId: file.transfer_id,
+          moveFile,
+        },
+      );
+      if (!result) return;
+      if (moveFile) {
+        try {
+          await loadReceipts([message]);
+        } catch {
+          report("文件已移动，状态刷新失败，请重新打开会话", true);
+          return;
+        }
+      }
+      report(
+        moveFile ? "已移动，文件位置已更新" : "已复制，原文件位置保持不变",
+      );
+    } catch (error) {
+      if (moveFile) await loadReceipts([message]).catch(() => {});
+      report(String(error), true);
+    } finally {
+      fileBusy.delete(id);
+    }
+  }
   return {
     settings,
     busy,
+    fileBusy,
     receipt,
     loadSettings,
     loadReceipts,
@@ -101,5 +142,6 @@ export function useReceiving(
     openDirectory,
     openFile,
     saveFile,
+    relocateFile,
   };
 }

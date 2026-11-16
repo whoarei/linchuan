@@ -57,6 +57,29 @@ fn default_directory(app: &tauri::AppHandle) -> String {
 }
 
 pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let handle = app.clone();
+        core.set_space_probe(std::sync::Arc::new(move |directory| {
+            let handle = handle.clone();
+            Box::pin(async move {
+                if directory == "@downloads" || directory.starts_with("content://") {
+                    mobile::<linchuan_core::storage::DiskSpace>(
+                        handle,
+                        "storageInfo",
+                        serde_json::json!({"directory":directory}),
+                    )
+                    .await
+                } else {
+                    tauri::async_runtime::spawn_blocking(move || {
+                        linchuan_core::storage::disk_space(std::path::Path::new(&directory))
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                }
+            })
+        }));
+    }
     core.configure_receiving(default_directory(&app))
         .await
         .map_err(|e| e.to_string())?;
@@ -70,17 +93,8 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
 async fn save(app: tauri::AppHandle, job: SaveJob) -> Result<SaveLocation, String> {
     #[cfg(target_os = "android")]
     {
-        mobile(
-            app,
-            "saveFile",
-            serde_json::json!({
-                "sourcePath": job.source.to_string_lossy(),
-                "name": job.name,
-                "mime": job.mime,
-                "directory": job.directory,
-            }),
-        )
-        .await
+        let input = std::fs::File::open(&job.source).map_err(|e| e.to_string())?;
+        save_android(app, job, input).await
     }
     #[cfg(not(target_os = "android"))]
     {
@@ -89,6 +103,205 @@ async fn save(app: tauri::AppHandle, job: SaveJob) -> Result<SaveLocation, Strin
             .await
             .map_err(|e| e.to_string())?
     }
+}
+
+#[cfg(target_os = "android")]
+async fn save_android(
+    app: tauri::AppHandle,
+    job: SaveJob,
+    input: std::fs::File,
+) -> Result<SaveLocation, String> {
+    use std::os::fd::FromRawFd;
+    #[derive(serde::Deserialize)]
+    struct Output {
+        fd: i32,
+        location: String,
+    }
+    let output: Output = mobile(
+        app.clone(),
+        "beginFile",
+        serde_json::json!({"name":job.name,"mime":job.mime,"directory":job.directory}),
+    )
+    .await?;
+    // Kotlin detaches ownership of this descriptor to Rust in beginFile.
+    let target = unsafe { std::fs::File::from_raw_fd(output.fd) };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        linchuan_core::receiving::copy_stream(input, target, job.progress.as_ref())
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|v| v);
+    let value = match result {
+        Ok(()) => {
+            mobile(
+                app.clone(),
+                "completeFile",
+                serde_json::json!({"location":output.location}),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    if value.is_err() {
+        let _ = delete_location(app, output.location).await;
+    }
+    value
+}
+
+async fn delete_location(app: tauri::AppHandle, location: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        mobile::<serde_json::Value>(app, "deleteFile", serde_json::json!({"location":location}))
+            .await
+            .map(|_| ())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = app;
+        tauri::async_runtime::spawn_blocking(move || {
+            std::fs::remove_file(location).map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
+async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        #[derive(serde::Deserialize)]
+        struct Pick {
+            directory: Option<String>,
+        }
+        mobile::<Pick>(app, "pickDirectory", serde_json::json!({}))
+            .await
+            .map(|v| v.directory)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri_plugin_dialog::DialogExt;
+        tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .file()
+                .set_title("选择目标目录")
+                .blocking_pick_folder()
+                .map(|file| {
+                    file.into_path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .map_err(|e| e.to_string())
+                })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .transpose()
+    }
+}
+
+static FILE_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tauri::command]
+pub async fn relocate_received_file(
+    app: tauri::AppHandle,
+    message_id: String,
+    file_id: String,
+    transfer_id: String,
+    move_file: bool,
+    runtime: State<'_, Runtime>,
+) -> Result<Option<SaveLocation>, String> {
+    let _operation = FILE_OPERATIONS.lock().await;
+    let core = runtime.0.get().ok_or("服务尚未就绪")?;
+    let source = core
+        .saved_files(vec![message_id.clone()])
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|r| r.file_id == file_id && r.status == "saved");
+    if move_file && source.is_none() {
+        return Err("文件尚未保存完成".into());
+    }
+    let Some(directory) = pick_directory(app.clone()).await? else {
+        return Ok(None);
+    };
+    let _permit = core.active_file_operation().await?;
+    let mut job = if let Some(record) = &source {
+        SaveJob {
+            message_id: message_id.clone(),
+            file_id: file_id.clone(),
+            source: record.location.clone().into(),
+            name: linchuan_core::receiving::safe_name(&record.name),
+            mime: record.mime.clone(),
+            directory: directory.clone(),
+            size: 0,
+            progress: None,
+        }
+    } else {
+        let mut job = core.cached_file(&transfer_id, &file_id).await?;
+        if job.message_id != message_id {
+            return Err("文件不属于此消息".into());
+        }
+        job.directory = directory.clone();
+        job
+    };
+    #[cfg(target_os = "android")]
+    let input = {
+        use std::os::fd::FromRawFd;
+        #[derive(serde::Deserialize)]
+        struct Input {
+            fd: i32,
+        }
+        let value: Input = mobile(
+            app.clone(),
+            "openInput",
+            serde_json::json!({"location":job.source.to_string_lossy()}),
+        )
+        .await?;
+        // openInput detaches the descriptor; this File now owns and closes it.
+        unsafe { std::fs::File::from_raw_fd(value.fd) }
+    };
+    #[cfg(not(target_os = "android"))]
+    let input =
+        std::fs::File::open(&job.source).map_err(|e| format!("文件已移动、删除或无法读取：{e}"))?;
+    job.size = input.metadata().map_err(|e| e.to_string())?.len();
+    let size = job.size;
+    let copy_app = app.clone();
+    let copy = move |progress| async move {
+        job.progress = progress;
+        #[cfg(target_os = "android")]
+        {
+            save_android(copy_app, job, input).await
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = copy_app;
+            // Hold the original open until the operation finishes; the folder
+            // helper reads the same source path and never overwrites a target.
+            let _input = input;
+            tauri::async_runtime::spawn_blocking(move || {
+                linchuan_core::receiving::save_to_folder(job)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
+    };
+    let value = if let Some(record) = source {
+        core.relocate_saved_file(record, size, directory, move_file, copy, move |location| {
+            delete_location(app.clone(), location)
+        })
+        .await?
+    } else {
+        let tag = uuid_tag();
+        let progress = core.reserve_copy(tag.clone(), directory, size).await?;
+        let result = copy(progress).await;
+        core.finish_copy(&tag);
+        result?
+    };
+    Ok(Some(value))
+}
+
+fn uuid_tag() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!("copy:{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Serialize)]
@@ -238,7 +451,7 @@ pub async fn open_received_file(
         use tauri_plugin_opener::OpenerExt;
         let path = std::path::PathBuf::from(record.location);
         if !path.is_file() {
-            return Err("文件已移动或删除，可点击保存副本重新保存".into());
+            return Err("文件已在外部移动或删除，原位置已失效".into());
         }
         if folder {
             app.opener()

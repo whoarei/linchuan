@@ -93,5 +93,6 @@ export interface AppState {
   groups: Group[];
   transfers: Transfer[];
   storage_used: number;
-  storage_limit: number;
+  storage_available: number | null;
+  storage_headroom: number;
 }

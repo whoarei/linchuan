@@ -7,6 +7,7 @@ mod model;
 mod names;
 mod preferences;
 pub mod receiving;
+pub mod storage;
 mod store;
 mod transport;
 pub mod updates;
@@ -50,6 +51,8 @@ struct Inner {
     events: broadcast::Sender<()>,
     client: reqwest::Client,
     streams: Semaphore,
+    space: storage::SpaceBudget,
+    space_leases: std::sync::Mutex<std::collections::HashMap<String, storage::Reservation>>,
     mdns: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
     stop: tokio::sync::watch::Sender<bool>,
 }
@@ -145,6 +148,8 @@ impl App {
                 .no_proxy()
                 .build()?,
             streams: Semaphore::new(MAX_STREAMS),
+            space: storage::SpaceBudget::default(),
+            space_leases: std::sync::Mutex::new(std::collections::HashMap::new()),
             mdns: std::sync::Mutex::new(None),
             stop,
         }));
@@ -207,6 +212,19 @@ impl App {
         state.link_conversations(&self.0.device_id);
         match self.0.store.save(state.clone()).await {
             Ok(()) => {
+                {
+                    let mut leases = self.0.space_leases.lock().unwrap();
+                    for t in state.transfers.values().filter(|t| t.view.terminal()) {
+                        leases.remove(&format!("incoming:{}", t.view.id));
+                        if t.view.status != "completed" {
+                            leases.remove(&format!("export:{}", t.view.id));
+                        }
+                    }
+                    for d in state.drafts.values().filter(|d| d.sent) {
+                        leases.remove(&format!("draft:{}", d.id));
+                    }
+                    leases.retain(|_, lease| !lease.finished());
+                }
                 // Active tasks stay cached; old completed history remains queryable in SQLite.
                 if state.transfers.len() > 500 {
                     let mut finished: Vec<_> = state
@@ -326,6 +344,9 @@ impl App {
                 matches!(transfer.view.status.as_str(), "accepted" | "transferring")
             })
     }
+    pub async fn active_file_operation(&self) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        self.0.streams.acquire().await.map_err(|e| e.to_string())
+    }
     fn notify(&self) {
         let _ = self.0.events.send(());
     }
@@ -364,11 +385,17 @@ impl App {
             .drafts
             .iter()
             .filter(|(_, d)| {
-                now().saturating_sub(d.created) > if d.sent { RETENTION } else { 3600 }
+                !d.files.iter().any(|file| file.uploading)
+                    && now().saturating_sub(d.created) > if d.sent { RETENTION } else { 3600 }
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
+            self.0
+                .space_leases
+                .lock()
+                .unwrap()
+                .remove(&format!("draft:{id}"));
             if let Some(d) = state.drafts.remove(&id) {
                 state.reserved = state.reserved.saturating_sub(if d.sent {
                     0
@@ -475,6 +502,7 @@ fn capabilities() -> Vec<String> {
         "groups-v1".into(),
         "signed-offers-v1".into(),
         "history-v1".into(),
+        "dynamic-storage-v1".into(),
     ]
 }
 

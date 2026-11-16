@@ -115,11 +115,31 @@ export function upload(
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", base + path);
     xhr.setRequestHeader("Authorization", `Bearer ${credential}`);
-    xhr.timeout = 3600_000;
+    xhr.timeout = 0;
+    let lastLoaded = 0;
+    let idleTimer: ReturnType<typeof setTimeout>;
+    let idle = false;
+    const resetIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idle = true;
+        xhr.abort();
+      }, 5 * 60_000);
+    };
     const abort = () => xhr.abort();
     signal.addEventListener("abort", abort, { once: true });
-    const done = () => signal.removeEventListener("abort", abort);
-    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    const done = () => {
+      clearTimeout(idleTimer);
+      signal.removeEventListener("abort", abort);
+    };
+    xhr.upload.onprogress = (e) => {
+      if (e.loaded > lastLoaded) {
+        lastLoaded = e.loaded;
+        resetIdle();
+      }
+      onProgress(e.loaded);
+    };
+    xhr.upload.onload = resetIdle;
     xhr.onload = () => {
       done();
       if (xhr.status >= 200 && xhr.status < 300) resolve();
@@ -141,13 +161,16 @@ export function upload(
     };
     xhr.onabort = () => {
       done();
-      reject(new Error("已取消上传"));
+      reject(
+        new Error(idle ? "连续 5 分钟无上传进度，请重新发送" : "已取消上传"),
+      );
     };
     if (signal.aborted) {
       done();
       reject(new Error("已取消上传"));
       return;
     }
+    resetIdle();
     xhr.send(file);
   });
 }

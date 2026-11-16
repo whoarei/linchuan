@@ -157,7 +157,7 @@ direct 必须有 peer_id、没有 group_id；group 相反。唯一约束分别�
 
 ### 4.9 attachments：附件声明
 
-主键 (message_id, file_id)，外键 message_id → messages。字段：name TEXT、size INTEGER、mime TEXT、position INTEGER。单文件最多 2 GiB，每次最多 64 个，元数据与消息同时写入；不以用户文件名构造磁盘路径。
+主键 (message_id, file_id)，外键 message_id → messages。字段：name TEXT、size INTEGER、mime TEXT、position INTEGER。单文件按动态磁盘空间准入，每次最多 64 个，元数据与消息同时写入；不以用户文件名构造磁盘路径。大小及单批总量必须可由浏览器 JSON 数字精确表示，累计使用检查过的加法，避免溢出和精度丢失。
 
 ### 4.10 deliveries：每位接收者的传输结果
 
@@ -224,7 +224,7 @@ conversation_id TEXT PRIMARY KEY REFERENCES conversations、text TEXT、updated_
 ## 8. 文件生命周期与重启恢复
 
 - 完成附件默认保留，不因启动或 24 小时自动删除；设置提供清理文件缓存入口，历史正文和文件卡片保留。
-- 10 GiB 本地预算包含持久文件及活动上传；空间不足时提示先清理。清理跳过正在上传、传输或引用中的文件。
+- 动态预算按磁盘标识归组，扣除活动任务尚未写入的字节和默认 2 GiB 预留空间；已写入的缓存与历史文件通过系统报告的空闲空间体现，避免重复扣减。接收时一并预留自动导出副本，取消、拒绝、失败或复制结束后释放相应预留。清理跳过正在上传、传输或引用中的文件。
 - 启动时检查 schema、迁移设置、恢复已知设备/群/会话、将中断任务终结、核对附件是否存在、清理已失效的 staging。
 - 过期浏览器凭证和临时下载 ticket 不授予历史读取权限。新启动的 owner token 与配对码继续随机生成。
 - 会话和消息查询按已认证 principal_id 过滤；不能通过修改 conversation_id、message_id 或 file_id 访问他人的记录。

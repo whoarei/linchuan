@@ -60,6 +60,28 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         .get(id)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("传输已过期"))?;
+    if transfer
+        .files
+        .iter()
+        .any(|f| f.meta.size > 2 * 1024 * 1024 * 1024)
+    {
+        let peer: serde_json::Value = app
+            .0
+            .client
+            .get(format!("{address}/api/info"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::ensure!(
+            peer["capabilities"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == "dynamic-storage-v1")),
+            "对方版本仅支持单文件 2 GiB，请先升级接收端"
+        );
+    }
     let mut offer = Offer {
         protocol: 1,
         message_id: transfer.view.message_id.clone(),
@@ -129,12 +151,17 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
                 chunk
             });
             let upload=app.0.client.put(format!("{endpoint}/files/{}",file.meta.id)).bearer_auth(&remote.token).header("content-length",file.meta.size)
-                .body(reqwest::Body::wrap_stream(stream)).timeout(Duration::from_secs(3600)).send();
+                .body(reqwest::Body::wrap_stream(stream)).send();
             tokio::pin!(upload);
+            let mut last_bytes = 0;
+            let mut last_progress = Instant::now();
             let response=loop{tokio::select!{
                 response=&mut upload=>break response?,
                 _=tokio::time::sleep(Duration::from_millis(300))=>{if !active(app,id).await{return Ok(());}
-                    update(app,id,"transferring",bytes+progress.load(std::sync::atomic::Ordering::Relaxed)).await;}
+                    let count = progress.load(std::sync::atomic::Ordering::Relaxed);
+                    if count > last_bytes { last_bytes = count; last_progress = Instant::now(); }
+                    anyhow::ensure!(last_progress.elapsed() < crate::storage::IDLE_TIMEOUT, "连续 5 分钟无文件传输进度，请重新发送");
+                    update(app,id,"transferring",bytes+count).await;}
             }};
             anyhow::ensure!(response.status().is_success(),"文件传输失败，对方可能已取消或磁盘空间不足");
             bytes+=file.meta.size;

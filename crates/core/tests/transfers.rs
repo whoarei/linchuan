@@ -13,6 +13,157 @@ struct Host {
 }
 
 #[tokio::test]
+async fn files_above_old_limits_use_available_space_and_reservations() {
+    let host = Host::new("动态空间").await;
+    host.app.set_space_probe(std::sync::Arc::new(|path| {
+        Box::pin(async move {
+            let mut disk = linchuan_core::storage::disk_space(std::path::Path::new(&path))?;
+            disk.available = 32 * 1024 * 1024 * 1024;
+            Ok(disk)
+        })
+    }));
+    let response = host
+        .post(
+            "/api/drafts",
+            json!({"files":[{"name":"eleven-gib.bin","size":11u64*1024*1024*1024}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let draft = response.json::<Value>().await.unwrap();
+    let response = host
+        .post(
+            "/api/drafts",
+            json!({"files":[{"name":"another.bin","size":20u64*1024*1024*1024}]}),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(response.text().await.unwrap().contains("磁盘空间不足"));
+    assert_eq!(
+        host.post(
+            &format!("/api/drafts/{}/cancel", draft["id"].as_str().unwrap()),
+            json!({})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        host.post(
+            "/api/drafts",
+            json!({"files":[{"name":"after-cancel.bin","size":20u64*1024*1024*1024}]})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    host.app.stop();
+}
+
+#[tokio::test]
+async fn files_larger_than_two_gib_stream_upload_and_download_intact() {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    let host = Host::new("大文件流式验证").await;
+    let recipient = host.pair("大文件接收浏览器").await;
+    let recipient_id = host.state(&recipient).await["me"]["id"].clone();
+    let size = 2u64 * 1024 * 1024 * 1024 + 17;
+    let draft = host
+        .draft(json!([{"name":"over-two-gib.bin","size":size}]))
+        .await;
+    let digest = std::sync::Arc::new(std::sync::Mutex::new(Sha256::new()));
+    let expected = digest.clone();
+    let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        (0u64, digest),
+        move |(offset, digest)| async move {
+            if offset == size {
+                return None;
+            }
+            let count = (size - offset).min(1024 * 1024) as usize;
+            let chunk = vec![(offset / (1024 * 1024) % 251) as u8; count];
+            digest.lock().unwrap().update(&chunk);
+            Some((
+                Ok::<_, std::io::Error>(chunk),
+                (offset + count as u64, digest),
+            ))
+        },
+    ));
+    let client = Client::new();
+    let response = client
+        .put(format!(
+            "{}/api/drafts/{}/files/{}",
+            host.url,
+            draft["id"].as_str().unwrap(),
+            draft["files"][0]["id"].as_str().unwrap()
+        ))
+        .bearer_auth(&host.token)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        response.text().await.unwrap()
+    );
+    let sent = host
+        .post(
+            &format!("/api/drafts/{}/send", draft["id"].as_str().unwrap()),
+            json!({"targets":[recipient_id],"text":"大文件验证"}),
+        )
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    let id = sent["ids"][0].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(format!("{}/api/transfers/{id}/decision", host.url))
+            .bearer_auth(&recipient)
+            .json(&json!({"accept":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let ticket: Value = client
+        .post(format!(
+            "{}/api/transfers/{id}/files/{}/ticket",
+            host.url,
+            draft["files"][0]["id"].as_str().unwrap()
+        ))
+        .bearer_auth(&recipient)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut stream = client
+        .get(format!("{}{}", host.url, ticket["url"].as_str().unwrap()))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let mut actual = Sha256::new();
+    let mut downloaded = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        downloaded += chunk.len() as u64;
+        actual.update(&chunk);
+    }
+    assert_eq!(downloaded, size);
+    assert_eq!(
+        actual.finalize(),
+        expected.lock().unwrap().clone().finalize()
+    );
+    host.app.stop();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+}
+
+#[tokio::test]
 async fn updater_preflight_detects_incoming_transfer_and_file_preparation() {
     let host = Host::new("更新检查").await;
     assert!(!host.app.has_active_work().await);
@@ -443,7 +594,7 @@ async fn unsafe_paths_limits_partial_upload_and_premature_completion() {
     assert_eq!(
         host.post(
             "/api/drafts",
-            json!({"files":[{"name":"large.bin","size":2147483649u64}]})
+            json!({"files":[{"name":"invalid-size.bin","size":u64::MAX}]})
         )
         .await
         .status(),

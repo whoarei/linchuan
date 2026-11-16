@@ -223,6 +223,147 @@ fn start_saver(app: &App) -> tokio::task::JoinHandle<()> {
     })
 }
 
+async fn relocate_saved(
+    app: &App,
+    record: linchuan_core::receiving::SavedFile,
+    target: &std::path::Path,
+    moving: bool,
+    deny_delete: bool,
+) -> Result<linchuan_core::receiving::SaveLocation, String> {
+    use linchuan_core::receiving::{save_to_folder, SaveJob};
+    let size = std::fs::metadata(&record.location).unwrap().len();
+    let original = record.location.clone();
+    let directory = target.to_string_lossy().into_owned();
+    let job = SaveJob {
+        message_id: record.message_id.clone(),
+        file_id: record.file_id.clone(),
+        source: record.location.clone().into(),
+        name: record.name.clone(),
+        mime: record.mime.clone(),
+        directory: directory.clone(),
+        size,
+        progress: None,
+    };
+    app.relocate_saved_file(
+        record,
+        size,
+        directory,
+        moving,
+        move |progress| async move {
+            tokio::task::spawn_blocking(move || save_to_folder(SaveJob { progress, ..job }))
+                .await
+                .unwrap()
+        },
+        move |path| {
+            let original = original.clone();
+            async move {
+                if deny_delete && path == original {
+                    Err("模拟原文件删除被拒绝".into())
+                } else {
+                    tokio::fs::remove_file(path)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+            }
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn copy_preserves_location_and_move_updates_it_after_cache_cleanup_and_restart() {
+    let sender = Host::new("发送").await;
+    let mut receiver = Host::new("接收").await;
+    let downloads = TempDir::new().unwrap();
+    let copies = TempDir::new().unwrap();
+    let moved = TempDir::new().unwrap();
+    receiver
+        .app
+        .configure_receiving(downloads.path().to_string_lossy().into())
+        .await
+        .unwrap();
+    let saver = start_saver(&receiver.app);
+    let (message, _, _) = incoming_file(&sender, &receiver, b"original file contents").await;
+    let original = saved(&receiver.app, &message, "saved").await;
+    std::fs::write(copies.path().join(&original.name), b"existing target").unwrap();
+    let copy = relocate_saved(&receiver.app, original.clone(), copies.path(), false, false)
+        .await
+        .unwrap();
+    assert_ne!(copy.name, original.name);
+    assert_eq!(
+        std::fs::read(&copy.location).unwrap(),
+        b"original file contents"
+    );
+    assert_eq!(
+        std::fs::read(copies.path().join(&original.name)).unwrap(),
+        b"existing target"
+    );
+    assert_eq!(
+        saved(&receiver.app, &message, "saved").await.location,
+        original.location
+    );
+    receiver.post("/api/storage/clear", json!({})).await;
+    let value = relocate_saved(&receiver.app, original.clone(), moved.path(), true, false)
+        .await
+        .unwrap();
+    assert!(!std::path::Path::new(&original.location).exists());
+    assert_eq!(
+        saved(&receiver.app, &message, "saved").await.location,
+        value.location
+    );
+    saver.abort();
+    receiver.restart().await;
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(record.location, value.location);
+    assert_eq!(record.directory, moved.path().to_string_lossy());
+    assert_eq!(
+        std::fs::read(&record.location).unwrap(),
+        b"original file contents"
+    );
+    assert!(std::path::Path::new(&copy.location).is_file());
+}
+
+#[tokio::test]
+async fn move_failure_keeps_original_file_and_record_and_removes_target_copy() {
+    let sender = Host::new("发送").await;
+    let receiver = Host::new("接收").await;
+    let downloads = TempDir::new().unwrap();
+    let target = TempDir::new().unwrap();
+    receiver
+        .app
+        .configure_receiving(downloads.path().to_string_lossy().into())
+        .await
+        .unwrap();
+    let saver = start_saver(&receiver.app);
+    let (message, _, _) = incoming_file(&sender, &receiver, b"keep me").await;
+    let original = saved(&receiver.app, &message, "saved").await;
+    let error = relocate_saved(&receiver.app, original.clone(), target.path(), true, true)
+        .await
+        .unwrap_err();
+    assert!(error.contains("原文件和记录保留"));
+    assert_eq!(
+        saved(&receiver.app, &message, "saved").await.location,
+        original.location
+    );
+    assert_eq!(std::fs::read(&original.location).unwrap(), b"keep me");
+    assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    // A failed SQLite update must also keep the original and remove the new copy.
+    let db = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER deny_move BEFORE UPDATE ON saved_files BEGIN SELECT RAISE(ABORT, 'deny move'); END;").unwrap();
+    assert!(
+        relocate_saved(&receiver.app, original.clone(), target.path(), true, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        saved(&receiver.app, &message, "saved").await.location,
+        original.location
+    );
+    assert_eq!(std::fs::read(&original.location).unwrap(), b"keep me");
+    assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
+    saver.abort();
+}
+
 async fn saved(app: &App, message: &str, expected: &str) -> linchuan_core::receiving::SavedFile {
     for _ in 0..200 {
         if let Some(record) = app
@@ -406,6 +547,8 @@ fn exported_filenames_are_portable_and_cannot_escape_the_directory() {
             name: name.into(),
             mime: "application/octet-stream".into(),
             directory: output.to_string_lossy().into_owned(),
+            size: 5,
+            progress: None,
         })
         .unwrap();
         assert_eq!(

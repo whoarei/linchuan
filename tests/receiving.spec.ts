@@ -20,6 +20,7 @@ async function client(browser: Browser, mobile = false) {
         calls: [] as { command: string; args: any }[],
         cancel: false,
         failPicker: false,
+        fileLocation: "/home/user/Downloads/邻传/自动保存.txt",
       });
       scope.__TAURI_INTERNALS__ = {
         async invoke(command: string, args: any = {}) {
@@ -44,6 +45,18 @@ async function client(browser: Browser, mobile = false) {
             return { directory: state.directory, label: state.directory };
           }
           if (command === "save_received_file") state.status = "saved";
+          if (command === "relocate_received_file") {
+            if (state.cancel) {
+              state.cancel = false;
+              return null;
+            }
+            if (state.failPicker) {
+              state.failPicker = false;
+              throw new Error("模拟移动失败，原文件和记录保留");
+            }
+            if (args.moveFile) state.fileLocation = "/other/自动保存.txt";
+            return { name: "自动保存.txt", location: "/other/自动保存.txt" };
+          }
           if (command === "received_files") {
             const response = await fetch(boot.address + "/api/state", {
               headers: { Authorization: `Bearer ${boot.token}` },
@@ -63,6 +76,8 @@ async function client(browser: Browser, mobile = false) {
                   name: f.name,
                   status: state.status,
                   error: state.status === "failed" ? "磁盘空间不足" : null,
+                  location: state.fileLocation,
+                  directory: state.directory,
                 })),
               );
           }
@@ -132,13 +147,11 @@ test("native saved files open through IPC after cache cleanup and failures can r
   await page
     .getByRole("button", { name: "连接 测试电脑", exact: true })
     .click();
-  await page
-    .locator("input[type=file]")
-    .setInputFiles({
-      name: "自动保存.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from("saved bytes"),
-    });
+  await page.locator("input[type=file]").setInputFiles({
+    name: "自动保存.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("saved bytes"),
+  });
   await page
     .getByRole("textbox", { name: "发送文字" })
     .fill("自动保存到固定目录");
@@ -160,6 +173,55 @@ test("native saved files open through IPC after cache cleanup and failures can r
   });
   await message.getByRole("button", { name: "重新保存 自动保存.txt" }).click();
   await expect(message).toContainText("已保存");
+  const savedLocation = message.locator(".file-label small");
+  await expect(savedLocation).toHaveAttribute(
+    "title",
+    "/home/user/Downloads/邻传/自动保存.txt",
+  );
+  await message
+    .getByRole("button", { name: "复制到其他位置 自动保存.txt" })
+    .click();
+  await expect(host.page.getByRole("status")).toHaveText(
+    "已复制，原文件位置保持不变",
+  );
+  await expect(savedLocation).toHaveAttribute(
+    "title",
+    "/home/user/Downloads/邻传/自动保存.txt",
+  );
+  await host.page.evaluate(() => ((window as any).__receiving.cancel = true));
+  await message
+    .getByRole("button", { name: "移动到其他位置 自动保存.txt" })
+    .click();
+  await expect(savedLocation).toHaveAttribute(
+    "title",
+    "/home/user/Downloads/邻传/自动保存.txt",
+  );
+  await host.page.evaluate(
+    () => ((window as any).__receiving.failPicker = true),
+  );
+  await message
+    .getByRole("button", { name: "移动到其他位置 自动保存.txt" })
+    .click();
+  await expect(host.page.getByRole("status")).toContainText("原文件和记录保留");
+  await expect(savedLocation).toHaveAttribute(
+    "title",
+    "/home/user/Downloads/邻传/自动保存.txt",
+  );
+  await message
+    .getByRole("button", { name: "移动到其他位置 自动保存.txt" })
+    .click();
+  await expect(host.page.getByRole("status")).toHaveText(
+    "已移动，文件位置已更新",
+  );
+  await expect(savedLocation).toHaveAttribute("title", "/other/自动保存.txt");
+  await expect(message.locator(".attachment-actions").getByRole("button")).toHaveCount(4);
+  await message.locator(".message-attachments").screenshot({ path: ".playwright/file-actions-desktop.png" });
+  await host.page.setViewportSize({ width: 390, height: 844 });
+  await expect(message.getByRole("button", { name: "复制到其他位置 自动保存.txt" })).toBeVisible();
+  await expect(message.getByRole("button", { name: "移动到其他位置 自动保存.txt" })).toBeVisible();
+  expect(await host.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await message.locator(".message-attachments").screenshot({ path: ".playwright/file-actions-mobile.png" });
+  await host.page.setViewportSize({ width: 1180, height: 820 });
   await message
     .getByRole("button", { name: "打开文件 自动保存.txt", exact: true })
     .click();

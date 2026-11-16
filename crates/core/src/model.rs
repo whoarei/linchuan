@@ -6,8 +6,6 @@ use std::{
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const MAX_FILE: u64 = 2 * 1024 * 1024 * 1024;
-pub const MAX_STORAGE: u64 = 10 * 1024 * 1024 * 1024;
 pub const RETENTION: u64 = 24 * 60 * 60;
 pub fn now() -> u64 {
     SystemTime::now()

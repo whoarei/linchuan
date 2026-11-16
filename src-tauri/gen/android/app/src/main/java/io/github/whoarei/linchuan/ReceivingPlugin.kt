@@ -10,6 +10,10 @@ import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.os.StatFs
+import android.os.storage.StorageManager
+import android.system.Os
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -38,6 +42,143 @@ class ReceiveOptions {
 @TauriPlugin(permissions = [Permission(alias = "legacy-storage", strings = [Manifest.permission.WRITE_EXTERNAL_STORAGE])])
 class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
   private val resolver get() = activity.contentResolver
+
+  @Command
+  fun storageInfo(invoke: Invoke) {
+    try {
+      val directory = invoke.parseArgs(ReceiveOptions::class.java).directory
+      val root: File
+      val target: File
+      if (directory == "@downloads") {
+        root = Environment.getExternalStorageDirectory()
+        target = File(root, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
+      } else {
+        val uri = Uri.parse(directory)
+        if (uri.authority != "com.android.externalstorage.documents")
+          throw Exception("所选文档提供器无法查询本地磁盘空间，请选择本机存储目录")
+        val id = DocumentsContract.getTreeDocumentId(uri)
+        val volume = id.substringBefore(':')
+        root = if (volume.equals("primary", true)) Environment.getExternalStorageDirectory()
+          else if (Build.VERSION.SDK_INT >= 30) {
+            activity.getSystemService(StorageManager::class.java).storageVolumes
+              .firstOrNull { it.uuid.equals(volume, true) }?.directory ?: throw Exception("存储卷不可用")
+          } else File("/storage/$volume")
+        target = File(root, id.substringAfter(':', ""))
+        val canonicalRoot = root.canonicalPath
+        if (target.canonicalPath != canonicalRoot && !target.canonicalPath.startsWith(canonicalRoot + File.separator))
+          throw Exception("目录不属于所选存储卷")
+      }
+      var existing = target
+      while (!existing.isDirectory) existing = existing.parentFile ?: throw Exception("目标磁盘不可用")
+      // Emulated shared storage and private app storage consume the same /data volume.
+      val physical = if (Environment.isExternalStorageEmulated(root)) Environment.getDataDirectory() else existing
+      invoke.resolve(JSObject().put("volume", "unix:${Os.stat(physical.absolutePath).st_dev}")
+        .put("available", StatFs(existing.absolutePath).availableBytes).put("path", existing.absolutePath))
+    } catch (e: Exception) { invoke.reject("无法检查目标剩余空间：${e.message}") }
+  }
+
+  @Command
+  fun beginFile(invoke: Invoke) {
+    val args = invoke.parseArgs(ReceiveOptions::class.java)
+    if (args.directory == "@downloads" && Build.VERSION.SDK_INT < 29 &&
+      activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+      requestPermissionForAlias("legacy-storage", invoke, "outputPermissionResult")
+      return
+    }
+    Thread {
+      var location: String? = null
+      try {
+        val descriptor: ParcelFileDescriptor
+        if (args.directory == "@downloads" && Build.VERSION.SDK_INT >= 29) {
+          val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, args.name)
+            put(MediaStore.Downloads.MIME_TYPE, args.mime)
+            put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
+            put(MediaStore.Downloads.IS_PENDING, 1)
+          }
+          val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw Exception("无法创建文件")
+          location = uri.toString()
+          descriptor = resolver.openFileDescriptor(uri, "w") ?: throw Exception("目标目录不可写")
+        } else if (args.directory.startsWith("content://")) {
+          val tree = Uri.parse(args.directory)
+          val id = DocumentsContract.getTreeDocumentId(tree)
+          val parent = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+          val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id)
+          val names = mutableSetOf<String>()
+          resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
+            while (it.moveToNext()) names.add(it.getString(0))
+          }
+          val name = (0..9999).asSequence().map { numbered(args.name, it) }.firstOrNull { it !in names }
+            ?: throw Exception("同名文件过多")
+          val uri = DocumentsContract.createDocument(resolver, parent, args.mime, name) ?: throw Exception("无法创建文件")
+          location = uri.toString()
+          descriptor = resolver.openFileDescriptor(uri, "w") ?: throw Exception("目标目录不可写")
+        } else {
+          val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "邻传")
+          if (!folder.isDirectory && !folder.mkdirs()) throw Exception("无法创建下载目录")
+          val target = (0..9999).asSequence().map { File(folder, numbered(args.name, it)) }.firstOrNull { it.createNewFile() }
+            ?: throw Exception("同名文件过多")
+          location = target.absolutePath
+          descriptor = ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_WRITE_ONLY)
+        }
+        invoke.resolve(JSObject().put("fd", descriptor.detachFd()).put("location", location))
+      } catch (e: Exception) {
+        location?.let { try { removeLocation(it) } catch (_: Exception) {} }
+        invoke.reject("无法创建目标文件：${e.message}")
+      }
+    }.start()
+  }
+
+  @PermissionCallback
+  fun outputPermissionResult(invoke: Invoke) {
+    if (activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) beginFile(invoke)
+    else invoke.reject("未获得存储权限")
+  }
+
+  @Command
+  fun completeFile(invoke: Invoke) {
+    try {
+      val location = invoke.parseArgs(ReceiveOptions::class.java).location
+      val name = if (location.startsWith("content://")) {
+        val uri = Uri.parse(location)
+        if (uri.authority == "media" && Build.VERSION.SDK_INT >= 29) {
+          if (resolver.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null) != 1)
+            throw Exception("无法完成文件保存")
+        }
+        displayName(uri) ?: "file"
+      } else {
+        val file = File(location)
+        MediaScannerConnection.scanFile(activity, arrayOf(location), null, null)
+        file.name
+      }
+      invoke.resolve(result(name, location))
+    } catch (e: Exception) { invoke.reject("保存未完成：${e.message}") }
+  }
+
+  @Command
+  fun openInput(invoke: Invoke) {
+    try {
+      val location = invoke.parseArgs(ReceiveOptions::class.java).location
+      val descriptor = if (location.startsWith("content://")) resolver.openFileDescriptor(Uri.parse(location), "r")
+        else ParcelFileDescriptor.open(File(location), ParcelFileDescriptor.MODE_READ_ONLY)
+      invoke.resolve(JSObject().put("fd", (descriptor ?: throw Exception("文件不可读")).detachFd()))
+    } catch (e: Exception) { invoke.reject("原文件已移动、删除或无法读取：${e.message}") }
+  }
+
+  private fun removeLocation(location: String) {
+    val removed = if (location.startsWith("content://")) {
+      val uri = Uri.parse(location)
+      if (DocumentsContract.isDocumentUri(activity, uri)) DocumentsContract.deleteDocument(resolver, uri)
+      else resolver.delete(uri, null, null) > 0
+    } else File(location).delete()
+    if (!removed) throw Exception("原文件未能删除")
+  }
+
+  @Command
+  fun deleteFile(invoke: Invoke) {
+    try { removeLocation(invoke.parseArgs(ReceiveOptions::class.java).location); invoke.resolve(JSObject()) }
+    catch (e: Exception) { invoke.reject(e.message) }
+  }
 
   @Command
   fun describeDirectory(invoke: Invoke) {
@@ -75,91 +216,11 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
     } catch (e: Exception) { invoke.reject("无法保留目录授权：${e.message}") }
   }
 
-  @Command
-  fun saveFile(invoke: Invoke) {
-    val args = invoke.parseArgs(ReceiveOptions::class.java)
-    if (args.directory == "@downloads" && Build.VERSION.SDK_INT < 29 &&
-      activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-      requestPermissionForAlias("legacy-storage", invoke, "storagePermissionResult")
-      return
-    }
-    Thread {
-      try {
-        val result = if (args.directory != "@downloads") saveDocument(args)
-          else if (Build.VERSION.SDK_INT >= 29) saveDownload(args) else saveLegacy(args)
-        invoke.resolve(result)
-      } catch (e: Exception) { invoke.reject("保存失败，请检查目录权限和剩余空间：${e.message}") }
-    }.start()
-  }
-
-  @PermissionCallback
-  fun storagePermissionResult(invoke: Invoke) {
-    if (activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) saveFile(invoke)
-    else invoke.reject("未获得存储权限，文件仍保留在应用内，可在授权后重试或更改接收目录")
-  }
-
   private fun displayName(uri: Uri): String? = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
     if (it.moveToFirst()) it.getString(0) else null
   }
 
   private fun result(name: String, location: String) = JSObject().put("name", name).put("location", location)
-
-  @android.annotation.TargetApi(29)
-  private fun saveDownload(args: ReceiveOptions): JSObject {
-    val values = ContentValues().apply {
-      put(MediaStore.Downloads.DISPLAY_NAME, args.name)
-      put(MediaStore.Downloads.MIME_TYPE, args.mime)
-      put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
-      put(MediaStore.Downloads.IS_PENDING, 1)
-    }
-    val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw Exception("无法创建下载文件")
-    try {
-      copyToUri(args.sourcePath, uri)
-      val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
-      if (resolver.update(uri, done, null, null) != 1) throw Exception("无法完成文件保存")
-      return result(displayName(uri) ?: args.name, uri.toString())
-    } catch (e: Exception) { resolver.delete(uri, null, null); throw e }
-  }
-
-  private fun saveDocument(args: ReceiveOptions): JSObject {
-    val tree = Uri.parse(args.directory)
-    val id = DocumentsContract.getTreeDocumentId(tree)
-    val parent = DocumentsContract.buildDocumentUriUsingTree(tree, id)
-    val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, id)
-    val names = mutableSetOf<String>()
-    resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
-      while (it.moveToNext()) names.add(it.getString(0))
-    }
-    val name = (0..9999).asSequence().map { numbered(args.name, it) }.firstOrNull { it !in names }
-      ?: throw Exception("同名文件过多")
-    val uri = DocumentsContract.createDocument(resolver, parent, args.mime, name) ?: throw Exception("无法创建文件")
-    try {
-      copyToUri(args.sourcePath, uri)
-      return result(displayName(uri) ?: name, uri.toString())
-    } catch (e: Exception) { DocumentsContract.deleteDocument(resolver, uri); throw e }
-  }
-
-  private fun copyToUri(source: String, uri: Uri) {
-    File(source).inputStream().use { input ->
-      (resolver.openOutputStream(uri, "w") ?: throw Exception("目录不可写")).use { output -> input.copyTo(output) }
-    }
-  }
-
-  @Suppress("DEPRECATION")
-  private fun saveLegacy(args: ReceiveOptions): JSObject {
-    val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "邻传")
-    if (!folder.isDirectory && !folder.mkdirs()) throw Exception("无法创建下载目录")
-    val target = (0..9999).asSequence().map { File(folder, numbered(args.name, it)) }.firstOrNull { it.createNewFile() }
-      ?: throw Exception("同名文件过多")
-    try {
-      File(args.sourcePath).inputStream().use { input -> target.outputStream().use { output ->
-        input.copyTo(output)
-        output.fd.sync()
-      } }
-      MediaScannerConnection.scanFile(activity, arrayOf(target.absolutePath), arrayOf(args.mime), null)
-      return result(target.name, target.absolutePath)
-    } catch (e: Exception) { target.delete(); throw e }
-  }
 
   private fun numbered(name: String, number: Int): String {
     if (number == 0) return name
@@ -173,10 +234,10 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
       val location = invoke.parseArgs(ReceiveOptions::class.java).location
       val uri = if (location.startsWith("content://")) Uri.parse(location) else {
         val file = File(location)
-        if (!file.isFile) throw Exception("文件已移动或删除，可重新保存")
+        if (!file.isFile) throw Exception("文件已在外部移动或删除，原位置已失效")
         FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", file)
       }
-      resolver.openAssetFileDescriptor(uri, "r")?.close() ?: throw Exception("文件已移动或删除，可重新保存")
+      resolver.openAssetFileDescriptor(uri, "r")?.close() ?: throw Exception("文件已在外部移动或删除，原位置已失效")
       activity.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, resolver.getType(uri) ?: "application/octet-stream")
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
       invoke.resolve()
