@@ -16,11 +16,7 @@ fn bad(e: impl std::fmt::Display) -> Error {
 }
 fn valid_endpoint(d: &Device) -> bool {
     let native = uuid::Uuid::parse_str(&d.id).is_ok() && d.host_device_id == d.id;
-    let browser =
-        d.id.strip_prefix("browser-")
-            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok());
-    (native || browser)
-        && uuid::Uuid::parse_str(&d.host_device_id).is_ok()
+    native
         && hex::decode(&d.public_key).is_ok_and(|k| k.len() == 32)
         && crate::clean_name(&d.name).is_ok()
 }
@@ -53,13 +49,8 @@ pub fn apply(state: &mut State, env: &SignedEnvelope, owner: &str) -> Result<()>
             let target = env.payload["target_id"]
                 .as_str()
                 .ok_or_else(|| Error::bad("缺少邀请目标"))?;
-            if target != owner
-                && !state
-                    .sessions
-                    .values()
-                    .any(|s| s.id == target && s.expires > now())
-            {
-                return Err(Error::bad("邀请目标不存在或已失效"));
+            if target != owner {
+                return Err(Error::forbidden());
             }
             let mut group: Group =
                 serde_json::from_value(env.payload["group"].clone()).map_err(bad)?;
@@ -343,6 +334,9 @@ pub async fn create(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     let p = app.principal(token(&headers)?).await?;
+    if !p.owner {
+        return Err(Error::forbidden());
+    }
     let name = crate::clean_name(body["name"].as_str().unwrap_or("")).map_err(bad)?;
     let selected: Vec<String> = serde_json::from_value(body["members"].clone()).map_err(bad)?;
     let mut ids: HashSet<String> = selected.into_iter().collect();
@@ -398,6 +392,9 @@ pub async fn decide(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     let p = app.principal(token(&headers)?).await?;
+    if !p.owner {
+        return Err(Error::forbidden());
+    }
     let accept = body["accept"]
         .as_bool()
         .ok_or_else(|| Error::bad("缺少加入决定"))?;
@@ -426,6 +423,9 @@ pub async fn leave(
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
     let p = app.principal(token(&headers)?).await?;
+    if !p.owner {
+        return Err(Error::forbidden());
+    }
     let mut state = app.0.state.lock().await;
     let group = state.groups.get(&id).ok_or_else(Error::missing)?;
     let m = group
@@ -449,6 +449,9 @@ pub async fn invite(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     let p = app.principal(token(&headers)?).await?;
+    if !p.owner {
+        return Err(Error::forbidden());
+    }
     let ids: Vec<String> = serde_json::from_value(body["members"].clone()).map_err(bad)?;
     let name = body["name"]
         .as_str()

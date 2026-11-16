@@ -427,6 +427,8 @@ mod tests {
                     path: path.join("f"),
                     complete: false,
                     uploading: true,
+                    storage: crate::model::FileStorage::Cache,
+                    downloaded: false,
                 }],
             },
         );

@@ -19,7 +19,17 @@ pub async fn direct(
     let peer = body["device_id"]
         .as_str()
         .ok_or_else(|| Error::bad("请选择设备"))?;
+    if !principal.owner && peer != app.0.device_id {
+        return Err(Error::forbidden());
+    }
     let mut state = app.0.state.lock().await;
+    if state
+        .profiles
+        .get(peer)
+        .is_some_and(|d| d.kind == "browser" && d.host_device_id != app.0.device_id)
+    {
+        return Err(Error::forbidden());
+    }
     if peer == principal.id || !state.profiles.contains_key(peer) {
         return Err(Error::bad("设备不存在"));
     }
@@ -49,11 +59,12 @@ pub async fn timeline(
     let p = app.principal(token(&headers)?).await?;
     {
         let state = app.0.state.lock().await;
-        if state
-            .conversations
-            .get(&id)
-            .is_none_or(|c| c.principal_id != p.id)
-        {
+        if state.conversations.get(&id).is_none_or(|c| {
+            c.principal_id != p.id
+                || (!p.owner
+                    && (c.kind != "direct"
+                        || c.peer_id.as_deref() != Some(app.0.device_id.as_str())))
+        }) {
             return Err(Error::missing());
         }
     }
@@ -92,11 +103,12 @@ pub async fn read(
     let p = app.principal(token(&headers)?).await?;
     {
         let state = app.0.state.lock().await;
-        if state
-            .conversations
-            .get(&id)
-            .is_none_or(|c| c.principal_id != p.id)
-        {
+        if state.conversations.get(&id).is_none_or(|c| {
+            c.principal_id != p.id
+                || (!p.owner
+                    && (c.kind != "direct"
+                        || c.peer_id.as_deref() != Some(app.0.device_id.as_str())))
+        }) {
             return Err(Error::missing());
         }
     }
@@ -125,11 +137,11 @@ pub async fn draft(
         return Err(Error::bad("草稿超过 64 KiB"));
     }
     let mut state = app.0.state.lock().await;
-    if state
-        .conversations
-        .get(&id)
-        .is_none_or(|c| c.principal_id != p.id)
-    {
+    if state.conversations.get(&id).is_none_or(|c| {
+        c.principal_id != p.id
+            || (!p.owner
+                && (c.kind != "direct" || c.peer_id.as_deref() != Some(app.0.device_id.as_str())))
+    }) {
         return Err(Error::missing());
     }
     state.composition.insert(id, text.into());
@@ -186,7 +198,7 @@ pub async fn clear_files(AxState(app): AxState<App>, headers: HeaderMap) -> Resu
             t.reserved = t
                 .files
                 .iter()
-                .filter(|f| f.complete && f.path.is_file())
+                .filter(|f| f.available())
                 .map(|f| f.meta.size)
                 .sum();
         }

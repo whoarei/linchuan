@@ -211,6 +211,55 @@ async fn incoming_file(sender: &Host, receiver: &Host, bytes: &[u8]) -> (String,
     (message, id, file)
 }
 
+async fn legacy_cached_file(receiver: &Host, bytes: &[u8]) -> (String, String, String) {
+    let browser = receiver.pair("旧版上传页面").await;
+    let draft: Value = receiver
+        .post_as(
+            "/api/drafts",
+            json!({"files":[{"name":"持久文件.txt","size":bytes.len(),"mime":"text/plain"}]}),
+            &browser,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let id = draft["id"].as_str().unwrap();
+    let file = draft["files"][0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        Client::new()
+            .put(format!("{}/api/drafts/{id}/files/{file}", receiver.url))
+            .bearer_auth(&browser)
+            .body(bytes.to_vec())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let sent: Value = receiver
+        .post_as(
+            &format!("/api/drafts/{id}/send"),
+            json!({"targets":[receiver.app.info().await.id],"text":"旧版已缓存上传"}),
+            &browser,
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let transfer = sent["ids"][0].as_str().unwrap().to_owned();
+    receiver
+        .post(
+            &format!("/api/transfers/{transfer}/decision"),
+            json!({"accept":true}),
+        )
+        .await;
+    (
+        sent["message_id"].as_str().unwrap().to_owned(),
+        transfer,
+        file,
+    )
+}
+
 fn start_saver(app: &App) -> tokio::task::JoinHandle<()> {
     let app = app.clone();
     tokio::spawn(async move {
@@ -438,7 +487,6 @@ async fn received_files_save_without_overwriting_survive_restart_and_cache_clean
 
 #[tokio::test]
 async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory() {
-    let sender = Host::new("发送").await;
     let receiver = Host::new("接收").await;
     let storage = TempDir::new().unwrap();
     let blocked = storage.path().join("not-a-directory");
@@ -448,7 +496,7 @@ async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory()
         .configure_receiving(blocked.to_string_lossy().into_owned())
         .await
         .unwrap();
-    let (message, _, _) = incoming_file(&sender, &receiver, b"retry contents").await;
+    let (message, _, _) = legacy_cached_file(&receiver, b"retry contents").await;
     saved(&receiver.app, &message, "pending").await;
     receiver.post("/api/storage/clear", json!({})).await;
     assert!(receiver.state().await["storage_used"].as_u64().unwrap() > 0);
@@ -475,15 +523,14 @@ async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory()
 
 #[tokio::test]
 async fn schema_one_upgrade_preserves_history_without_exporting_old_files() {
-    let sender = Host::new("发送").await;
     let mut receiver = Host::new("旧版接收").await;
-    let (message, transfer, file) = incoming_file(&sender, &receiver, b"old history").await;
+    let (message, transfer, file) = legacy_cached_file(&receiver, b"old history").await;
     let identity = receiver.app.info().await;
     receiver.app.stop();
     {
         let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
         conn.execute_batch(
-            "DROP TABLE saved_files; PRAGMA user_version=1; UPDATE messages SET received_at=1;",
+            "DROP TABLE saved_files; DROP TABLE file_sources; DROP TABLE receive_outputs; PRAGMA user_version=1; UPDATE messages SET received_at=1;",
         )
         .unwrap();
     }
@@ -561,7 +608,7 @@ fn exported_filenames_are_portable_and_cannot_escape_the_directory() {
 }
 
 #[tokio::test]
-async fn browser_to_browser_files_are_not_exported_by_the_host() {
+async fn browser_to_browser_transfers_are_rejected_by_the_host() {
     let host = Host::new("宿主").await;
     let downloads = TempDir::new().unwrap();
     host.app
@@ -594,36 +641,16 @@ async fn browser_to_browser_files_are_not_exported_by_the_host() {
             .status(),
         StatusCode::OK
     );
-    let sent: Value = host
+    let response = host
         .post_as(
             &format!("/api/drafts/{draft_id}/send"),
-            json!({"targets":[state["me"]["id"]],"text":"仅网页"}),
+            json!({"targets":[state["me"]["id"]],"text":"不允许网页互传"}),
             &one,
         )
-        .await
-        .json()
-        .await
-        .unwrap();
-    let message = sent["message_id"].as_str().unwrap();
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let state: Value = host.get("/api/state", &two).await.json().await.unwrap();
-    let transfer = state["transfers"][0]["id"].as_str().unwrap();
-    assert_eq!(
-        host.post_as(
-            &format!("/api/transfers/{transfer}/decision"),
-            json!({"accept":true}),
-            &two
-        )
-        .await
-        .status(),
-        StatusCode::OK
-    );
-    assert!(host
-        .app
-        .saved_files(vec![message.into()])
-        .await
-        .unwrap()
-        .is_empty());
-    assert!(host.app.queue_save_file(transfer, file).await.is_err());
+    assert!(state["transfers"].as_array().unwrap().is_empty());
     assert_eq!(std::fs::read_dir(downloads.path()).unwrap().count(), 0);
 }
 
@@ -633,7 +660,7 @@ async fn export_database_retry_keeps_actual_directory_without_copying_twice() {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
-    let sender = Host::new("发送").await;
+
     let receiver = Host::new("接收").await;
     let first = TempDir::new().unwrap();
     let second = TempDir::new().unwrap();
@@ -642,7 +669,7 @@ async fn export_database_retry_keeps_actual_directory_without_copying_twice() {
         .configure_receiving(first.path().to_string_lossy().into_owned())
         .await
         .unwrap();
-    let (message, _, _) = incoming_file(&sender, &receiver, b"one export").await;
+    let (message, _, _) = legacy_cached_file(&receiver, b"one export").await;
     let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
     conn.execute_batch("CREATE TRIGGER block_saved BEFORE UPDATE ON saved_files WHEN NEW.status='saved' BEGIN SELECT RAISE(ABORT,'disk full'); END;").unwrap();
     let count = Arc::new(AtomicUsize::new(0));
@@ -787,6 +814,14 @@ async fn completed_files_history_and_drafts_survive_restart_and_missing_files_ke
         "原始字节".as_bytes()
     );
     receiver.post("/api/storage/clear", json!({})).await;
+    let page = receiver.timeline(&conversation, &receiver.token).await;
+    assert_eq!(page["messages"][0]["files"][0]["available"], true);
+    let saved = receiver
+        .app
+        .saved_files(vec![message.as_str().unwrap().into()])
+        .await
+        .unwrap();
+    std::fs::remove_file(&saved[0].location).unwrap();
     let page = receiver.timeline(&conversation, &receiver.token).await;
     assert_eq!(page["messages"][0]["files"][0]["available"], false);
     assert_eq!(page["messages"][0]["deliveries"][0]["status"], "completed");
@@ -1455,7 +1490,11 @@ async fn shared_file_source_does_not_allow_another_browser_to_skip_acceptance() 
             )
             .await
             .status(),
-            StatusCode::NOT_FOUND
+            if tid == t2 {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NOT_FOUND
+            }
         );
     }
 }

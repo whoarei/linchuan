@@ -36,6 +36,8 @@ import {
   RefreshCw,
 } from "lucide-vue-next";
 import QRCode from "qrcode";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
 import ConversationRow from "./ConversationRow.vue";
 import { useUpdates } from "./useUpdates";
@@ -116,8 +118,13 @@ const messages = ref<Message[]>([]);
 const before = ref<number | null>(null);
 const historyBusy = ref(false);
 const text = ref("");
-const files = ref<File[]>([]);
-const fileCache = new Map<string, File[]>();
+type SelectedFile = File & { source_id?: string };
+type NativeSelection = { source_id: string; name: string; size: number; mime: string };
+const files = ref<SelectedFile[]>([]);
+const fileCache = new Map<string, SelectedFile[]>();
+const browserOnly = computed(() => state.value?.me.owner === false);
+const sendPhase = ref("正在发送…");
+const nativeListeners: UnlistenFn[] = [];
 const sending = ref(false);
 const progress = ref(0);
 const uploadTotal = ref(0);
@@ -272,7 +279,7 @@ const eligible = computed(
   () =>
     state.value?.devices.filter(
       (d) =>
-        d.capabilities?.includes("groups-v1") &&
+        d.kind !== "browser" && d.capabilities?.includes("groups-v1") &&
         (!editingGroup.value ||
           !group.value?.members.some(
             (m) => m.device.id === d.id && m.state !== "left",
@@ -307,13 +314,13 @@ function timestamp(ms: number) {
 }
 function online(id?: string) {
   return (
-    id === state.value?.me.id || !!state.value?.devices.some((d) => d.id === id)
+    id === state.value?.me.id || (browserOnly.value && id===state.value?.info.id && connected.value) || !!state.value?.devices.some((d) => d.id === id)
   );
 }
 function summary(message: Message) {
   const ds = message.deliveries;
   const done = ds.filter((d) => d.status === "completed").length;
-  if (ds.length && done === ds.length) return "已送达";
+  if (ds.length && done === ds.length) return message.files.length && ds.some((d)=>d.recipient_id.startsWith("browser-")) ? "已发送至浏览器" : "已送达";
   if (done && ds.every((d) => terminal(d.status)))
     return `部分送达 ${done}/${ds.length}`;
   if (ds.some((d) => d.status === "transferring" || d.status === "accepted"))
@@ -377,6 +384,15 @@ async function refresh() {
     const next = await api<AppState>("/api/state");
     if (disposed || requestToken !== token()) return;
     state.value = next;
+    if (!next.me.owner) {
+      let host=next.conversations.find((c)=>c.kind==="direct" && c.peer_id===next.info.id);
+      if(!host) {
+        const raw=await api<Conversation>("/api/conversations/direct",{device_id:next.info.id});
+        host={...raw,name:next.info.name,preview:"",last_message_at:0,unread:0};
+        next.conversations.push(host);
+      }
+      if(selected.value!==host.id) await selectConversation(host);
+    }
     connected.value = true;
     ready.value = true;
     if (!shareAddress.value)
@@ -545,7 +561,7 @@ function flushDraft() {
       if (connected.value) notify("草稿未保存，请检查连接", true);
     });
 }
-function addFiles(items: File[]) {
+function addFiles(items: SelectedFile[]) {
   if (sending.value || !canWrite.value) return;
   for (const file of items) {
     if (!Number.isSafeInteger(file.size) || file.size < 0) {
@@ -559,6 +575,14 @@ function addFiles(items: File[]) {
     files.value.push(file);
   }
   fileCache.set(selected.value, [...files.value]);
+}
+function nativeSelections(items: NativeSelection[]) {
+  addFiles(items.map((f) => ({ name:f.name,size:f.size,type:f.mime,source_id:f.source_id }) as SelectedFile));
+}
+async function chooseFiles() {
+  if (!native) { input.value?.click(); return; }
+  try { nativeSelections(await invoke<NativeSelection[]>("choose_send_files") || []); }
+  catch(error) { notify(String(error),true); }
 }
 function fileChange(event: Event) {
   const element = event.target as HTMLInputElement;
@@ -595,39 +619,62 @@ async function send() {
   let preparedDraft = "";
   let sent = false;
   try {
+    const streaming = browserOnly.value;
+    sendPhase.value = streaming ? "等待对方接收…" : "正在发送…";
     const draft = await api<{ id: string; files: FileMeta[] }>("/api/drafts", {
-      files: selectedFiles.map((f) => ({
-        name: f.name,
-        size: f.size,
-        mime: f.type,
-      })),
+      streaming,
+      files: selectedFiles.map((f) => ({ name:f.name,size:f.size,mime:f.type,source_id:f.source_id })),
     });
     preparedDraft = draft.id;
-    let count = 0;
-    for (let i = 0; i < selectedFiles.length; i++) {
-      await upload(
-        `/api/drafts/${draft.id}/files/${draft.files[i].id}`,
-        selectedFiles[i],
-        (bytes) => (progress.value = count + bytes),
-        signal,
-      );
-      count += selectedFiles[i].size;
+    if (!streaming) {
+      let count = 0;
+      for (let i=0;i<selectedFiles.length;i++) {
+        if (!selectedFiles[i].source_id) {
+          sendPhase.value="正在保存粘贴内容…";
+          await upload("/api/drafts/"+draft.id+"/files/"+draft.files[i].id,selectedFiles[i],(bytes)=>(progress.value=count+bytes),signal);
+        }
+        count += selectedFiles[i].size;
+      }
     }
-    if (signal.aborted) throw new Error("已取消上传");
-    await api(`/api/drafts/${draft.id}/send`, {
-      text: body,
-      targets: conversation.kind === "direct" ? [conversation.peer_id] : [],
-      group_id: conversation.group_id,
+    if(signal.aborted) throw new Error("已取消发送");
+    const result = await api<{ids:string[]}>("/api/drafts/"+draft.id+"/send", {
+      text:body, targets:conversation.kind==="direct"?[conversation.peer_id]:[], group_id:conversation.group_id,
     });
-    sent = true;
-    fileCache.set(conversation.id, []);
-    if (selected.value === conversation.id) {
-      text.value = "";
-      files.value = [];
+    sent=true;
+    fileCache.set(conversation.id,[]);
+    if(selected.value===conversation.id){text.value="";files.value=[];}
+    await refresh();scrollBottom();
+    if(streaming && selectedFiles.length) {
+      const transferId=result.ids[0];
+      try {
+        const deadline=Date.now()+5*60_000;
+        while(true) {
+          if(signal.aborted) throw new Error("已取消发送");
+          const next=await api<AppState>("/api/state");
+          const transfer=next.transfers.find((t)=>t.id===transferId);
+          if(!transfer || terminal(transfer.status)) throw new Error(transfer?.error || (transfer?.status==="rejected"?"对方已拒绝接收":"传输已结束"));
+          if(transfer.status==="accepted") break;
+          if(Date.now()>deadline) throw new Error("等待接收超时，请重新发送");
+          await new Promise((resolve)=>setTimeout(resolve,400));
+        }
+        sendPhase.value="正在发送文件…";
+        let count=0;
+        for(let i=0;i<selectedFiles.length;i++) {
+          await upload("/api/transfers/"+transferId+"/files/"+draft.files[i].id+"/upload",selectedFiles[i],(bytes)=>(progress.value=count+bytes),signal);
+          count+=selectedFiles[i].size;
+        }
+      } catch(error) {
+        await api("/api/transfers/"+transferId+"/cancel",{}).catch(()=>{});
+        throw error;
+      }
     }
     await refresh();
     scrollBottom();
   } catch (error) {
+    if(browserOnly.value && selectedFiles.length && token()) {
+      fileCache.set(conversation.id,selectedFiles);
+      if(selected.value===conversation.id && !files.value.length){files.value=selectedFiles;if(!text.value)text.value=body;}
+    }
     notify((error as Error).message, true);
   } finally {
     if (preparedDraft && !sent) {
@@ -649,8 +696,12 @@ async function decide(transfer: Transfer, accept: boolean) {
   if (decisionBusy.value.has(transfer.id)) return;
   decisionBusy.value.add(transfer.id);
   try {
-    await api(`/api/transfers/${transfer.id}/decision`, { accept });
+    await api("/api/transfers/"+transfer.id+"/decision", { accept });
     await refresh();
+    if(accept && browserOnly.value && transfer.files.length) {
+      const message=messages.value.find((m)=>m.id===transfer.message_id);
+      if(message) for(const file of message.files) await download(file,message.id);
+    }
   } catch (error) {
     notify((error as Error).message, true);
   } finally {
@@ -971,6 +1022,13 @@ onMounted(async () => {
     void loadReceiveSettings();
     const info = await api<{ name: string }>("/api/info");
     hostName.value = info.name;
+    if(native) {
+      try {
+        nativeListeners.push(await listen<NativeSelection[]>("linchuan-files",(event)=>nativeSelections(event.payload)));
+        nativeListeners.push(await listen<string>("linchuan-file-error",(event)=>notify(event.payload,true)));
+        nativeListeners.push(await listen<boolean>("linchuan-dragging",(event)=>{ dragging.value=event.payload && canWrite.value; }));
+      } catch { /* Native test hosts may omit the event bridge. */ }
+    }
     if (token()) await refresh();
     else loading.value = false;
     if (ready.value) events();
@@ -987,6 +1045,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   disposed = true;
+  nativeListeners.forEach((unlisten)=>unlisten());
   window.removeEventListener("linchuan-session-change", sessionChanged);
   clearInterval(poll);
   clearTimeout(draftTimer);
@@ -1050,6 +1109,7 @@ onUnmounted(() => {
     class="workspace"
     :class="{
       'chat-open': !!selected && mode === 'devices',
+      'browser-only': browserOnly,
       'section-open': mode !== 'devices',
     }"
   >
@@ -1059,11 +1119,11 @@ onUnmounted(() => {
       ><button
         class="rail-button"
         :class="{ active: mode === 'devices' }"
-        aria-label="设备"
-        title="设备"
+        :aria-label="browserOnly ? '收发' : '设备'"
+        :title="browserOnly ? '收发' : '设备'"
         @click="setMode('devices')"
       >
-        <MessageSquare :size="23" /><span>设备</span
+        <MessageSquare :size="23" /><span>{{ browserOnly ? "收发" : "设备" }}</span
         ><i v-if="unread" class="rail-unread" />
       </button>
       <div class="rail-spacer" />
@@ -1085,7 +1145,7 @@ onUnmounted(() => {
         <Info :size="22" /><span>关于</span>
       </button>
     </nav>
-    <aside v-if="mode === 'devices'" class="conversation-panel">
+    <aside v-if="mode === 'devices' && !browserOnly" class="conversation-panel">
       <header class="list-header">
         <div>
           <h1>设备</h1>
@@ -1229,6 +1289,7 @@ onUnmounted(() => {
       <template v-if="current"
         ><header class="chat-header">
           <button
+            v-if="!browserOnly"
             class="icon-button mobile-back"
             aria-label="返回设备列表"
             @click="
@@ -1252,6 +1313,7 @@ onUnmounted(() => {
               <span
                 class="connection-dot"
                 :class="{ offline: !online(current.peer_id) }"
+                :title="browserOnly ? (connected ? '局域网已连接' : '连接中断') : (online(current.peer_id) ? '设备在线' : '设备离线')"
               /><template v-if="currentDevice"
                 >{{ currentDevice.platform }} · </template
               >{{ online(current.peer_id) ? "在线" : "离线 · 历史记录保留" }}
@@ -1398,6 +1460,7 @@ onUnmounted(() => {
                       取消
                     </button>
                   </div>
+                  <div v-if="browserOnly" class="browser-downloads"><button v-for="file in message.files" :key="file.id" class="text-button" @click="download(file,message.id)">下载 {{ file.name }}</button><small>文件由浏览器下载管理器保存。</small></div>
                   <progress
                     aria-label="文件接收进度"
                     :value="incomingActive(message)!.bytes"
@@ -1427,6 +1490,7 @@ onUnmounted(() => {
                     role="group"
                     :aria-label="`${file.name} 的文件操作`"
                   >
+                    <button v-if="native && file.original" class="icon-button" :aria-label="`打开原文件 ${file.name}`" title="打开原文件" @click="openSavedFile(message.id,file.id)"><ArrowUpRight :size="18" /></button>
                     <LoaderCircle
                       v-if="fileBusy.has(`${message.id}:${file.id}`)"
                       class="spin"
@@ -1700,11 +1764,11 @@ onUnmounted(() => {
               title="添加文件或图片"
               aria-label="添加文件或图片"
               :disabled="!canWrite || sending"
-              @click="input?.click()"
+              @click="chooseFiles()"
             >
               <Paperclip :size="20" /></button
             ><span>{{
-              sending ? "正在准备文件…" : "可粘贴截图或拖入文件"
+              sending ? sendPhase : "可粘贴截图或拖入文件"
             }}</span
             ><span v-if="sending" class="upload-count"
               >{{ size(progress) }} / {{ size(uploadTotal)
@@ -1751,7 +1815,7 @@ onUnmounted(() => {
               <LoaderCircle v-if="sending" class="spin" :size="15" /><Send
                 v-else
                 :size="15"
-              />{{ sending ? "准备中" : "发送" }}
+              />{{ sending ? (sendPhase.startsWith("等待") ? "等待接收" : "发送中") : "发送" }}
             </button>
           </div>
         </div>

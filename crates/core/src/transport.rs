@@ -143,7 +143,8 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         if !update(app,id,"transferring",bytes).await{return Ok(());}
         for file in &transfer.files{
             if !active(app,id).await{return Ok(());}
-            let input=tokio::fs::File::open(&file.path).await?;
+            let _permit=app.0.outgoing.acquire().await?;
+            let input=app.open_source(file).await.map_err(anyhow::Error::msg)?;
             let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let uploaded = progress.clone();
             let stream = ReaderStream::new(input).map(move |chunk| {
@@ -164,6 +165,8 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
                     update(app,id,"transferring",bytes+count).await;}
             }};
             anyhow::ensure!(response.status().is_success(),"文件传输失败，对方可能已取消或磁盘空间不足");
+            // Check again after streaming; never acknowledge a changed original as complete.
+            let _=app.open_source(file).await.map_err(anyhow::Error::msg)?;
             bytes+=file.meta.size;
             if !update(app,id,"transferring",bytes).await{return Ok(());}
         }

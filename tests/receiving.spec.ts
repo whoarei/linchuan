@@ -144,9 +144,7 @@ test("native saved files open through IPC after cache cleanup and failures can r
   await page.getByLabel("你的设备名称").fill("固定目录测试浏览器");
   await page.getByLabel("六位配对码").fill(host.boot.pairing_code);
   await page.getByRole("button", { name: "连接设备", exact: true }).click();
-  await page
-    .getByRole("button", { name: "连接 测试电脑", exact: true })
-    .click();
+  await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await page.locator("input[type=file]").setInputFiles({
     name: "自动保存.txt",
     mimeType: "text/plain",

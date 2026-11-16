@@ -142,9 +142,7 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
   const page = await context.newPage();
   await pair(page, "历史临时网页");
   const original = await identity(page);
-  await page
-    .getByRole("button", { name: "连接 临时测试电脑", exact: true })
-    .click();
+  await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await page
     .getByRole("textbox", { name: "发送文字" })
     .fill("临时会话留下的文字");

@@ -61,6 +61,7 @@ export interface Group {
 export interface MessageFile extends FileMeta {
   available: boolean;
   transfer_id: string;
+  original?: boolean;
 }
 export interface Message {
   id: string;

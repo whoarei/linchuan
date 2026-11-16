@@ -25,7 +25,7 @@ pub fn plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 }
 
 #[cfg(target_os = "android")]
-async fn mobile<T: serde::de::DeserializeOwned + Send + 'static>(
+pub(crate) async fn mobile<T: serde::de::DeserializeOwned + Send + 'static>(
     app: tauri::AppHandle,
     command: &'static str,
     args: serde_json::Value,
@@ -59,6 +59,71 @@ fn default_directory(app: &tauri::AppHandle) -> String {
 pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
+        use linchuan_core::files::{PlatformFiles, PlatformOutput};
+        use std::os::fd::FromRawFd;
+        use std::sync::Arc;
+        #[derive(serde::Deserialize)]
+        struct Descriptor {
+            fd: i32,
+            location: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Input {
+            fd: i32,
+        }
+        let open_app = app.clone();
+        let begin_app = app.clone();
+        let finish_app = app.clone();
+        let abort_app = app.clone();
+        core.set_platform_files(PlatformFiles {
+            open: Arc::new(move |location| {
+                let app = open_app.clone();
+                Box::pin(async move {
+                    let input: Input =
+                        mobile(app, "openInput", serde_json::json!({"location":location})).await?;
+                    Ok(unsafe { std::fs::File::from_raw_fd(input.fd) })
+                })
+            }),
+            begin: Arc::new(move |directory, name, mime| {
+                let app = begin_app.clone();
+                Box::pin(async move {
+                    let output: Descriptor = mobile(
+                        app,
+                        "beginFile",
+                        serde_json::json!({"directory":directory,"name":name,"mime":mime}),
+                    )
+                    .await?;
+                    Ok(PlatformOutput {
+                        file: unsafe { std::fs::File::from_raw_fd(output.fd) },
+                        location: output.location,
+                    })
+                })
+            }),
+            finish: Arc::new(move |location| {
+                let app = finish_app.clone();
+                Box::pin(async move {
+                    let saved: SaveLocation = mobile(
+                        app,
+                        "completeFile",
+                        serde_json::json!({"location":location}),
+                    )
+                    .await?;
+                    Ok(saved.name)
+                })
+            }),
+            abort: Arc::new(move |location| {
+                let app = abort_app.clone();
+                Box::pin(async move {
+                    mobile::<serde_json::Value>(
+                        app,
+                        "deleteFile",
+                        serde_json::json!({"location":location}),
+                    )
+                    .await?;
+                    Ok(())
+                })
+            }),
+        });
         let handle = app.clone();
         core.set_space_probe(std::sync::Arc::new(move |directory| {
             let handle = handle.clone();
@@ -83,6 +148,7 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
     core.configure_receiving(default_directory(&app))
         .await
         .map_err(|e| e.to_string())?;
+    core.recover_receive_outputs().await?;
     tauri::async_runtime::spawn(async move {
         core.run_receive_saver(move |job| save(app.clone(), job))
             .await;
@@ -93,7 +159,22 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
 async fn save(app: tauri::AppHandle, job: SaveJob) -> Result<SaveLocation, String> {
     #[cfg(target_os = "android")]
     {
-        let input = std::fs::File::open(&job.source).map_err(|e| e.to_string())?;
+        let input = if job.source.to_string_lossy().starts_with("content://") {
+            use std::os::fd::FromRawFd;
+            #[derive(serde::Deserialize)]
+            struct Input {
+                fd: i32,
+            }
+            let source: Input = mobile(
+                app.clone(),
+                "openInput",
+                serde_json::json!({"location":job.source}),
+            )
+            .await?;
+            unsafe { std::fs::File::from_raw_fd(source.fd) }
+        } else {
+            std::fs::File::open(&job.source).map_err(|e| e.to_string())?
+        };
         save_android(app, job, input).await
     }
     #[cfg(not(target_os = "android"))]
@@ -231,7 +312,7 @@ pub async fn relocate_received_file(
             name: linchuan_core::receiving::safe_name(&record.name),
             mime: record.mime.clone(),
             directory: directory.clone(),
-            size: 0,
+            size: record.size,
             progress: None,
         }
     } else {
@@ -261,7 +342,10 @@ pub async fn relocate_received_file(
     #[cfg(not(target_os = "android"))]
     let input =
         std::fs::File::open(&job.source).map_err(|e| format!("文件已移动、删除或无法读取：{e}"))?;
-    job.size = input.metadata().map_err(|e| e.to_string())?.len();
+    let metadata = input.metadata().map_err(|e| e.to_string())?;
+    if metadata.is_file() {
+        job.size = metadata.len();
+    }
     let size = job.size;
     let copy_app = app.clone();
     let copy = move |progress| async move {
@@ -426,16 +510,31 @@ pub async fn open_received_file(
     folder: bool,
     runtime: State<'_, Runtime>,
 ) -> Result<(), String> {
-    let record = runtime
-        .0
-        .get()
-        .ok_or("服务尚未就绪")?
-        .saved_files(vec![message_id])
+    let core = runtime.0.get().ok_or("服务尚未就绪")?;
+    let record = core
+        .saved_files(vec![message_id.clone()])
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
-        .find(|f| f.file_id == file_id && f.status == "saved")
-        .ok_or("文件尚未保存完成")?;
+        .find(|f| f.file_id == file_id && f.status == "saved");
+    let record = if let Some(record) = record {
+        record
+    } else {
+        let job = core
+            .outgoing_file(message_id.clone(), file_id.clone())
+            .await?;
+        SavedFile {
+            message_id,
+            file_id,
+            name: job.name,
+            directory: job.directory,
+            location: job.source.to_string_lossy().into_owned(),
+            status: "saved".into(),
+            error: None,
+            mime: job.mime,
+            size: job.size,
+        }
+    };
     #[cfg(target_os = "android")]
     {
         let _: serde_json::Value = mobile(

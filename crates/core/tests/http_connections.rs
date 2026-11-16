@@ -223,7 +223,7 @@ async fn an_old_ca_setting_does_not_block_http_or_erase_identity_and_browser_his
         database
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 

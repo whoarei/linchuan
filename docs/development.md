@@ -44,6 +44,8 @@ python3 scripts/test_updates.py
 
 `rust-embed` 会嵌入 `dist`；先构建前端再构建 Rust。首次 Linux 浏览器测试可使用 `npx playwright install --with-deps chromium` 安装系统依赖。HTTP 测试直接在局域网地址验证无证书配对、WS 和文件完整下载。ready.json 的 address 是本机 HTTP 地址；分享给局域网设备时使用信息接口的 addresses。
 
+全量核心测试包含原文件直传和兼容上传／下载两条实际超过 2 GiB 的校验，需要相应磁盘读写时间；建议测试磁盘至少保留 7 GiB 可用空间。新浏览器模型、原生文件选择 IPC 和浏览器下载状态的回归见 `tests/direct-model.spec.ts`，直接文件流和故障恢复见 `crates/core/tests/direct_transfers.rs`。
+
 ## 打包
 
 ```bash

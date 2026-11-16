@@ -28,7 +28,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 2, "数据库版本高于当前程序支持的版本，请升级邻传");
+        anyhow::ensure!(version <= 3, "数据库版本高于当前程序支持的版本，请升级邻传");
         if version < 2 {
             let tx = conn.transaction()?;
             if version == 0 {
@@ -36,6 +36,12 @@ impl Store {
             }
             tx.execute_batch(include_str!("../migrations/002_received_files.sql"))?;
             tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/003_file_sources.sql"))?;
+            tx.pragma_update(None, "user_version", 3)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {
@@ -101,7 +107,7 @@ impl Store {
             let mut db=inner.lock().map_err(|_|anyhow::anyhow!("数据库锁异常"))?;
             let mut changed=HashMap::new();
             // Diff metadata in memory; only changed rows are written inside the transaction.
-            for (id,t) in &state.transfers { let value=serde_json::to_string(&(&t.view,t.incoming_remote,t.files.iter().map(|f|(&f.path,f.complete,f.path.is_file())).collect::<Vec<_>>()))?; if db.saved.get(id)!=Some(&value) {changed.insert(id.clone(),value);} }
+            for (id,t) in &state.transfers { let value=serde_json::to_string(&(&t.view,t.incoming_remote,t.files.iter().map(|f|(f,f.available())).collect::<Vec<_>>()))?; if db.saved.get(id)!=Some(&value) {changed.insert(id.clone(),value);} }
             let tx=db.conn.transaction()?;
             if let Some(local)=state.profiles.values().find(|d|d.kind=="local"){tx.execute("UPDATE app_settings SET value=?1 WHERE key='device_name'",[&local.name])?;}
             for device in state.profiles.values() {upsert_device(&tx,device)?;}
@@ -126,13 +132,26 @@ impl Store {
                 }
                 tx.execute("INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET status=excluded.status,bytes=excluded.bytes,error=excluded.error,updated_at=excluded.updated_at",params![v.id,v.message_id,v.recipient_id,v.recipient_name,v.status,v.bytes,v.total,v.error,t.incoming_remote,v.created_at,now_ms()])?;
                 for f in &t.files {
-                    let relative=f.path.strip_prefix(&root)?.to_str().ok_or_else(||anyhow::anyhow!("附件路径无效"))?;
-                    anyhow::ensure!(relative.starts_with("files/")||relative.starts_with("files\\"),"持久附件必须位于 files 目录");
-                    let blob=identity::token_hash(relative);let availability=if f.complete&&f.path.is_file(){"available"}else{"missing"};
-                    tx.execute("INSERT INTO file_blobs VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN file_blobs.state='expired' AND excluded.state='missing' THEN 'expired' ELSE excluded.state END",params![blob,relative,f.meta.size,availability,now_ms()])?;
-                    tx.execute("INSERT INTO delivery_files VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET complete=excluded.complete",params![v.id,f.meta.id,blob,f.complete])?;
-                    if v.status == "completed" && f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d| d.kind == "local") {
-                        tx.execute("INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) SELECT ?1,?2,?3,?4,'pending',?5 WHERE EXISTS(SELECT 1 FROM app_settings WHERE key='receive_directory') AND (SELECT received_at FROM messages WHERE id=?1)>=CAST((SELECT value FROM app_settings WHERE key='receive_since') AS INTEGER)",params![v.message_id,f.meta.id,v.id,f.meta.name,now_ms()])?;
+                    let mut persisted=f.clone();
+                    if f.cached(){persisted.path=f.path.strip_prefix(&root)?.into();}
+                    let encoded=serde_json::to_string(&persisted)?;
+                    tx.execute("INSERT INTO file_sources VALUES(?1,?2,?3) ON CONFLICT(delivery_id,file_id) DO UPDATE SET source_json=excluded.source_json",params![v.id,f.meta.id,encoded])?;
+                    if f.cached() {
+                        let relative=f.path.strip_prefix(&root)?.to_str().ok_or_else(||anyhow::anyhow!("附件路径无效"))?;
+                        anyhow::ensure!(relative.starts_with("files/")||relative.starts_with("files\\"),"持久缓存必须位于 files 目录");
+                        let blob=identity::token_hash(relative);let availability=if f.available(){"available"}else{"missing"};
+                        tx.execute("INSERT INTO file_blobs VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN file_blobs.state='expired' AND excluded.state='missing' THEN 'expired' ELSE excluded.state END",params![blob,relative,f.meta.size,availability,now_ms()])?;
+                        tx.execute("INSERT INTO delivery_files VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET complete=excluded.complete",params![v.id,f.meta.id,blob,f.complete])?;
+                        if v.status == "completed" && f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
+                            tx.execute("INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) SELECT ?1,?2,?3,?4,'pending',?5 WHERE EXISTS(SELECT 1 FROM app_settings WHERE key='receive_directory') AND (SELECT received_at FROM messages WHERE id=?1)>=CAST((SELECT value FROM app_settings WHERE key='receive_since') AS INTEGER)",params![v.message_id,f.meta.id,v.id,f.meta.name,now_ms()])?;
+                        }
+                    } else if let FileStorage::Received {directory,name}=&f.storage {
+                        if f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
+                            tx.execute("INSERT INTO saved_files(message_id,file_id,transfer_id,name,directory,location,status,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'saved',?7) ON CONFLICT(message_id,file_id) DO UPDATE SET name=excluded.name,directory=excluded.directory,location=excluded.location,status='saved',error=NULL,updated_at=excluded.updated_at WHERE saved_files.status<>'saved'",params![v.message_id,f.meta.id,v.id,name,directory,f.path.to_string_lossy(),now_ms()])?;
+                        }
+                    }
+                    if f.complete && matches!(f.storage,FileStorage::Received{..}) {
+                        tx.execute("DELETE FROM receive_outputs WHERE delivery_id=?1 AND file_id=?2 AND published=1",params![v.id,f.meta.id])?;
                     }
                 }
                 for (principal,peer,direction) in [(&v.sender_id,&v.recipient_id,"outgoing"),(&v.recipient_id,&v.sender_id,"incoming")] {
@@ -215,7 +234,7 @@ impl Store {
             for(position,id,sender_id,sender_name,text,created_at,direction)in rows{
                 let ids:Vec<String>=conn.prepare("SELECT d.id FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.message_id=?1 AND (m.sender_id=?2 OR d.recipient_id=?2) ORDER BY CASE WHEN d.status='completed' THEN 0 ELSE 1 END,d.created_at,d.id")?.query_map(params![id,principal],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
                 let mut deliveries=Vec::new();let mut files=Vec::new();
-                for delivery in ids {if let Some(t)=query_transfer(conn,root,&delivery)?{if files.is_empty(){files=t.files.iter().map(|f|MessageFile{meta:f.meta.clone(),available:f.complete&&f.path.is_file()&&(sender_id==principal||t.view.status=="completed"),transfer_id:t.view.id.clone()}).collect();}deliveries.push(t.view);}}
+                for delivery in ids {if let Some(t)=query_transfer(conn,root,&delivery)?{if files.is_empty(){files=t.files.iter().map(|f|MessageFile{meta:f.meta.clone(),available:f.available()&&(sender_id==principal||t.view.status=="completed"||(t.view.recipient_id==principal&&matches!(t.view.status.as_str(),"accepted"|"transferring"))),transfer_id:t.view.id.clone(),original:matches!(f.storage,FileStorage::Original{..})}).collect();}deliveries.push(t.view);}}
                 result.push(MessageView{id,position,sender_id,sender_name,text,created_at,direction,files,deliveries});
             }
             result.reverse();Ok(result)
@@ -254,7 +273,11 @@ fn query_conversations(
         .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
-fn query_transfer(conn: &Connection, root: &Path, id: &str) -> anyhow::Result<Option<Transfer>> {
+pub(crate) fn query_transfer(
+    conn: &Connection,
+    root: &Path,
+    id: &str,
+) -> anyhow::Result<Option<Transfer>> {
     let view=conn.query_row("SELECT d.id,m.id,m.group_id,m.created_at,m.sender_id,m.sender_name,d.recipient_id,d.recipient_name,m.text,d.status,d.bytes,d.total,m.created_at,d.error,d.incoming_remote FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.id=?1",[id],|r|Ok((TransferView{id:r.get(0)?,message_id:r.get(1)?,group_id:r.get(2)?,created_at:r.get(3)?,sender_id:r.get(4)?,sender_name:r.get(5)?,recipient_id:r.get(6)?,recipient_name:r.get(7)?,text:r.get(8)?,status:r.get(9)?,bytes:r.get(10)?,total:r.get(11)?,created:r.get::<_,u64>(12)?/1000,error:r.get(13)?,files:Vec::new()},r.get::<_,bool>(14)?))).optional()?;
     let Some((mut view, remote)) = view else {
         return Ok(None);
@@ -282,14 +305,67 @@ fn query_transfer(conn: &Connection, root: &Path, id: &str) -> anyhow::Result<Op
                 .all(|p| matches!(p, std::path::Component::Normal(_))),
             "数据库附件路径异常"
         );
-        view.files.push(meta.clone());
         files.push(StoredFile {
             meta,
             path: root.join(path),
             complete,
             uploading: false,
+            storage: FileStorage::Cache,
+            downloaded: false,
         });
     }
+    let mut q = conn.prepare("SELECT source_json FROM file_sources WHERE delivery_id=?1")?;
+    for row in q.query_map([id], |r| r.get::<_, String>(0))? {
+        let mut file: StoredFile = serde_json::from_str(&row?)?;
+        file.uploading = false;
+        if file.cached() {
+            if file.path.is_relative() {
+                anyhow::ensure!(
+                    file.path
+                        .components()
+                        .all(|p| matches!(p, std::path::Component::Normal(_))),
+                    "缓存路径异常"
+                );
+                file.path = root.join(&file.path);
+            }
+            anyhow::ensure!(file.path.starts_with(root.join("files")), "缓存路径异常");
+        }
+        if let Some(old) = files.iter_mut().find(|f| f.meta.id == file.meta.id) {
+            *old = file;
+        } else {
+            files.push(file);
+        }
+    }
+    let mut q = conn
+        .prepare("SELECT source_json FROM receive_outputs WHERE delivery_id=?1 AND published=1")?;
+    for row in q.query_map([id], |r| r.get::<_, String>(0))? {
+        let file: StoredFile = serde_json::from_str(&row?)?;
+        if let Some(old) = files.iter_mut().find(|f| f.meta.id == file.meta.id) {
+            if !old.complete {
+                *old = file;
+            }
+        } else {
+            files.push(file);
+        }
+    }
+    let order: Vec<String> = conn
+        .prepare("SELECT file_id FROM attachments WHERE message_id=?1 ORDER BY position")?
+        .query_map([&view.message_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    files.sort_by_key(|f| {
+        order
+            .iter()
+            .position(|id| id == &f.meta.id)
+            .unwrap_or(usize::MAX)
+    });
+    for f in &mut files {
+        if matches!(f.storage, FileStorage::Received { .. }) {
+            if let Some((location,directory,name))=conn.query_row("SELECT location,directory,name FROM saved_files WHERE message_id=?1 AND file_id=?2 AND status='saved'",params![view.message_id,f.meta.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
+                f.path=location.into();f.storage=FileStorage::Received{directory,name};
+            }
+        }
+    }
+    view.files = files.iter().map(|f| f.meta.clone()).collect();
     Ok(Some(Transfer {
         view,
         files,

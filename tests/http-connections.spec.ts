@@ -29,7 +29,7 @@ test("LAN HTTP browser pairs without certificates and transfers through WS", asy
   socket.on("framereceived", frame => { if (frame.payload.toString() === "changed") notifications++; });
   await expect(page.getByRole("navigation", { name: "主要功能" })).toBeVisible();
   const credential = await page.evaluate(() => localStorage.getItem("linchuan-token"));
-  await page.getByRole("button", { name: `连接 ${info.name}`, exact: true }).click();
+  await expect(page.getByRole("heading",{name:info.name,exact:true})).toBeVisible();
   await page.getByRole("textbox", { name: "发送文字" }).fill("直接通过 HTTP 发送");
   const bytes = Buffer.from("HTTP 文件完整性\n\u0000");
   await page.locator("input[type=file]").setInputFiles({ name: "HTTP 测试.txt", mimeType: "text/plain", buffer: bytes });

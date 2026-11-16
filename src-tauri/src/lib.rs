@@ -2,6 +2,7 @@ use linchuan_core::{App, Bootstrap, Options};
 use tauri::{Manager, State};
 mod desktop;
 mod receiving;
+mod sending;
 struct Runtime(tokio::sync::OnceCell<App>);
 #[tauri::command]
 fn desktop_window_controls() -> bool {
@@ -87,7 +88,10 @@ pub fn run() {
             desktop::setup(app)?;
             Ok(())
         })
-        .on_window_event(desktop::on_window_event)
+        .on_window_event(|window, event| {
+            desktop::on_window_event(window, event);
+            sending::on_window_event(window, event);
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init());
@@ -100,6 +104,7 @@ pub fn run() {
             desktop_window_controls,
             check_release,
             prepare_update,
+            sending::choose_send_files,
             desktop::desktop_settings,
             desktop::desktop_set_autostart,
             desktop::desktop_set_close_to_tray,

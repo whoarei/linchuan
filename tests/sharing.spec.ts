@@ -64,9 +64,7 @@ test("browser text and Unicode file are received in a per-device conversation an
 }) => {
   const host = await owner(browser);
   await pair(page, "网页手机");
-  await page
-    .getByRole("button", { name: "连接 测试电脑", exact: true })
-    .click();
+  await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await page
     .getByRole("textbox", { name: "发送文字" })
     .fill("来自浏览器的一段文字");
@@ -124,68 +122,38 @@ test("two applications exchange directly in the new three-column layout", async 
   await a.context.close();
   await b.context.close();
 });
-test("group invitation, shared timeline and per-recipient acceptance work for browser members", async ({
-  browser,
-}) => {
-  const host = await owner(browser);
-  const ca = await browser.newContext();
-  const cb = await browser.newContext();
-  const a = await ca.newPage();
-  const b = await cb.newPage();
-  await pair(a, "群成员甲");
-  await pair(b, "群成员乙");
-  await host.page.getByRole("button", { name: "添加", exact: true }).click();
-  await host.page
-    .getByRole("button", { name: "新建群聊", exact: true })
-    .click();
-  await host.page.getByLabel("群名称").fill("资料共享群");
-  await host.page.getByRole("checkbox", { name: /群成员甲/ }).check();
-  await host.page.getByRole("checkbox", { name: /群成员乙/ }).check();
-  await host.page
-    .getByRole("button", { name: "创建群聊", exact: true })
-    .click();
-  for (const p of [a, b]) {
-    await p
-      .getByRole("button", { name: "打开 资料共享群", exact: true })
-      .click();
-    await p.getByRole("button", { name: "加入群聊", exact: true }).click();
-  }
-  await host.page
-    .getByRole("textbox", { name: "发送文字" })
-    .fill("群里只有一条消息");
-  await host.page.locator("input[type=file]").setInputFiles({
-    name: "群资料.txt",
-    mimeType: "text/plain",
-    buffer: Buffer.from("group bytes"),
+test("native group members receive independently while browser pages stay host-only", async ({browser}) => {
+    const host=await owner(browser);const a=await owner(browser,1);const b=await owner(browser,2);
+    await addPeer(host.page,a.b.address);await addPeer(host.page,b.b.address);
+    const aname=(await me(a.page)).name;const bname=(await me(b.page)).name;
+    await host.page.getByRole("button",{name:"添加",exact:true}).click();
+    await host.page.getByRole("button",{name:"新建群聊",exact:true}).click();
+    await host.page.getByLabel("群名称").fill("客户端资料群");
+    await host.page.getByRole("checkbox",{name:new RegExp(aname)}).check();
+    await host.page.getByRole("checkbox",{name:new RegExp(bname)}).check();
+    await host.page.getByRole("button",{name:"创建群聊",exact:true}).click();
+    for(const member of [a,b]) {
+      await member.page.getByRole("button",{name:"打开 客户端资料群",exact:true}).click();
+      await member.page.getByRole("button",{name:"加入群聊",exact:true}).click();
+    }
+    await host.page.getByRole("textbox",{name:"发送文字"}).fill("群文件只发送一条消息");
+    await host.page.locator("input[type=file]").setInputFiles({name:"群资料.txt",mimeType:"text/plain",buffer:Buffer.from("group bytes")});
+    await host.page.getByRole("button",{name:"发送",exact:true}).click();
+    const card=host.page.locator(".message").filter({hasText:"群文件只发送一条消息"});
+    await a.page.locator(".message").filter({hasText:"群文件只发送一条消息"}).getByRole("button",{name:"接收",exact:true}).click();
+    await expect(b.page.locator(".message").filter({hasText:"群文件只发送一条消息"}).getByRole("button",{name:"接收",exact:true})).toBeVisible();
+    await b.page.locator(".message").filter({hasText:"群文件只发送一条消息"}).getByRole("button",{name:"接收",exact:true}).click();
+    await expect(card.getByText("已送达",{exact:true})).toBeVisible();
+    await host.page.screenshot({path:".playwright/desktop.png",fullPage:true});
+    await Promise.all([host.context.close(),a.context.close(),b.context.close()]);
   });
-  await host.page.getByRole("button", { name: "发送", exact: true }).click();
-  for (const p of [a, b]) {
-    const message = p
-      .locator(".message")
-      .filter({ hasText: "群里只有一条消息" });
-    await message.getByRole("button", { name: "接收", exact: true }).click();
-  }
-  const bubble = host.page
-    .locator(".message")
-    .filter({ hasText: "群里只有一条消息" });
-  await expect(bubble).toHaveCount(1);
-  await expect(bubble.getByText("已送达", { exact: true })).toBeVisible();
-  await bubble.getByRole("button", { name: "已送达", exact: true }).click();
-  await expect(bubble.getByText("已完成", { exact: true })).toHaveCount(2);
-  await host.page.screenshot({
-    path: ".playwright/desktop.png",
-    fullPage: true,
-  });
-  await host.context.close();
-  await ca.close();
-  await cb.close();
-});
+
 test("settings exposes device rename; drafts and history survive a page reload", async ({
   browser,
 }) => {
   const host = await owner(browser);
   await host.page
-    .getByRole("button", { name: "打开 资料共享群", exact: true })
+    .getByRole("button", { name: "打开 客户端资料群", exact: true })
     .click();
   await host.page
     .getByRole("textbox", { name: "发送文字" })
@@ -208,13 +176,13 @@ test("settings exposes device rename; drafts and history survive a page reload",
   await expect(host.page.getByRole("status")).toHaveText("设备名称已保存");
   await host.page.reload();
   await host.page
-    .getByRole("button", { name: "打开 资料共享群", exact: true })
+    .getByRole("button", { name: "打开 客户端资料群", exact: true })
     .click();
   await expect(
     host.page.getByRole("textbox", { name: "发送文字" }),
   ).toHaveValue("还没有发送的草稿");
   await expect(
-    host.page.locator(".message").filter({ hasText: "群里只有一条消息" }),
+    host.page.locator(".message").filter({ hasText: "群文件只发送一条消息" }),
   ).toHaveCount(1);
   await host.page.getByRole("button", { name: "关于", exact: true }).click();
   await expect(
@@ -224,7 +192,7 @@ test("settings exposes device rename; drafts and history survive a page reload",
   await expect(host.page.getByText(version, { exact: true })).toBeVisible();
   await host.context.close();
 });
-test("mobile has list-to-conversation navigation and no horizontal overflow", async ({
+test("mobile browser opens its host directly without device navigation or horizontal overflow", async ({
   browser,
 }) => {
   const context = await browser.newContext({
@@ -239,11 +207,10 @@ test("mobile has list-to-conversation navigation and no horizontal overflow", as
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
-  await page
-    .getByRole("button", { name: "连接 重命名后的电脑", exact: true })
-    .click();
+  await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await expect(page.getByRole("textbox", { name: "发送文字" })).toBeVisible();
-  await expect(page.getByRole("navigation", { name: "主要功能" })).toBeHidden();
+  await expect(page.getByRole("navigation", { name: "主要功能" })).toBeVisible();
+  await expect(page.locator(".conversation-panel")).toHaveCount(0);
   await page.getByRole("textbox", { name: "发送文字" }).fill("手机会话");
   await page.getByRole("button", { name: "发送", exact: true }).click();
   await expect(
@@ -255,7 +222,7 @@ test("mobile has list-to-conversation navigation and no horizontal overflow", as
     ),
   ).toBe(true);
   await page.screenshot({ path: ".playwright/mobile.png", fullPage: true });
-  await page.getByRole("button", { name: "返回设备列表" }).click();
+  await expect(page.getByRole("button", { name: "返回设备列表" })).toHaveCount(0);
   await expect(
     page.getByRole("navigation", { name: "主要功能" }),
   ).toBeVisible();
@@ -301,7 +268,7 @@ test("browser names are automatic, editable and remembered without changing iden
   ).toBeVisible();
   const identity = (await me(page)).id;
   expect((await me(page)).platform).toBe("Windows · Edge");
-  await expect(page.locator(".list-footer small")).toHaveText("Windows · Edge");
+  await expect(page.locator(".list-footer")).toHaveCount(0);
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await expect(page.getByLabel("设备名称", { exact: true })).toHaveValue(
     automatic,

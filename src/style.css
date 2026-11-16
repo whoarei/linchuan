@@ -1833,3 +1833,10 @@ input::placeholder {
   padding: 0;
   border-radius: 0;
 }
+
+.browser-downloads { display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
+@media (max-width: 760px) {
+  .browser-only.chat-open { padding-bottom:calc(65px + env(safe-area-inset-bottom)); }
+  .browser-only.chat-open .function-rail { display:flex; }
+  .browser-only.chat-open .chat-panel { width:100%; min-width:0; }
+}

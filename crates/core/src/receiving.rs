@@ -17,6 +17,7 @@ pub struct SavedFile {
     pub status: String,
     pub error: Option<String>,
     pub mime: String,
+    pub size: u64,
 }
 #[derive(Clone, Debug)]
 pub struct SaveJob {
@@ -95,7 +96,7 @@ impl App {
         let file = transfer
             .files
             .iter()
-            .find(|f| f.meta.id == file_id && f.complete && f.path.is_file())
+            .find(|f| f.meta.id == file_id && f.available())
             .ok_or_else(|| anyhow::anyhow!("应用内副本已清理，无法重新保存"))?;
         let (message, id, transfer_id, name) = (
             transfer.view.message_id.clone(),
@@ -114,10 +115,10 @@ impl App {
     pub async fn saved_files(&self, messages: Vec<String>) -> anyhow::Result<Vec<SavedFile>> {
         anyhow::ensure!(messages.len() <= 200, "一次读取的消息过多");
         self.0.store.run(move |c, _| {
-            let mut q = c.prepare("SELECT s.message_id,s.file_id,s.name,s.directory,s.location,s.status,s.error,a.mime FROM saved_files s JOIN attachments a ON a.message_id=s.message_id AND a.file_id=s.file_id WHERE s.message_id=?1")?;
+            let mut q = c.prepare("SELECT s.message_id,s.file_id,s.name,s.directory,s.location,s.status,s.error,a.mime,a.size FROM saved_files s JOIN attachments a ON a.message_id=s.message_id AND a.file_id=s.file_id WHERE s.message_id=?1")?;
             let mut files=Vec::new();
             for message in messages {
-                files.extend(q.query_map([message], |r| Ok(SavedFile {message_id:r.get(0)?,file_id:r.get(1)?,name:r.get(2)?,directory:r.get(3)?,location:r.get(4)?,status:r.get(5)?,error:r.get(6)?,mime:r.get(7)?}))?.collect::<rusqlite::Result<Vec<_>>>()?);
+                files.extend(q.query_map([message], |r| Ok(SavedFile {message_id:r.get(0)?,file_id:r.get(1)?,name:r.get(2)?,directory:r.get(3)?,location:r.get(4)?,status:r.get(5)?,error:r.get(6)?,mime:r.get(7)?,size:r.get(8)?}))?.collect::<rusqlite::Result<Vec<_>>>()?);
             }
             Ok(files)
         }).await
@@ -125,8 +126,15 @@ impl App {
     async fn receive_jobs(&self) -> anyhow::Result<Vec<SaveJob>> {
         self.0.store.run(|c, root| {
             let directory: String = c.query_row("SELECT value FROM app_settings WHERE key='receive_directory'",[],|r|r.get(0)).optional()?.unwrap_or_default();
-            let mut q = c.prepare("SELECT s.message_id,s.file_id,a.name,a.mime,b.relative_path,a.size FROM saved_files s JOIN attachments a ON a.message_id=s.message_id AND a.file_id=s.file_id JOIN delivery_files df ON df.delivery_id=s.transfer_id AND df.file_id=s.file_id JOIN file_blobs b ON b.id=df.blob_id WHERE s.status='pending' ORDER BY s.updated_at")?;
-            let jobs = q.query_map([], |r| { let path:String=r.get(4)?; Ok(SaveJob {message_id:r.get(0)?,file_id:r.get(1)?,name:safe_name(&r.get::<_,String>(2)?),mime:r.get(3)?,source:root.join(path),directory:directory.clone(),size:r.get(5)?,progress:None}) })?.collect::<rusqlite::Result<_>>()?;
+            let rows:Vec<(String,String,String)>=c.prepare("SELECT message_id,file_id,transfer_id FROM saved_files WHERE status='pending' ORDER BY updated_at")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            let mut jobs=Vec::new();
+            for(message_id,file_id,transfer_id) in rows {
+                if let Some(t)=crate::store::query_transfer(c,root,&transfer_id)? {
+                    if let Some(f)=t.files.into_iter().find(|f|f.meta.id==file_id && f.available()) {
+                        jobs.push(SaveJob{message_id,file_id,source:f.path,name:safe_name(&f.meta.name),mime:f.meta.mime,directory:directory.clone(),size:f.meta.size,progress:None});
+                    }
+                }
+            }
             Ok(jobs)
         }).await
     }
@@ -238,7 +246,7 @@ impl App {
         let f = t
             .files
             .iter()
-            .find(|f| f.meta.id == file_id && f.complete && f.path.is_file())
+            .find(|f| f.meta.id == file_id && f.available())
             .ok_or("文件副本已清理")?;
         Ok(SaveJob {
             message_id: t.view.message_id.clone(),

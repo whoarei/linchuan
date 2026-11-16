@@ -194,6 +194,44 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
+  fun pickFiles(invoke: Invoke) {
+    try {
+      val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*").addCategory(Intent.CATEGORY_OPENABLE)
+        .putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true).putExtra(Intent.EXTRA_LOCAL_ONLY, true)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+      startActivityForResult(invoke, intent, "filesResult")
+    } catch(e: Exception) { invoke.reject("无法打开文件选择器：" + e.message) }
+  }
+
+  @ActivityCallback
+  fun filesResult(invoke: Invoke, result: ActivityResult) {
+    try {
+      val files = org.json.JSONArray()
+      if(result.resultCode == Activity.RESULT_OK) {
+        val data = result.data
+        val uris = if(data?.clipData != null) (0 until data.clipData!!.itemCount).map { data.clipData!!.getItemAt(it).uri }
+          else listOfNotNull(data?.data)
+        if(uris.size > 64) throw Exception("一次最多发送 64 个文件")
+        for(uri in uris) {
+          val flags = (data?.flags ?: 0) and Intent.FLAG_GRANT_READ_URI_PERMISSION
+          if(flags != 0 && ((data?.flags ?: 0) and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) != 0)
+            resolver.takePersistableUriPermission(uri, flags)
+          var size: Long? = null
+          var name: String? = null
+          resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use {
+            if(it.moveToFirst()) { name=it.getString(0); if(!it.isNull(1)) size=it.getLong(1) }
+          }
+          val length = size ?: resolver.openAssetFileDescriptor(uri,"r")?.use { if(it.length >= 0) it.length else null }
+          if(length == null || length < 0) throw Exception("此文件来源无法读取大小，请选择本机文件")
+          files.put(JSObject().put("location",uri.toString()).put("name",name ?: "file").put("size",length)
+            .put("mime",resolver.getType(uri) ?: "application/octet-stream"))
+        }
+      }
+      invoke.resolve(JSObject().put("files",files))
+    } catch(e: Exception) { invoke.reject("无法选择文件：" + e.message) }
+  }
+
+  @Command
   fun pickDirectory(invoke: Invoke) {
     try {
       val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).addFlags(

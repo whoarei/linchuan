@@ -1,6 +1,7 @@
 mod api;
 mod conversations;
 mod discovery;
+pub mod files;
 mod groups;
 mod identity;
 mod model;
@@ -50,11 +51,15 @@ struct Inner {
     pub state: Mutex<State>,
     events: broadcast::Sender<()>,
     client: reqwest::Client,
-    streams: Semaphore,
+    streams: Arc<Semaphore>,
     space: storage::SpaceBudget,
     space_leases: std::sync::Mutex<std::collections::HashMap<String, storage::Reservation>>,
     mdns: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
     stop: tokio::sync::watch::Sender<bool>,
+    sources: std::sync::Mutex<std::collections::HashMap<String, (StoredFile, u64)>>,
+    file_io: std::sync::RwLock<Option<files::PlatformFiles>>,
+    outgoing: Semaphore,
+    receive_directories: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 #[derive(Clone)]
 pub struct App(Arc<Inner>);
@@ -147,12 +152,19 @@ impl App {
                 .redirect(reqwest::redirect::Policy::none())
                 .no_proxy()
                 .build()?,
-            streams: Semaphore::new(MAX_STREAMS),
+            streams: Arc::new(Semaphore::new(MAX_STREAMS)),
             space: storage::SpaceBudget::default(),
             space_leases: std::sync::Mutex::new(std::collections::HashMap::new()),
             mdns: std::sync::Mutex::new(None),
             stop,
+            sources: std::sync::Mutex::new(std::collections::HashMap::new()),
+            file_io: std::sync::RwLock::new(None),
+            outgoing: Semaphore::new(4),
+            receive_directories: std::sync::Mutex::new(std::collections::HashMap::new()),
         }));
+        app.recover_receive_outputs()
+            .await
+            .map_err(anyhow::Error::msg)?;
         {
             let mut state = app.0.state.lock().await;
             app.commit(&mut state).await?;
@@ -200,7 +212,8 @@ impl App {
                 let used: u64 = transfer
                     .files
                     .iter()
-                    .filter(|f| f.complete && f.path.is_file())
+                    .filter(|f| f.cached() && f.available())
+                    .filter(|f| f.cached())
                     .map(|f| f.meta.size)
                     .sum();
                 state.reserved = state
@@ -215,6 +228,11 @@ impl App {
                 {
                     let mut leases = self.0.space_leases.lock().unwrap();
                     for t in state.transfers.values().filter(|t| t.view.terminal()) {
+                        self.0
+                            .receive_directories
+                            .lock()
+                            .unwrap()
+                            .remove(&t.view.id);
                         leases.remove(&format!("incoming:{}", t.view.id));
                         if t.view.status != "completed" {
                             leases.remove(&format!("export:{}", t.view.id));
@@ -260,12 +278,14 @@ impl App {
                     .values()
                     .filter(|d| !d.sent)
                     .flat_map(|d| &d.files)
+                    .filter(|f| f.cached())
                     .map(|f| f.meta.size)
                     .sum();
                 let new_budget: u64 = drafts
                     .values()
                     .filter(|d| !d.sent)
                     .flat_map(|d| &d.files)
+                    .filter(|f| f.cached())
                     .map(|f| f.meta.size)
                     .sum();
                 restored.reserved = restored.reserved.saturating_sub(old_budget) + new_budget;
@@ -278,17 +298,29 @@ impl App {
         }
     }
     async fn cache_transfer(&self, id: &str) -> Result<(), api::Error> {
-        if self.0.state.lock().await.transfers.contains_key(id) {
+        if self
+            .0
+            .state
+            .lock()
+            .await
+            .transfers
+            .get(id)
+            .is_some_and(|t| !t.view.terminal())
+        {
             return Ok(());
         }
-        if let Some(t) = self
+        if let Some(mut t) = self
             .0
             .store
             .transfer(id.into())
             .await
             .map_err(|e| api::Error::storage(e.to_string()))?
         {
-            self.0.state.lock().await.transfers.insert(id.into(), t);
+            let mut state = self.0.state.lock().await;
+            if let Some(previous) = state.transfers.get(id) {
+                t.peer_token = previous.peer_token.clone();
+            }
+            state.transfers.insert(id.into(), t);
         }
         Ok(())
     }
@@ -375,6 +407,26 @@ impl App {
     async fn sweep(&self) {
         let mut paths = Vec::new();
         let mut state = self.0.state.lock().await;
+        let mut expired = false;
+        for transfer in state.transfers.values_mut() {
+            let live_browser = transfer
+                .files
+                .iter()
+                .any(|f| f.storage == FileStorage::Browser)
+                || transfer.view.recipient_id.starts_with("browser-");
+            if live_browser
+                && !transfer.view.terminal()
+                && now().saturating_sub(transfer.view.created) > 300
+            {
+                transfer.view.status = "interrupted".into();
+                transfer.view.error = Some("浏览器传输连续 5 分钟无进展，请重新发送或下载".into());
+                expired = true;
+            }
+        }
+        if expired {
+            let _ = self.commit(&mut state).await;
+            self.notify();
+        }
         state.tickets.retain(|_, t| t.expires > now());
         state.sessions.retain(|_, s| now() < s.expires);
         state.peers.retain(|_, _| true);
@@ -400,7 +452,11 @@ impl App {
                 state.reserved = state.reserved.saturating_sub(if d.sent {
                     0
                 } else {
-                    d.files.iter().map(|f| f.meta.size).sum()
+                    d.files
+                        .iter()
+                        .filter(|f| f.cached())
+                        .map(|f| f.meta.size)
+                        .sum()
                 });
                 if !d.sent {
                     paths.push(self.0.work.join(&id));

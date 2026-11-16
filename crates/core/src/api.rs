@@ -35,6 +35,12 @@ impl Error {
     pub fn unauthorized() -> Self {
         Self(StatusCode::UNAUTHORIZED, "连接已失效，请重新配对".into())
     }
+    pub fn forbidden() -> Self {
+        Self(
+            StatusCode::FORBIDDEN,
+            "浏览器只能与当前连接的客户端互传".into(),
+        )
+    }
     pub(crate) fn missing() -> Self {
         Self(StatusCode::NOT_FOUND, "内容不存在或已过期".into())
     }
@@ -119,6 +125,10 @@ pub fn router(app: App) -> Router {
         .route("/api/drafts/{id}/send", post(send))
         .route("/api/drafts/{id}/cancel", post(discard_draft))
         .route("/api/transfers/{id}/decision", post(decision))
+        .route(
+            "/api/transfers/{id}/files/{file}/upload",
+            put(browser_upload).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/transfers/{id}/cancel", post(cancel))
         .route("/api/transfers/{id}/files/{file}/ticket", post(ticket))
         .route("/download/{ticket}", get(download))
@@ -222,7 +232,7 @@ pub(crate) fn rate_limit(state: &mut crate::model::State, key: String, limit: u3
 async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Value>> {
     let p = app.principal(token(&headers)?).await?;
     let info = app.info().await;
-    let conversations = app
+    let mut conversations = app
         .0
         .store
         .conversations(p.id.clone())
@@ -273,14 +283,20 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
     let mut transfers: Vec<_> = state
         .transfers
         .values()
-        .filter(|t| t.view.sender_id == p.id || t.view.recipient_id == p.id)
+        .filter(|t| {
+            (t.view.sender_id == p.id || t.view.recipient_id == p.id)
+                && (p.owner
+                    || (t.view.group_id.is_none()
+                        && (t.view.sender_id == app.0.device_id
+                            || t.view.recipient_id == app.0.device_id)))
+        })
         .map(|t| t.view.clone())
         .collect();
     transfers.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
     let groups: Vec<_> = state
         .groups
         .values()
-        .filter(|g| g.members.iter().any(|m| m.device.id == p.id))
+        .filter(|g| p.owner && g.members.iter().any(|m| m.device.id == p.id))
         .cloned()
         .map(|mut group| {
             for member in &mut group.members {
@@ -291,6 +307,13 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
             group
         })
         .collect();
+    if !p.owner {
+        conversations.retain(|c| {
+            c.conversation.kind == "direct"
+                && c.conversation.peer_id.as_deref() == Some(app.0.device_id.as_str())
+        });
+        devices.clear();
+    }
     let platform = state
         .profiles
         .get(&p.id)
@@ -366,7 +389,9 @@ async fn add_peer(
     headers: HeaderMap,
     Json(value): Json<Value>,
 ) -> Result<Json<Value>> {
-    app.principal(token(&headers)?).await?;
+    if !app.principal(token(&headers)?).await?.owner {
+        return Err(Error::forbidden());
+    }
     let address = local_address(value["address"].as_str().unwrap_or(""))?;
     // Addresses may be reassigned. remember_peer checks the stable device ID
     // and its recorded key without treating an old IP/port as an identity.
@@ -403,49 +428,75 @@ async fn create_draft(
     Json(request): Json<DraftRequest>,
 ) -> Result<Json<DraftResponse>> {
     let p = app.principal(token(&headers)?).await?;
-    let total = validate_files(&request.files)?;
-    let id = uid();
-    let mut state = app.0.state.lock().await;
-    if state.drafts.len() >= 256 {
-        return Err(Error::conflict(
-            "临时空间不足或草稿过多，请稍后重试或重启应用清理",
-        ));
+    validate_files(&request.files)?;
+    if request.streaming && p.owner {
+        return Err(Error::bad("原生文件请使用本机文件来源"));
     }
-    let files: Vec<_> = request
-        .files
-        .into_iter()
-        .map(|f| {
+    let id = uid();
+    let mut files = Vec::new();
+    for input in request.files {
+        if let Some(source) = input.source_id {
+            if !p.owner {
+                return Err(Error::forbidden());
+            }
+            let file = app
+                .0
+                .sources
+                .lock()
+                .unwrap()
+                .get(&source)
+                .map(|v| v.0.clone())
+                .ok_or_else(|| Error::bad("原文件引用已失效，请重新选择"))?;
+            let mut file = file;
+            file.meta.id = uid();
+            files.push(file);
+        } else {
             let file_id = uid();
-            StoredFile {
+            files.push(StoredFile {
                 path: app.0.work.join(&id).join(&file_id),
                 meta: FileMeta {
                     id: file_id,
-                    name: f.name,
-                    size: f.size,
-                    mime: f.mime,
+                    name: input.name,
+                    size: input.size,
+                    mime: input.mime,
                 },
                 complete: false,
                 uploading: false,
-            }
-        })
-        .collect();
+                storage: if request.streaming {
+                    FileStorage::Browser
+                } else {
+                    FileStorage::Cache
+                },
+                downloaded: false,
+            });
+        }
+    }
     let lease = app
         .0
         .space
         .reserve(
             files
                 .iter()
+                .filter(|f| f.cached())
                 .map(|f| (f.meta.id.clone(), app.cache_location(), f.meta.size))
                 .collect(),
         )
         .await
         .map_err(Error::conflict)?;
+    let mut state = app.0.state.lock().await;
+    if state.drafts.len() >= 256 {
+        return Err(Error::conflict("待发送文件过多，请稍后重试"));
+    }
     tokio::fs::create_dir(app.0.work.join(&id)).await?;
     let response = DraftResponse {
         id: id.clone(),
         files: files.iter().map(|f| f.meta.clone()).collect(),
     };
-    state.reserved += total;
+    state.reserved += files
+        .iter()
+        .filter(|f| f.cached())
+        .map(|f| f.meta.size)
+        .sum::<u64>();
     state.drafts.insert(
         id.clone(),
         Draft {
@@ -566,6 +617,9 @@ async fn upload_draft(
             .iter_mut()
             .find(|f| f.meta.id == file_id)
             .ok_or_else(Error::missing)?;
+        if !file.cached() {
+            return Err(Error::bad("此文件不需要准备缓存"));
+        }
         if file.uploading || file.complete {
             return Err(Error::conflict("文件已上传或正在上传"));
         }
@@ -644,7 +698,12 @@ async fn discard_draft(
     if draft.files.iter().any(|f| f.uploading) {
         return Err(Error::conflict("上传正在结束，请稍后重试"));
     }
-    let bytes: u64 = draft.files.iter().map(|f| f.meta.size).sum();
+    let bytes: u64 = draft
+        .files
+        .iter()
+        .filter(|f| f.cached())
+        .map(|f| f.meta.size)
+        .sum();
     match tokio::fs::remove_dir_all(app.0.work.join(&draft.id)).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -674,7 +733,12 @@ async fn send(
         .filter(|d| d.owner == p.id)
         .ok_or_else(Error::missing)?
         .clone();
-    if draft.sent || draft.files.iter().any(|f| !f.complete) {
+    if draft.sent
+        || draft
+            .files
+            .iter()
+            .any(|f| !f.complete && f.storage != FileStorage::Browser)
+    {
         return Err(Error::conflict("文件尚未上传完成或草稿已发送"));
     }
     if draft.files.is_empty() && request.text.trim().is_empty() {
@@ -690,6 +754,9 @@ async fn send(
         return Err(Error::conflict("同时进行的传输过多"));
     }
     let mut targets = request.targets;
+    if !p.owner && (request.group_id.is_some() || targets != [app.0.device_id.clone()]) {
+        return Err(Error::forbidden());
+    }
     if let Some(group_id) = &request.group_id {
         let group = state
             .groups
@@ -700,6 +767,13 @@ async fn send(
                     .any(|m| m.device.id == p.id && m.state == "joined")
             })
             .ok_or_else(Error::missing)?;
+        if group
+            .members
+            .iter()
+            .any(|m| m.state == "joined" && m.device.id.starts_with("browser-"))
+        {
+            return Err(Error::bad("此旧群包含浏览器成员，请新建仅包含客户端的群聊"));
+        }
         targets = group
             .members
             .iter()
@@ -724,6 +798,9 @@ async fn send(
             .get(&target)
             .ok_or_else(Error::missing)?
             .clone();
+        if device.kind == "browser" && device.host_device_id != app.0.device_id {
+            return Err(Error::forbidden());
+        }
         let address = if target == info.id
             || state.sessions.values().any(|s| {
                 s.id == target && s.expires > now() && now().saturating_sub(s.last_seen) < 45
@@ -754,10 +831,17 @@ async fn send(
     }
     let original_draft = draft.clone();
     let destination = app.0.directory.join("files").join(&draft.id);
-    tokio::fs::rename(app.0.work.join(&draft.id), &destination).await?;
-    crate::sync_directory(app.0.directory.join("files")).await?;
-    for file in &mut draft.files {
-        file.path = destination.join(&file.meta.id);
+    let has_cache = draft.files.iter().any(|f| f.cached());
+    if has_cache {
+        tokio::fs::rename(app.0.work.join(&draft.id), &destination).await?;
+        crate::sync_directory(app.0.directory.join("files")).await?;
+        for file in &mut draft.files {
+            if file.cached() {
+                file.path = destination.join(&file.meta.id);
+            }
+        }
+    } else {
+        let _ = tokio::fs::remove_dir(app.0.work.join(&draft.id)).await;
     }
     let message_id = uid();
     let created_at = now_ms();
@@ -822,10 +906,13 @@ async fn send(
         .composition
         .insert(conversation.id.clone(), String::new());
     if let Err(error) = app.commit(&mut state).await {
-        let _ = tokio::fs::rename(&destination, app.0.work.join(&id)).await;
+        if has_cache {
+            let _ = tokio::fs::rename(&destination, app.0.work.join(&id)).await;
+        }
         state.reserved += original_draft
             .files
             .iter()
+            .filter(|f| f.cached())
             .map(|f| f.meta.size)
             .sum::<u64>();
         state
@@ -865,51 +952,59 @@ async fn decision(
     if transfer.view.status != "pending" {
         return Err(Error::conflict("该请求已处理"));
     }
-    if accept {
-        let incoming_space = app
+    if !p.owner && (transfer.view.group_id.is_some() || transfer.view.sender_id != app.0.device_id)
+    {
+        return Err(Error::forbidden());
+    }
+    if accept
+        && p.owner
+        && transfer
+            .files
+            .iter()
+            .any(|f| matches!(f.storage, FileStorage::Browser | FileStorage::Receiving))
+    {
+        let directory = app.target_directory().await?;
+        let lease = app
             .0
-            .space_leases
-            .lock()
-            .unwrap()
-            .get(&format!("incoming:{id}"))
-            .cloned();
-        if let Some(lease) = incoming_space {
-            lease.check().map_err(Error::conflict)?;
-        }
-        if p.id == app.0.device_id && !transfer.files.is_empty() {
-            let directory = app
-                .receive_directory()
-                .await
-                .map_err(|e| Error::storage(e.to_string()))?;
-            if !directory.is_empty() {
-                let requests = transfer
+            .space
+            .reserve(
+                transfer
                     .files
                     .iter()
+                    .filter(|f| !f.complete)
                     .map(|f| {
                         (
-                            format!("export:{}:{}", transfer.view.message_id, f.meta.id),
+                            format!("receive:{id}:{}", f.meta.id),
                             directory.clone(),
                             f.meta.size,
                         )
                     })
-                    .collect();
-                let lease = app
-                    .0
-                    .space
-                    .reserve(requests)
-                    .await
-                    .map_err(Error::conflict)?;
-                app.0
-                    .space_leases
-                    .lock()
-                    .unwrap()
-                    .insert(format!("export:{id}"), lease);
-            }
-        }
+                    .collect(),
+            )
+            .await
+            .map_err(Error::conflict)?;
+        app.0
+            .space_leases
+            .lock()
+            .unwrap()
+            .insert(format!("incoming:{id}"), lease);
+        app.0
+            .receive_directories
+            .lock()
+            .unwrap()
+            .insert(id.clone(), directory);
     }
     transfer.view.status = if !accept {
         "rejected"
-    } else if transfer.incoming_remote {
+    } else if transfer.files.is_empty() {
+        "completed"
+    } else if !p.owner
+        || transfer.incoming_remote
+        || transfer
+            .files
+            .iter()
+            .any(|f| f.storage == FileStorage::Browser)
+    {
         "accepted"
     } else {
         "completed"
@@ -918,12 +1013,15 @@ async fn decision(
     if transfer.view.status == "completed" {
         transfer.view.bytes = transfer.view.total;
     }
+    if accept {
+        transfer.view.created = now();
+    }
     if let Err(error) = app.commit(&mut state).await {
         app.0
             .space_leases
             .lock()
             .unwrap()
-            .remove(&format!("export:{id}"));
+            .remove(&format!("incoming:{id}"));
         return Err(error);
     }
     drop(state);
@@ -941,7 +1039,13 @@ async fn cancel(
     let transfer = state
         .transfers
         .get_mut(&id)
-        .filter(|t| t.view.sender_id == p.id || t.view.recipient_id == p.id)
+        .filter(|t| {
+            (t.view.sender_id == p.id || t.view.recipient_id == p.id)
+                && (p.owner
+                    || (t.view.group_id.is_none()
+                        && (t.view.sender_id == app.0.device_id
+                            || t.view.recipient_id == app.0.device_id)))
+        })
         .ok_or_else(Error::missing)?;
     if transfer.view.terminal() {
         return Err(Error::conflict("该传输已结束"));
@@ -963,17 +1067,33 @@ async fn ticket(
     let transfer = state
         .transfers
         .get(&id)
-        .filter(|t| {
-            t.view.sender_id == p.id
-                || (t.view.recipient_id == p.id && t.view.status == "completed")
-        })
+        .filter(|t| t.view.sender_id == p.id || t.view.recipient_id == p.id)
         .ok_or_else(Error::missing)?;
+    if !p.owner
+        && (transfer.view.group_id.is_some()
+            || (transfer.view.sender_id != app.0.device_id
+                && transfer.view.recipient_id != app.0.device_id))
+    {
+        return Err(Error::forbidden());
+    }
+    if transfer.view.recipient_id == p.id
+        && !matches!(
+            transfer.view.status.as_str(),
+            "accepted" | "transferring" | "completed"
+        )
+    {
+        return Err(Error::conflict("请先接收文件"));
+    }
     let file = transfer
         .files
         .iter()
-        .find(|f| f.meta.id == file_id && f.complete && f.path.is_file())
+        .find(|f| f.meta.id == file_id && f.available())
         .ok_or_else(Error::missing)?
         .clone();
+    let track = !p.owner
+        && transfer.view.recipient_id == p.id
+        && !transfer.view.terminal()
+        && !file.downloaded;
     if state.tickets.len() >= 2048 {
         return Err(Error::conflict("下载请求过多，请稍后重试"));
     }
@@ -981,8 +1101,9 @@ async fn ticket(
     state.tickets.insert(
         key.clone(),
         Ticket {
-            path: file.path,
-            name: file.meta.name,
+            file,
+            transfer_id: id,
+            track,
             expires: now() + 120,
         },
     );
@@ -998,12 +1119,108 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
         .remove(&key)
         .filter(|t| t.expires > now())
         .ok_or_else(Error::missing)?;
-    let file = tokio::fs::File::open(ticket.path).await?;
-    let length = file.metadata().await?.len();
-    let encoded: String = url::form_urlencoded::byte_serialize(ticket.name.as_bytes())
+    let _permit = app
+        .0
+        .streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::conflict("同时下载过多，请稍后重试"))?;
+    let input = app.open_source(&ticket.file).await.map_err(Error::bad)?;
+    let length = ticket.file.meta.size;
+    let encoded: String = url::form_urlencoded::byte_serialize(ticket.file.meta.name.as_bytes())
         .collect::<String>()
         .replace('+', "%20");
-    let mut response = Body::from_stream(ReaderStream::new(file)).into_response();
+    if ticket.track {
+        let mut state = app.0.state.lock().await;
+        let t = state
+            .transfers
+            .get_mut(&ticket.transfer_id)
+            .ok_or_else(Error::missing)?;
+        if !matches!(t.view.status.as_str(), "accepted" | "transferring") {
+            return Err(Error::conflict("传输已结束"));
+        }
+        let f = t
+            .files
+            .iter_mut()
+            .find(|f| f.meta.id == ticket.file.meta.id)
+            .ok_or_else(Error::missing)?;
+        if f.uploading || f.downloaded {
+            return Err(Error::conflict("文件已下载或正在下载"));
+        }
+        f.uploading = true;
+        t.view.status = "transferring".into();
+        app.commit(&mut state).await?;
+        drop(state);
+        app.notify();
+    }
+    let verification = Some(input.try_clone().await?);
+    let stream = futures_util::stream::try_unfold(
+        DownloadStream {
+            app: app.clone(),
+            ticket,
+            reader: Some(ReaderStream::new(input)),
+            verification,
+            bytes: 0,
+            finished: false,
+            updated: std::time::Instant::now(),
+            _permit,
+        },
+        |mut download| async move {
+            if download.finished {
+                return Ok(None);
+            }
+            if download.ticket.track {
+                let state = download.app.0.state.lock().await;
+                if state
+                    .transfers
+                    .get(&download.ticket.transfer_id)
+                    .is_none_or(|t| t.view.terminal())
+                {
+                    return Err(std::io::Error::other("传输已取消"));
+                }
+            }
+            match download.reader.as_mut().unwrap().next().await {
+                Some(Ok(chunk)) => {
+                    download.bytes += chunk.len() as u64;
+                    if download.bytes > download.ticket.file.meta.size {
+                        return Err(std::io::Error::other("原文件大小已变化"));
+                    }
+                    if download.bytes == download.ticket.file.meta.size {
+                        let input = download.verification.take().unwrap().into_std().await;
+                        App::check_source(&download.ticket.file, &input)
+                            .map_err(std::io::Error::other)?;
+                        if download.ticket.track {
+                            download.report(true).await.map_err(std::io::Error::other)?;
+                        }
+                        download.finish();
+                    } else if download.ticket.track && download.updated.elapsed().as_millis() >= 200
+                    {
+                        download
+                            .report(false)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        download.updated = std::time::Instant::now();
+                    }
+                    Ok(Some((chunk, download)))
+                }
+                Some(Err(error)) => Err(error),
+                None => {
+                    if download.bytes != download.ticket.file.meta.size {
+                        return Err(std::io::Error::other("文件不完整"));
+                    }
+                    let input = download.verification.take().unwrap().into_std().await;
+                    App::check_source(&download.ticket.file, &input)
+                        .map_err(std::io::Error::other)?;
+                    if download.ticket.track {
+                        download.report(true).await.map_err(std::io::Error::other)?;
+                    }
+                    download.finish();
+                    Ok(None)
+                }
+            }
+        },
+    );
+    let mut response = Body::from_stream(stream).into_response();
     let headers = response.headers_mut();
     headers.insert(
         "content-type",
@@ -1018,6 +1235,97 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
         .map_err(|_| Error::bad("文件名无效"))?,
     );
     Ok(response)
+}
+struct DownloadStream {
+    app: App,
+    ticket: Ticket,
+    reader: Option<ReaderStream<tokio::fs::File>>,
+    verification: Option<tokio::fs::File>,
+    bytes: u64,
+    finished: bool,
+    updated: std::time::Instant,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl DownloadStream {
+    fn finish(&mut self) {
+        self.finished = true;
+    }
+    async fn report(&self, done: bool) -> std::result::Result<(), String> {
+        let mut state = self.app.0.state.lock().await;
+        let t = state
+            .transfers
+            .get_mut(&self.ticket.transfer_id)
+            .ok_or("传输不存在")?;
+        if t.view.terminal() {
+            return Err("传输已结束".into());
+        }
+        if done {
+            t.view.error = None;
+            let file = t
+                .files
+                .iter_mut()
+                .find(|f| f.meta.id == self.ticket.file.meta.id)
+                .ok_or("文件不存在")?;
+            file.downloaded = true;
+            file.uploading = false;
+        }
+        t.view.created = now();
+        t.view.bytes = t
+            .files
+            .iter()
+            .filter(|f| f.downloaded && f.meta.id != self.ticket.file.meta.id)
+            .map(|f| f.meta.size)
+            .sum::<u64>()
+            + self.bytes;
+        if t.files.iter().all(|f| f.downloaded) {
+            t.view.status = "completed".into();
+        }
+        if done {
+            self.app
+                .commit(&mut state)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        drop(state);
+        self.app.notify();
+        Ok(())
+    }
+}
+impl Drop for DownloadStream {
+    fn drop(&mut self) {
+        if !self.ticket.track || self.finished {
+            return;
+        }
+        let app = self.app.clone();
+        let id = self.ticket.transfer_id.clone();
+        let file = self.ticket.file.meta.id.clone();
+        tokio::spawn(async move {
+            let mut state = app.0.state.lock().await;
+            if let Some(t) = state.transfers.get_mut(&id) {
+                if let Some(f) = t.files.iter_mut().find(|f| f.meta.id == file) {
+                    f.uploading = false;
+                }
+                if !t.view.terminal() {
+                    t.view.status = if t.files.iter().any(|f| f.uploading) {
+                        "transferring"
+                    } else {
+                        "accepted"
+                    }
+                    .into();
+                    t.view.error = Some("下载中断，可重新下载；原文件需要保持可用".into());
+                    t.view.bytes = t
+                        .files
+                        .iter()
+                        .filter(|f| f.downloaded)
+                        .map(|f| f.meta.size)
+                        .sum();
+                }
+                let _ = app.commit(&mut state).await;
+            }
+            drop(state);
+            app.notify();
+        });
+    }
 }
 async fn peer_offer(
     AxState(app): AxState<App>,
@@ -1038,6 +1346,7 @@ async fn peer_offer(
             name: f.name.clone(),
             size: f.size,
             mime: f.mime.clone(),
+            source_id: None,
         })
         .collect();
     let total = validate_files(&input)?;
@@ -1059,13 +1368,8 @@ async fn peer_offer(
     };
     let mut state = app.0.state.lock().await;
     rate_limit(&mut state, format!("offer:{}", addr.ip()), 60)?;
-    if recipient != info.id
-        && !state
-            .sessions
-            .values()
-            .any(|s| s.id == recipient && s.expires > now())
-    {
-        return Err(Error::bad("接收身份不存在"));
+    if recipient != info.id {
+        return Err(Error::forbidden());
     }
     let sender = if let Some(env) = &offer.identity {
         crate::identity::verify(env).map_err(|e| Error::bad(e.to_string()))?;
@@ -1074,13 +1378,8 @@ async fn peer_offer(
         {
             return Err(Error::bad("消息签名与内容不符"));
         }
-        if offer.sender_id != env.host_id
-            && offer
-                .sender_id
-                .strip_prefix("browser-")
-                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
-        {
-            return Err(Error::bad("发送身份无效"));
+        if offer.sender_id != env.host_id {
+            return Err(Error::forbidden());
         }
         if let Some(host) = state.profiles.get(&env.host_id) {
             if !host.public_key.is_empty() && host.public_key != env.public_key {
@@ -1144,6 +1443,9 @@ async fn peer_offer(
             &crate::identity::token_hash(&format!("{}:{}", addr.ip(), offer.sender_name))[..24]
         )
     };
+    if sender.starts_with("browser-") {
+        return Err(Error::forbidden());
+    }
     if let Some(existing) = state
         .transfers
         .values_mut()
@@ -1183,28 +1485,16 @@ async fn peer_offer(
     }
     let id = uid();
     let token = secret();
-    let path = app.0.directory.join("files").join(&id);
-    let lease = app
-        .0
-        .space
-        .reserve(
-            offer
-                .files
-                .iter()
-                .map(|f| (f.id.clone(), app.cache_location(), f.size))
-                .collect(),
-        )
-        .await
-        .map_err(Error::conflict)?;
-    tokio::fs::create_dir(&path).await?;
     let files = offer
         .files
         .iter()
         .map(|f| StoredFile {
             meta: f.clone(),
-            path: path.join(&f.id),
+            path: Default::default(),
             complete: false,
             uploading: false,
+            storage: FileStorage::Receiving,
+            downloaded: false,
         })
         .collect();
     let recipient_name = state
@@ -1235,7 +1525,6 @@ async fn peer_offer(
         created: now(),
         error: None,
     };
-    state.reserved += total;
     state.transfers.insert(
         id.clone(),
         Transfer {
@@ -1243,15 +1532,10 @@ async fn peer_offer(
             files,
             peer_token: Some(token.clone()),
             incoming_remote: true,
-            reserved: total,
+            reserved: 0,
         },
     );
     app.commit(&mut state).await?;
-    app.0
-        .space_leases
-        .lock()
-        .unwrap()
-        .insert(format!("incoming:{id}"), lease);
     drop(state);
     app.notify();
     Ok(Json(OfferResponse { id, token }))
@@ -1309,18 +1593,93 @@ async fn peer_upload(
         file.clone()
     };
     app.notify();
-    let space = app.space_progress(&file.meta.id, &app.cache_location());
-    let result = write_file(body, &file, Some((app.clone(), id.clone())), space).await;
+    let result = app.receive_stream(&id, &file, body).await;
     let mut state = app.0.state.lock().await;
     let t = authorized_transfer(&mut state, &id, token(&headers)?)?;
     let active = matches!(t.view.status.as_str(), "accepted" | "transferring");
     if let Some(f) = t.files.iter_mut().find(|f| f.meta.id == file_id) {
+        if let Ok(saved) = &result {
+            *f = saved.clone();
+        }
         f.uploading = false;
-        f.complete = result.is_ok() && active;
     }
     if result.is_err() && active {
         t.view.status = "failed".into();
-        t.view.error = Some("文件上传中断，请重新发送".into());
+        t.view.error = result.as_ref().err().map(ToString::to_string);
+    }
+    t.view.bytes = t
+        .files
+        .iter()
+        .filter(|f| f.complete)
+        .map(|f| f.meta.size)
+        .sum();
+    app.commit(&mut state).await?;
+    drop(state);
+    app.notify();
+    result?;
+    if !active {
+        return Err(Error::conflict("传输已取消"));
+    }
+    Ok(Json(json!({"ok":true})))
+}
+async fn browser_upload(
+    AxState(app): AxState<App>,
+    headers: HeaderMap,
+    Path((id, file_id)): Path<(String, String)>,
+    body: Body,
+) -> Result<Json<Value>> {
+    let p = app.principal(token(&headers)?).await?;
+    if p.owner {
+        return Err(Error::forbidden());
+    }
+    let _permit = app
+        .0
+        .streams
+        .try_acquire()
+        .map_err(|_| Error::conflict("同时传输过多，请稍后重试"))?;
+    let file = {
+        let mut state = app.0.state.lock().await;
+        let t = state
+            .transfers
+            .get_mut(&id)
+            .filter(|t| {
+                t.view.sender_id == p.id
+                    && t.view.recipient_id == app.0.device_id
+                    && t.view.group_id.is_none()
+            })
+            .ok_or_else(Error::missing)?;
+        if !matches!(t.view.status.as_str(), "accepted" | "transferring") {
+            return Err(Error::conflict("对方尚未接收或传输已结束"));
+        }
+        let f = t
+            .files
+            .iter_mut()
+            .find(|f| f.meta.id == file_id)
+            .ok_or_else(Error::missing)?;
+        if f.storage != FileStorage::Browser || f.uploading || f.complete {
+            return Err(Error::conflict("文件已上传或正在上传"));
+        }
+        f.uploading = true;
+        t.view.status = "transferring".into();
+        f.clone()
+    };
+    app.notify();
+    let result = app.receive_stream(&id, &file, body).await;
+    let mut state = app.0.state.lock().await;
+    let t = state.transfers.get_mut(&id).ok_or_else(Error::missing)?;
+    let active = !t.view.terminal();
+    if let Some(f) = t.files.iter_mut().find(|f| f.meta.id == file_id) {
+        if let Ok(saved) = &result {
+            *f = saved.clone();
+        }
+        f.uploading = false;
+    }
+    if result.is_err() && active {
+        t.view.status = "failed".into();
+        t.view.error = result.as_ref().err().map(ToString::to_string);
+    }
+    if result.is_ok() && active && t.files.iter().all(|f| f.complete) {
+        t.view.status = "completed".into();
     }
     t.view.bytes = t
         .files
@@ -1441,6 +1800,14 @@ async fn logout(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<V
     state
         .sessions
         .remove(&crate::identity::token_hash(credential));
+    for transfer in state
+        .transfers
+        .values_mut()
+        .filter(|t| !t.view.terminal() && (t.view.sender_id == p.id || t.view.recipient_id == p.id))
+    {
+        transfer.view.status = "cancelled".into();
+        transfer.view.error = Some("浏览器已断开连接".into());
+    }
     app.commit(&mut state).await?;
     drop(state);
     app.notify();
@@ -1461,6 +1828,8 @@ mod transfer_timeout_tests {
             },
             complete: false,
             uploading: true,
+            storage: crate::model::FileStorage::Cache,
+            downloaded: false,
         }
     }
     #[tokio::test(start_paused = true)]

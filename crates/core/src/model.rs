@@ -92,13 +92,46 @@ pub struct FileInput {
     pub size: u64,
     #[serde(default)]
     pub mime: String,
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize, Debug, Default, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FileStorage {
+    #[default]
+    Cache,
+    Original {
+        modified: Option<u64>,
+        #[serde(default)]
+        identity: Option<String>,
+    },
+    Receiving,
+    Browser,
+    Received {
+        directory: String,
+        name: String,
+    },
+}
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StoredFile {
     pub meta: FileMeta,
     pub path: PathBuf,
     pub complete: bool,
     pub uploading: bool,
+    #[serde(default)]
+    pub storage: FileStorage,
+    #[serde(default)]
+    pub downloaded: bool,
+}
+impl StoredFile {
+    pub fn cached(&self) -> bool {
+        self.storage == FileStorage::Cache
+    }
+    pub fn available(&self) -> bool {
+        self.complete
+            && !matches!(self.storage, FileStorage::Browser | FileStorage::Receiving)
+            && (self.path.to_string_lossy().starts_with("content://") || self.path.is_file())
+    }
 }
 #[derive(Clone)]
 pub struct Draft {
@@ -147,8 +180,9 @@ pub struct Transfer {
 }
 #[derive(Clone)]
 pub struct Ticket {
-    pub path: PathBuf,
-    pub name: String,
+    pub file: StoredFile,
+    pub transfer_id: String,
+    pub track: bool,
     pub expires: u64,
 }
 #[derive(Clone, Default)]
@@ -175,6 +209,8 @@ pub struct PairRequest {
 pub struct DraftRequest {
     #[serde(default)]
     pub files: Vec<FileInput>,
+    #[serde(default)]
+    pub streaming: bool,
 }
 #[derive(Serialize)]
 pub struct DraftResponse {
@@ -300,6 +336,7 @@ pub struct MessageFile {
     pub meta: FileMeta,
     pub available: bool,
     pub transfer_id: String,
+    pub original: bool,
 }
 #[derive(Clone, Serialize)]
 pub struct MessageView {
