@@ -912,10 +912,10 @@ async fn peer_offer(
             return Err(Error::bad("消息签名与内容不符"));
         }
         if offer.sender_id != env.host_id
-            && !offer
+            && offer
                 .sender_id
                 .strip_prefix("browser-")
-                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+                .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
         {
             return Err(Error::bad("发送身份无效"));
         }

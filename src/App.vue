@@ -155,6 +155,7 @@ const toastError = ref(false);
 let toastTimer: ReturnType<typeof setTimeout>;
 const preview = ref<{ url: string; name: string }>();
 const thumbnails = ref<Record<string, string>>({});
+const decisionBusy = ref(new Set<string>());
 const thumbnailRequests = new Set<string>();
 let thumbnailBytes = 0;
 let poll: ReturnType<typeof setInterval>;
@@ -336,9 +337,23 @@ function statusLabel(status: string) {
     )[status] || status
   );
 }
+function incomingDelivery(message: Message) {
+  return message.deliveries.find((d) => d.recipient_id === state.value?.me.id);
+}
 function incomingPending(message: Message) {
-  return message.deliveries.find(
-    (d) => d.recipient_id === state.value?.me.id && d.status === "pending",
+  const delivery = incomingDelivery(message);
+  return delivery?.status === "pending" ? delivery : undefined;
+}
+function incomingActive(message: Message) {
+  const delivery = incomingDelivery(message);
+  return delivery && ["accepted", "transferring"].includes(delivery.status)
+    ? delivery
+    : undefined;
+}
+function visibleDeliveries(message: Message) {
+  return message.deliveries.filter(
+    (delivery) =>
+      !message.files.length || delivery.id !== incomingActive(message)?.id,
   );
 }
 function toggleExpanded(id: string) {
@@ -613,11 +628,15 @@ async function send() {
   }
 }
 async function decide(transfer: Transfer, accept: boolean) {
+  if (decisionBusy.value.has(transfer.id)) return;
+  decisionBusy.value.add(transfer.id);
   try {
     await api(`/api/transfers/${transfer.id}/decision`, { accept });
     await refresh();
   } catch (error) {
     notify((error as Error).message, true);
+  } finally {
+    decisionBusy.value.delete(transfer.id);
   }
 }
 async function cancel(transfer: Transfer) {
@@ -1307,130 +1326,239 @@ onUnmounted(() => {
                   <Copy :size="14" />
                 </button>
               </div>
-              <div
-                v-for="file in message.files"
-                :key="file.id"
-                class="attachment-card"
-                :class="{
-                  expired:
-                    !file.available &&
-                    receipt(message.id, file.id)?.status !== 'saved' &&
-                    message.deliveries.every((d) => terminal(d.status)),
-                }"
-              >
-                <button
-                  v-if="thumbnails[message.id + file.id]"
-                  class="image-thumbnail"
-                  :aria-label="`预览 ${file.name}`"
-                  @click="viewImage(file)"
+              <div v-if="message.files.length" class="message-attachments">
+                <div
+                  v-if="incomingPending(message)"
+                  class="attachment-receive-actions"
                 >
-                  <img
-                    :src="thumbnails[message.id + file.id]"
-                    :alt="file.name"
+                  <span
+                    >待接收<template v-if="message.files.length > 1">
+                      · {{ message.files.length }} 个文件，一起接收</template
+                    ></span
+                  >
+                  <button
+                    class="secondary"
+                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    @click="decide(incomingPending(message)!, false)"
+                  >
+                    拒绝
+                  </button>
+                  <button
+                    class="primary"
+                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    @click="decide(incomingPending(message)!, true)"
+                  >
+                    <LoaderCircle
+                      v-if="decisionBusy.has(incomingPending(message)!.id)"
+                      class="spin"
+                      :size="13"
+                    />接收
+                  </button>
+                </div>
+                <div
+                  v-else-if="incomingActive(message)"
+                  class="attachment-transfer"
+                  role="status"
+                >
+                  <div>
+                    <LoaderCircle class="spin" :size="13" />
+                    <span>正在接收…</span>
+                    <small
+                      >{{ size(incomingActive(message)!.bytes) }} /
+                      {{ size(incomingActive(message)!.total) }}</small
+                    >
+                    <button
+                      class="text-button"
+                      @click="cancel(incomingActive(message)!)"
+                    >
+                      取消
+                    </button>
+                  </div>
+                  <progress
+                    aria-label="文件接收进度"
+                    :value="incomingActive(message)!.bytes"
+                    :max="incomingActive(message)!.total || 1"
                   />
-                </button>
-                <div class="attachment-body">
-                  <span class="file-icon"
-                    ><ImageIcon
-                      v-if="file.mime.startsWith('image/')"
-                      :size="24" /><File v-else :size="24" /></span
-                  ><span class="file-label"
-                    ><b>{{ file.name }}</b
-                    ><small
-                      >{{ size(file.size)
-                      }}<template
-                        v-if="
-                          !file.available &&
-                          receipt(message.id, file.id)?.status !== 'saved' &&
-                          message.deliveries.every((d) => terminal(d.status))
-                        "
-                      >
-                        · 文件不可用或已过期</template
-                      >
-                      <template
-                        v-if="receipt(message.id, file.id)?.status === 'saved'"
-                      >
-                        · 已保存</template
-                      >
-                      <template
-                        v-else-if="
-                          receipt(message.id, file.id)?.status === 'pending'
-                        "
-                      >
-                        · 正在保存…</template
-                      >
-                      <template
-                        v-else-if="
-                          receipt(message.id, file.id)?.status === 'failed'
-                        "
-                      >
-                        · 保存失败</template
-                      >
-                    </small></span
-                  ><template
+                </div>
+                <div
+                  v-for="file in message.files"
+                  :key="file.id"
+                  class="attachment-card"
+                  :class="{
+                    expired:
+                      !file.available &&
+                      receipt(message.id, file.id)?.status !== 'saved' &&
+                      message.deliveries.every((d) => terminal(d.status)),
+                  }"
+                >
+                  <div
                     v-if="
-                      native && receipt(message.id, file.id)?.status === 'saved'
+                      !incomingPending(message) &&
+                      !incomingActive(message) &&
+                      (file.available ||
+                        (native &&
+                          receipt(message.id, file.id)?.status === 'saved'))
                     "
+                    class="attachment-actions"
+                    role="group"
+                    :aria-label="`${file.name} 的文件操作`"
                   >
                     <button
-                      class="icon-button"
-                      :aria-label="`打开文件 ${file.name}`"
-                      title="打开文件"
-                      @click="openSavedFile(message.id, file.id)"
-                    >
-                      <ArrowUpRight :size="18" />
-                    </button>
-                    <button
-                      class="icon-button"
-                      :aria-label="`打开所在文件夹 ${file.name}`"
-                      title="打开所在文件夹"
-                      @click="openSavedFile(message.id, file.id, true)"
-                    >
-                      <FolderOpen :size="18" />
-                    </button>
-                  </template>
-                  <template v-if="file.available"
-                    ><button
-                      v-if="raster(file) && !thumbnails[message.id + file.id]"
+                      v-if="
+                        file.available &&
+                        raster(file) &&
+                        !thumbnails[message.id + file.id]
+                      "
                       class="icon-button"
                       :aria-label="`预览 ${file.name}`"
+                      title="预览图片"
                       @click="viewImage(file)"
                     >
-                      <ImageIcon :size="17" /></button
-                    ><button
+                      <ImageIcon :size="17" />
+                    </button>
+                    <button
+                      v-if="file.available"
                       class="icon-button"
                       :disabled="
                         receipt(message.id, file.id)?.status === 'pending'
                       "
                       :aria-label="`${native ? (receipt(message.id, file.id)?.status === 'failed' ? '重新保存' : '保存副本') : '下载'} ${file.name}`"
-                      :title="native ? '保存到接收目录' : '下载'"
+                      :title="
+                        native
+                          ? receipt(message.id, file.id)?.status === 'failed'
+                            ? '重新保存到接收目录'
+                            : '保存副本到接收目录'
+                          : '下载'
+                      "
                       @click="download(file, message.id)"
                     >
-                      <Download :size="18" /></button
-                  ></template>
+                      <Download :size="18" />
+                    </button>
+                    <template
+                      v-if="
+                        native &&
+                        receipt(message.id, file.id)?.status === 'saved'
+                      "
+                    >
+                      <button
+                        class="icon-button"
+                        :aria-label="`打开所在文件夹 ${file.name}`"
+                        title="打开所在文件夹"
+                        @click="openSavedFile(message.id, file.id, true)"
+                      >
+                        <FolderOpen :size="18" />
+                      </button>
+                      <button
+                        class="icon-button"
+                        :aria-label="`打开文件 ${file.name}`"
+                        title="打开文件"
+                        @click="openSavedFile(message.id, file.id)"
+                      >
+                        <ArrowUpRight :size="18" />
+                      </button>
+                    </template>
+                  </div>
+                  <button
+                    v-if="thumbnails[message.id + file.id]"
+                    class="image-thumbnail"
+                    :aria-label="`预览 ${file.name}`"
+                    @click="viewImage(file)"
+                  >
+                    <img
+                      :src="thumbnails[message.id + file.id]"
+                      :alt="file.name"
+                    />
+                  </button>
+                  <div class="attachment-body">
+                    <span class="file-icon"
+                      ><ImageIcon
+                        v-if="file.mime.startsWith('image/')"
+                        :size="24" /><File v-else :size="24" /></span
+                    ><span class="file-label"
+                      ><b>{{ file.name }}</b
+                      ><small
+                        >{{ size(file.size)
+                        }}<template
+                          v-if="
+                            incomingDelivery(message) &&
+                            [
+                              'rejected',
+                              'cancelled',
+                              'failed',
+                              'interrupted',
+                            ].includes(incomingDelivery(message)!.status)
+                          "
+                        >
+                          ·
+                          {{
+                            statusLabel(incomingDelivery(message)!.status)
+                          }}</template
+                        ><template
+                          v-else-if="
+                            !file.available &&
+                            receipt(message.id, file.id)?.status !== 'saved' &&
+                            message.deliveries.every((d) => terminal(d.status))
+                          "
+                        >
+                          · 文件不可用或已过期</template
+                        >
+                        <template
+                          v-if="
+                            receipt(message.id, file.id)?.status === 'saved'
+                          "
+                        >
+                          · 已保存</template
+                        >
+                        <template
+                          v-else-if="
+                            receipt(message.id, file.id)?.status === 'pending'
+                          "
+                        >
+                          · 正在保存…</template
+                        >
+                        <template
+                          v-else-if="
+                            receipt(message.id, file.id)?.status === 'failed'
+                          "
+                        >
+                          · 保存失败</template
+                        >
+                        <template
+                          v-else-if="
+                            incomingDelivery(message)?.status === 'completed' &&
+                            file.available
+                          "
+                        >
+                          · 已接收</template
+                        >
+                      </small></span
+                    >
+                  </div>
+                  <p
+                    v-if="receipt(message.id, file.id)?.status === 'failed'"
+                    class="save-error"
+                    role="status"
+                  >
+                    {{
+                      receipt(message.id, file.id)?.error
+                    }}。可重试或在设置中更改接收目录。
+                  </p>
                 </div>
-                <p
-                  v-if="receipt(message.id, file.id)?.status === 'failed'"
-                  class="save-error"
-                  role="status"
-                >
-                  {{
-                    receipt(message.id, file.id)?.error
-                  }}。可重试或在设置中更改接收目录。
-                </p>
               </div>
-              <div v-if="incomingPending(message)" class="receive-actions">
-                <span
-                  >是否接收{{
-                    message.files.length ? "这些内容" : "这条文字"
-                  }}？</span
+              <div
+                v-if="!message.files.length && incomingPending(message)"
+                class="receive-actions"
+              >
+                <span>是否接收这条文字？</span
                 ><button
                   class="secondary"
+                  :disabled="decisionBusy.has(incomingPending(message)!.id)"
                   @click="decide(incomingPending(message)!, false)"
                 >
                   拒绝</button
                 ><button
                   class="primary"
+                  :disabled="decisionBusy.has(incomingPending(message)!.id)"
                   @click="decide(incomingPending(message)!, true)"
                 >
                   接收
@@ -1454,19 +1582,24 @@ onUnmounted(() => {
               </button>
               <div
                 v-if="
-                  expanded.has(message.id) ||
-                  message.deliveries.some(
-                    (d) => d.status === 'transferring' || d.error,
-                  )
+                  visibleDeliveries(message).length &&
+                  (expanded.has(message.id) ||
+                    visibleDeliveries(message).some(
+                      (d) => d.status === 'transferring' || d.error,
+                    ))
                 "
                 class="delivery-details"
               >
-                <div v-for="delivery in message.deliveries" :key="delivery.id">
+                <div
+                  v-for="delivery in visibleDeliveries(message)"
+                  :key="delivery.id"
+                >
                   <span>{{
                     delivery.recipient_id === state!.me.id
                       ? "本机"
                       : delivery.recipient_name
-                  }}</span><span>{{ statusLabel(delivery.status) }}</span
+                  }}</span
+                  ><span>{{ statusLabel(delivery.status) }}</span
                   ><button
                     v-if="!terminal(delivery.status)"
                     class="text-button"

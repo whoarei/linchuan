@@ -610,7 +610,7 @@ small {
 .copy-message:focus {
   opacity: 1;
 }
-.attachment-card {
+.message-attachments {
   margin-top: 6px;
   border: 1px solid #e2e7ef;
   background: #fff;
@@ -618,6 +618,63 @@ small {
   overflow: hidden;
   width: 300px;
   max-width: 100%;
+}
+.attachment-card + .attachment-card {
+  border-top: 1px solid #e2e7ef;
+}
+.attachment-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  padding: 5px 7px 0;
+}
+.attachment-actions .icon-button {
+  min-width: 32px;
+  min-height: 32px;
+}
+.attachment-receive-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #edf0f5;
+}
+.attachment-receive-actions > span {
+  flex: 1;
+  min-width: 0;
+  color: #8795ab;
+  font-size: 10px;
+}
+.attachment-receive-actions button {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+.attachment-transfer {
+  padding: 10px 12px;
+  border-bottom: 1px solid #edf0f5;
+  color: #7085ae;
+  font-size: 10px;
+}
+.attachment-transfer > div {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.attachment-transfer small {
+  color: #98a4b7;
+  font-size: 9px;
+}
+.attachment-transfer button {
+  margin-left: auto;
+  font-size: 10px;
+}
+.attachment-transfer progress {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
 }
 .attachment-body {
   display: flex;
@@ -1646,7 +1703,7 @@ input::placeholder {
     opacity: 0.65;
     right: 6px;
   }
-  .attachment-card {
+  .message-attachments {
     width: 260px;
   }
   .attachment-body {
@@ -1656,8 +1713,12 @@ input::placeholder {
   .file-label b {
     font-size: 11px;
   }
-  .attachment-body > .icon-button {
-    padding: 4px;
+  .attachment-actions .icon-button {
+    min-width: 36px;
+    min-height: 36px;
+  }
+  .attachment-receive-actions button {
+    min-height: 36px;
   }
   .image-thumbnail,
   .image-thumbnail img {

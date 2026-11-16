@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "linchuan"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "linchuan-core",
  "serde",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "linchuan-core"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "axum",

@@ -49,10 +49,10 @@ pub async fn timeline(
     let p = app.principal(token(&headers)?).await?;
     {
         let state = app.0.state.lock().await;
-        if !state
+        if state
             .conversations
             .get(&id)
-            .is_some_and(|c| c.principal_id == p.id)
+            .is_none_or(|c| c.principal_id != p.id)
         {
             return Err(Error::missing());
         }
@@ -92,10 +92,10 @@ pub async fn read(
     let p = app.principal(token(&headers)?).await?;
     {
         let state = app.0.state.lock().await;
-        if !state
+        if state
             .conversations
             .get(&id)
-            .is_some_and(|c| c.principal_id == p.id)
+            .is_none_or(|c| c.principal_id != p.id)
         {
             return Err(Error::missing());
         }
@@ -125,10 +125,10 @@ pub async fn draft(
         return Err(Error::bad("草稿超过 64 KiB"));
     }
     let mut state = app.0.state.lock().await;
-    if !state
+    if state
         .conversations
         .get(&id)
-        .is_some_and(|c| c.principal_id == p.id)
+        .is_none_or(|c| c.principal_id != p.id)
     {
         return Err(Error::missing());
     }
