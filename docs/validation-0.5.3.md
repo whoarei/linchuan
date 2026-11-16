@@ -17,7 +17,15 @@
 
 v0.5.3 的同一标签提交需通过完整 Checks，再构建 Windows NSIS、Linux DEB／AppImage 和 Android arm64 APK。Linux 分别检查正常启动与 --autostart；Android 核对应用 ID、版本名 0.5.3、版本码 503999、既有发布证书及 ZIP／ELF 16 KiB 对齐。
 
-公开前核对四个安装包、三个桌面签名、latest.json 和 SHA256SUMS，共九个资产。公开后重新下载核对文件摘要、桌面更新签名、Android 证书和版本，并确认 Latest 与公开在线更新入口返回 0.5.3。发布完成后补记实际结果。
+公开前核对四个安装包、三个桌面签名、latest.json 和 SHA256SUMS，共九个资产。公开后重新下载核对文件摘要、桌面更新签名、Android 证书和版本，并确认 Latest 与公开在线更新入口返回 0.5.3。
+
+## 实际发布记录
+
+- [v0.5.3 正式版](https://github.com/whoarei/linchuan/releases/tag/v0.5.3)于 2026-11-16 公开并设为 Latest。发布源码为 `a3e567671a03231950c3828473ac6ec3845789b8`，远程标签和发布运行指向同一提交。
+- [正式 Release 流水线](https://github.com/whoarei/linchuan/actions/runs/43819927532)全部成功：完整 Checks、Windows NSIS、Linux DEB／AppImage、Android arm64、统一签名与发布。[main 分支 Checks](https://github.com/whoarei/linchuan/actions/runs/43819927434)也已通过。云端完整核心测试包含实际超过 2 GiB 的上传和下载，Linux 正常启动及 --autostart 检查通过。
+- 发布后重新下载全部九个资产，核对 SHA256SUMS、远端大小和 SHA-256 摘要，以及三个桌面更新签名及精确版本。公开 Latest API 和 `releases/latest/download/latest.json` 均返回 0.5.3；Debian 包内部版本为 0.5.3，架构为 amd64。
+- Android APK 的应用 ID、版本名 0.5.3、版本码 503999、APK 签名、ZIP 16 KiB 对齐、arm64 ABI 及所有原生库的 ELF 16 KiB 页对齐均通过本地复核。证书 SHA-256 指纹为 `28c461e4f2f8612f9d7717d727e772177474798fd7c48b03ca3ffbca8c81bf0a`，与 0.4.0 起的既有发布证书一致。
+- 发布复用现有 GitHub Actions 与 Secrets，既有公开版本及标签保持不变。
 
 ## 验收边界
 
