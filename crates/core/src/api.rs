@@ -1,11 +1,11 @@
 use crate::{model::*, App};
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, State as AxState, WebSocketUpgrade},
+    extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State as AxState, WebSocketUpgrade},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -71,7 +71,27 @@ pub(crate) fn token(headers: &HeaderMap) -> Result<&str> {
         .ok_or_else(Error::unauthorized)
 }
 
-pub fn router(app: App) -> Router {
+#[derive(Clone, Copy)]
+pub(crate) struct BrowserTransport(pub bool);
+
+async fn check_transport(
+    AxState(app): AxState<App>,
+    Extension(transport): Extension<BrowserTransport>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Result<Response> {
+    if let Ok(credential) = token(request.headers()) {
+        if !app
+            .credential_matches_transport(credential, transport.0)
+            .await
+        {
+            return Err(Error::unauthorized());
+        }
+    }
+    Ok(next.run(request).await)
+}
+
+pub fn router(app: App, secure: bool) -> Router {
     let cors = CorsLayer::new()
         .allow_origin([
             "tauri://localhost".parse::<HeaderValue>().unwrap(),
@@ -90,6 +110,14 @@ pub fn router(app: App) -> Router {
         .route("/api/pair", post(pair))
         .route("/api/session/logout", post(logout))
         .route("/api/state", get(state))
+        .route(
+            "/api/browser/assistance",
+            get(crate::assistance::browser_session),
+        )
+        .route(
+            "/api/browser/assistance/{id}",
+            post(crate::assistance::browser_action).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
         .route(
             "/api/conversations/direct",
             post(crate::conversations::direct),
@@ -134,6 +162,10 @@ pub fn router(app: App) -> Router {
         .route("/download/{ticket}", get(download))
         .route("/api/events", get(events))
         .route("/api/peer/offer", post(peer_offer))
+        .route(
+            "/api/peer/assistance",
+            post(crate::assistance::receive).layer(DefaultBodyLimit::max(96 * 1024)),
+        )
         .route("/api/peer/transfers/{id}", get(peer_status))
         .route(
             "/api/peer/transfers/{id}/files/{file}",
@@ -142,6 +174,11 @@ pub fn router(app: App) -> Router {
         .route("/api/peer/transfers/{id}/complete", post(peer_complete))
         .route("/api/peer/transfers/{id}/cancel", post(peer_cancel))
         .fallback(get(asset))
+        .layer(axum::middleware::from_fn_with_state(
+            app.clone(),
+            check_transport,
+        ))
+        .layer(Extension(BrowserTransport(secure)))
         .layer(cors)
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -159,6 +196,7 @@ async fn info(AxState(app): AxState<App>) -> Json<Info> {
 async fn pair(
     AxState(app): AxState<App>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Extension(BrowserTransport(secure)): Extension<BrowserTransport>,
     headers: HeaderMap,
     Json(request): Json<PairRequest>,
 ) -> Result<Json<Value>> {
@@ -169,8 +207,17 @@ async fn pair(
         crate::clean_name(&request.name).map_err(|e| Error::bad(e.to_string()))?
     };
     let mut state = app.0.state.lock().await;
-    rate_limit(&mut state, format!("pair:{}", addr.ip()), 12)?;
-    if request.code != app.0.code {
+    rate_limit(&mut state, format!("pair:{secure}:{}", addr.ip()), 12)?;
+    let code = if secure {
+        &app.0
+            .browser_https
+            .as_ref()
+            .ok_or_else(Error::unauthorized)?
+            .pairing_code
+    } else {
+        &app.0.code
+    };
+    if &request.code != code {
         return Err(Error::unauthorized());
     }
     if state.sessions.len() >= 64 {
@@ -184,6 +231,7 @@ async fn pair(
             name: name.clone(),
             last_seen: now(),
             expires: now() + RETENTION,
+            secure,
         },
     );
     state.profiles.insert(
@@ -262,7 +310,7 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
         state
             .sessions
             .values()
-            .filter(|s| s.id != p.id && now().saturating_sub(s.last_seen) < 45)
+            .filter(|s| p.owner && s.online())
             .map(|s| Device {
                 id: s.id.clone(),
                 name: s.name.clone(),
@@ -276,7 +324,10 @@ async fn state(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<Va
                 kind: "browser".into(),
                 host_device_id: info.id.clone(),
                 public_key: info.public_key.clone(),
-                capabilities: info.capabilities.clone(),
+                capabilities: crate::assistance::browser_capabilities(
+                    app.0.assistance.is_some(),
+                    s.secure,
+                ),
             }),
     );
     devices.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1760,6 +1811,7 @@ async fn peer_cancel(
 }
 async fn events(
     AxState(app): AxState<App>,
+    Extension(BrowserTransport(secure)): Extension<BrowserTransport>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response> {
@@ -1775,7 +1827,7 @@ async fn events(
                 | "https://tauri.localhost"
                 | "http://localhost:1420"
                 | "http://127.0.0.1:1420"
-        ) && origin != format!("http://{host}")
+        ) && origin != format!("{}://{host}", if secure { "https" } else { "http" })
         {
             return Err(Error::unauthorized());
         }
@@ -1785,7 +1837,7 @@ async fn events(
         let Ok(Some(Ok(axum::extract::ws::Message::Text(message))))=first else {return};
         let Ok(value)=serde_json::from_str::<Value>(&message) else{return};
         let Some(token)=value["token"].as_str() else{return};
-        if app.principal(token).await.is_err(){return;}
+        if !app.credential_matches_transport(token, secure).await || app.principal(token).await.is_err(){return;}
         let mut events=app.0.events.subscribe();
         let mut heartbeat=tokio::time::interval(std::time::Duration::from_secs(20));
         loop {tokio::select!{
@@ -1838,6 +1890,7 @@ async fn logout(AxState(app): AxState<App>, headers: HeaderMap) -> Result<Json<V
     }
     app.commit(&mut state).await?;
     drop(state);
+    app.disconnect_browser_viewer(&p.id).await;
     app.notify();
     Ok(Json(json!({"ok":true})))
 }

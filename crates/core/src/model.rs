@@ -65,6 +65,12 @@ pub struct Bootstrap {
     pub address: String,
     pub token: String,
     pub pairing_code: String,
+    pub browser_https: Option<BrowserAccess>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BrowserAccess {
+    pub address: String,
+    pub pairing_code: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -72,6 +78,13 @@ pub struct Session {
     pub name: String,
     pub last_seen: u64,
     pub expires: u64,
+    pub secure: bool,
+}
+
+impl Session {
+    pub fn online(&self) -> bool {
+        self.expires > now() && now().saturating_sub(self.last_seen) < 45
+    }
 }
 #[derive(Clone)]
 pub struct Principal {
@@ -353,6 +366,12 @@ pub struct MessageView {
 
 impl State {
     pub fn link_conversations(&mut self, owner: &str) {
+        for session in self.sessions.values() {
+            let conversation = Conversation::direct(owner, &session.id);
+            self.conversations
+                .entry(conversation.id.clone())
+                .or_insert(conversation);
+        }
         let locals: std::collections::HashSet<_> = self
             .sessions
             .values()

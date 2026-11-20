@@ -19,6 +19,7 @@ import {
   LogOut,
   MessageSquare,
   Monitor,
+  MonitorUp,
   MoreHorizontal,
   Paperclip,
   Plus,
@@ -39,6 +40,7 @@ import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
+import ScreenAssistance from "./ScreenAssistance.vue";
 import ConversationRow from "./ConversationRow.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
@@ -57,6 +59,7 @@ import {
   setToken,
   forget,
   pairingCode,
+  browserHttps,
   address,
   upload,
   ApiError,
@@ -113,7 +116,7 @@ const connected = ref(true);
 const mode = ref<Mode>("devices");
 const selected = ref("");
 const search = ref("");
-const showTemporaryHistory = ref(false);
+const showTemporaryHistory = ref<boolean>();
 const messages = ref<Message[]>([]);
 const before = ref<number | null>(null);
 const historyBusy = ref(false);
@@ -142,6 +145,7 @@ const pairError = ref("");
 const modal = ref<
   | ""
   | "connect"
+  | "browser-https"
   | "manual"
   | "group"
   | "members"
@@ -152,6 +156,12 @@ const modal = ref<
 const addMenu = ref(false);
 const qr = ref("");
 const shareAddress = ref("");
+const httpsAddressSelected = computed(() => !!browserHttps && shareAddress.value === browserHttps.address);
+const shareCode = computed(() => httpsAddressSelected.value ? browserHttps?.pairing_code : pairingCode);
+const httpsHost = ref("");
+const httpsPort = ref<number | "">("");
+const httpsCertificate = ref<File>();
+const httpsKey = ref<File>();
 const manualAddress = ref("");
 const modalBusy = ref(false);
 const groupName = ref("");
@@ -184,6 +194,7 @@ const current = computed(() =>
 const currentDevice = computed(() =>
   state.value?.devices.find((d) => d.id === current.value?.peer_id),
 );
+const screenAssistance = ref<InstanceType<typeof ScreenAssistance>>();
 const displayNames = computed(() => {
   if (!state.value) return new Map<string, string>();
   return deviceLabels([
@@ -203,7 +214,7 @@ const displayNames = computed(() => {
           c.kind === "direct" &&
           c.peer_id &&
           (!temporaryOffline(c) ||
-            ((showTemporaryHistory.value || search.value.trim()) &&
+            (temporaryHistoryExpanded.value &&
               (c.last_message_at || c.has_draft))),
       )
       .map((c) => ({ id: c.peer_id!, name: c.name })),
@@ -242,8 +253,11 @@ const canSend = computed(
     (text.value.trim().length > 0 || files.value.length > 0) &&
     new TextEncoder().encode(text.value).length <= 65536,
 );
+function browserConversation(c: Conversation) {
+  return c.kind === "direct" && c.peer_kind === "browser";
+}
 function temporaryOffline(c: Conversation) {
-  return c.kind === "direct" && c.peer_kind === "browser" && !online(c.peer_id);
+  return browserConversation(c) && !online(c.peer_id);
 }
 function matchesSearch(c: Conversation) {
   return `${c.name} ${c.preview}`
@@ -254,24 +268,27 @@ const temporaryHistory = computed(
   () =>
     state.value?.conversations.filter(
       (c) =>
-        temporaryOffline(c) &&
-        (c.last_message_at || c.has_draft) &&
+        browserConversation(c) &&
+        (online(c.peer_id) || c.last_message_at || c.has_draft) &&
         matchesSearch(c),
     ) || [],
 );
+const temporaryHistoryExpanded = computed(() => !!search.value.trim() ||
+  (showTemporaryHistory.value ?? temporaryHistory.value.some((c) => online(c.peer_id))));
 const historyUnread = computed(() =>
   temporaryHistory.value.reduce((sum, c) => sum + c.unread, 0),
 );
 const conversations = computed(
   () =>
     state.value?.conversations.filter(
-      (c) => !temporaryOffline(c) && matchesSearch(c),
+      (c) => !browserConversation(c) && matchesSearch(c),
     ) || [],
 );
 const nearby = computed(
   () =>
     state.value?.devices.filter(
       (d) =>
+        d.kind !== "browser" &&
         !state.value!.conversations.some((c) => c.peer_id === d.id) &&
         d.name.toLowerCase().includes(search.value.toLowerCase()),
     ) || [],
@@ -422,7 +439,10 @@ function events() {
   socket.onopen = () => socket?.send(JSON.stringify({ token: token() }));
   socket.onmessage = () => {
     clearTimeout(eventTimer);
-    eventTimer = setTimeout(() => void refresh(), 120);
+    eventTimer = setTimeout(() => {
+      void refresh();
+      if (!native) void screenAssistance.value?.refresh();
+    }, 120);
   };
   socket.onerror = () => {};
 }
@@ -842,6 +862,40 @@ async function updateQr() {
     color: { dark: "#24334d", light: "#ffffff" },
   });
 }
+function configureBrowserHttps() {
+  httpsHost.value = browserHttps ? new URL(browserHttps.address).hostname : "";
+  httpsPort.value = browserHttps ? Number(new URL(browserHttps.address).port) || 443 : "";
+  httpsCertificate.value = undefined;
+  httpsKey.value = undefined;
+  modal.value = "browser-https";
+}
+function choosePem(event: Event, type: "certificate" | "key") {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  if (type === "certificate") httpsCertificate.value = file;
+  else httpsKey.value = file;
+}
+async function saveBrowserHttps() {
+  const certificate = httpsCertificate.value;
+  const key = httpsKey.value;
+  if (!certificate || !key || modalBusy.value) return;
+  if (certificate.size > 128 * 1024 || key.size > 32 * 1024) {
+    notify("证书或私钥文件过大", true);
+    return;
+  }
+  modalBusy.value = true;
+  try {
+    await invoke("assistance_browser_https_setup", {
+      host: httpsHost.value.trim(), port: httpsPort.value || 0,
+      certificatePem: await certificate.text(), keyPem: await key.text(),
+    });
+    await showConnection();
+    notify("已保存 HTTPS 配置，完全退出后重新打开邻传即可生效");
+  } catch (error) {
+    notify(String(error), true);
+  } finally {
+    modalBusy.value = false;
+  }
+}
 async function connectPeer() {
   modalBusy.value = true;
   try {
@@ -1005,7 +1059,7 @@ function sessionChanged() {
   selected.value = "";
   modal.value = "";
   code.value = "";
-  showTemporaryHistory.value = false;
+  showTemporaryHistory.value = undefined;
   messages.value = [];
   text.value = "";
   files.value = [];
@@ -1075,6 +1129,15 @@ onUnmounted(() => {
 
 <template>
   <DesktopTitleBar @error="notify($event, true)" />
+  <ScreenAssistance
+    v-if="ready && (native || (browserOnly && state?.info.capabilities?.includes('screen-share-v1')))"
+    :browser="!native"
+    :android="native && state?.info.platform === 'Android'"
+    :linux="native && state?.info.platform === 'Linux'"
+    ref="screenAssistance"
+    @error="notify($event, true)"
+    @ended="notify($event)"
+  />
   <div v-if="loading || bootError" class="launch">
     <div class="brand-icon">邻</div>
     <h1>邻传</h1>
@@ -1240,12 +1303,12 @@ onUnmounted(() => {
         >
           <button
             class="history-toggle"
-            :aria-expanded="showTemporaryHistory || !!search.trim()"
+            :aria-expanded="temporaryHistoryExpanded"
             aria-controls="temporary-history-list"
-            @click="showTemporaryHistory = !showTemporaryHistory"
+            @click="showTemporaryHistory = !temporaryHistoryExpanded"
           >
             <ChevronDown
-              v-if="showTemporaryHistory || search.trim()"
+              v-if="temporaryHistoryExpanded"
               :size="14"
             /><ChevronRight v-else :size="14" />临时会话记录
             <span>{{ temporaryHistory.length }}</span><em
@@ -1254,7 +1317,7 @@ onUnmounted(() => {
             >
           </button>
           <div
-            v-if="showTemporaryHistory || search.trim()"
+            v-if="temporaryHistoryExpanded"
             id="temporary-history-list"
           >
             <ConversationRow
@@ -1263,7 +1326,7 @@ onUnmounted(() => {
               :conversation="conversation"
               :label="conversationLabel(conversation)"
               :selected="conversation.id === selected"
-              :online="false"
+              :online="online(conversation.peer_id)"
               @select="selectConversation(conversation)"
             />
           </div>
@@ -1341,7 +1404,18 @@ onUnmounted(() => {
             @click="modal = 'members'"
           >
             <MoreHorizontal :size="23" /></button
-          ><span v-else class="local-note">局域网直传</span>
+          >
+          <button
+            v-else-if="
+              screenAssistance?.canCapture && currentDevice &&
+              (currentDevice.capabilities.includes('screen-share-v1') ||
+                currentDevice.capabilities.includes('screen-view-web-v1'))
+            "
+            type="button"
+            class="secondary"
+            @click="screenAssistance?.start(currentDevice)"
+          ><MonitorUp :size="16" />分享屏幕</button>
+          <span v-else class="local-note">局域网直传</span>
         </header>
         <div
           v-if="group && membership?.state === 'invited'"
@@ -2120,21 +2194,39 @@ onUnmounted(() => {
         <h2>连接其他设备</h2>
         <p>在同一网络中，扫码或用浏览器打开地址。</p>
         <img :src="qr" class="qr-image" alt="浏览器访问二维码" /><select
-          v-if="state!.info.addresses.length > 1"
+          v-if="state!.info.addresses.length > 1 || browserHttps"
           v-model="shareAddress"
           aria-label="选择网络地址"
           @change="updateQr"
         >
           <option v-for="item in state!.info.addresses" :key="item">
             {{ item }}
-          </option></select
+          </option>
+          <option v-if="browserHttps" :value="browserHttps.address">网页协助（HTTPS）</option></select
         ><button class="address-copy" @click="copy(shareAddress)">
           <span>{{ shareAddress }}</span><Copy :size="16" />
         </button>
         <div class="pairing-code">
-          <small>本次配对码</small><b>{{ pairingCode }}</b>
-        </div></template
+          <small>{{ httpsAddressSelected ? "网页协助配对码" : "本次配对码" }}</small><b>{{ shareCode }}</b>
+        </div>
+        <button v-if="native && state?.info.capabilities?.includes('screen-share-v1')" class="secondary" type="button" @click="configureBrowserHttps">
+          配置网页控制
+        </button></template
       >
+      <template v-else-if="modal === 'browser-https'">
+        <h2>配置网页控制</h2>
+        <p>请使用观看方浏览器信任的证书。域名或 IP 地址需与证书匹配。</p>
+        <form @submit.prevent="saveBrowserHttps">
+          <label>域名或 IP 地址<input v-model="httpsHost" maxlength="253" required /></label>
+          <label>HTTPS 端口<input v-model.number="httpsPort" type="number" min="1" max="65535" placeholder="留空自动分配" /></label>
+          <label>PEM 证书链<input type="file" required @change="choosePem($event, 'certificate')" /></label>
+          <label>PEM 私钥<input type="file" required @change="choosePem($event, 'key')" /></label>
+          <div class="modal-actions">
+            <button class="secondary" type="button" :disabled="modalBusy" @click="showConnection">返回</button>
+            <button class="primary" :disabled="modalBusy">保存</button>
+          </div>
+        </form>
+      </template>
       <template v-else-if="modal === 'manual'"
         ><div class="modal-icon"><Link :size="24" /></div>
         <h2>通过地址连接</h2>

@@ -524,17 +524,21 @@ async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory()
 #[tokio::test]
 async fn schema_one_upgrade_preserves_history_without_exporting_old_files() {
     let mut receiver = Host::new("旧版接收").await;
+    let browser = receiver.pair("旧版浏览器").await;
     let (message, transfer, file) = legacy_cached_file(&receiver, b"old history").await;
     let identity = receiver.app.info().await;
     receiver.app.stop();
     {
         let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
         conn.execute_batch(
-            "DROP TABLE saved_files; DROP TABLE file_sources; DROP TABLE receive_outputs; PRAGMA user_version=1; UPDATE messages SET received_at=1;",
+            "DROP TABLE saved_files; DROP TABLE file_sources; DROP TABLE receive_outputs;
+             ALTER TABLE browser_sessions DROP COLUMN secure;
+             PRAGMA user_version=1; UPDATE messages SET received_at=1;",
         )
         .unwrap();
     }
     receiver.restart().await;
+    assert_eq!(receiver.get("/api/state", &browser).await.status(), 200);
     let downloads = TempDir::new().unwrap();
     receiver
         .app

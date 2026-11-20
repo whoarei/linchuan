@@ -131,6 +131,9 @@ test("invalid saved credentials return to pairing and blocked browser storage st
   await expect(
     temporary.getByRole("button", { name: "设置", exact: true }),
   ).toBeVisible();
+  await temporary.getByRole("button", { name: "设置", exact: true }).click();
+  await temporary.getByRole("button", { name: "断开连接", exact: true }).click();
+  await expect(temporary.getByLabel("六位配对码")).toBeVisible();
   await blocked.close();
 });
 
@@ -147,7 +150,9 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
     .getByRole("textbox", { name: "发送文字" })
     .fill("临时会话留下的文字");
   await page.getByRole("button", { name: "发送", exact: true }).click();
-  await host.page
+  const history = host.page.getByRole("region", { name: "临时会话记录" });
+  const historyToggle = history.getByRole("button", { name: /临时会话记录/ });
+  await history
     .getByRole("button", { name: "打开 历史临时网页", exact: true })
     .click();
   await expect(host.page.locator(".message").filter({hasText:"临时会话留下的文字"}).getByRole("button", { name: "接收", exact: true })).toHaveCount(0);
@@ -156,7 +161,6 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
   await expect(
     host.page.getByRole("button", { name: "打开 历史临时网页", exact: true }),
   ).toHaveCount(0);
-  const history = host.page.getByRole("region", { name: "临时会话记录" });
   await expect(
     history.getByRole("button", { name: /临时会话记录/ }),
   ).toHaveAttribute("aria-expanded", "false");
@@ -169,20 +173,30 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
   );
   await history.getByRole("button", { name: /临时会话记录/ }).click();
   await pair(page, "历史临时网页");
-  expect((await identity(page)).id).not.toBe(original.id);
+  const second = await identity(page);
+  expect(second.id).not.toBe(original.id);
+  await historyToggle.click();
+  let suffixLength = 4;
+  while (second.id.slice(-suffixLength) === original.id.slice(-suffixLength)) suffixLength += 4;
+  const onlineLabel = `打开 历史临时网页 · ${second.id.slice(-suffixLength).toUpperCase()}`;
   await expect(
-    host.page.getByRole("button", { name: "连接 历史临时网页", exact: true }),
+    history.getByRole("button", { name: /打开 历史临时网页/ }),
+  ).toHaveCount(2);
+  await expect(
+    host.page.getByRole("button", { name: /连接 历史临时网页/ }),
+  ).toHaveCount(0);
+  await expect(
+    history.getByRole("button", { name: onlineLabel, exact: true }),
   ).toBeVisible();
-  await host.page
-    .getByRole("button", { name: "连接 历史临时网页", exact: true })
+  await history
+    .getByRole("button", { name: onlineLabel, exact: true })
     .click();
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByRole("button", { name: "断开连接", exact: true }).click();
   await expect(
-    host.page.getByRole("button", { name: "打开 历史临时网页", exact: true }),
-  ).toHaveCount(0);
+    history.getByRole("button", { name: /打开 历史临时网页/ }),
+  ).toHaveCount(1);
   // The second identity had an empty conversation and must not add a history row.
-  await history.getByRole("button", { name: /临时会话记录/ }).click();
   await expect(
     history.getByRole("button", { name: "打开 历史临时网页", exact: true }),
   ).toHaveCount(1);
@@ -209,8 +223,8 @@ test("offline browser history folds away, empty sessions hide and drafts remain 
       await route.continue();
     },
   );
-  await host.page
-    .getByRole("button", { name: "连接 草稿临时网页", exact: true })
+  await history
+    .getByRole("button", { name: "打开 草稿临时网页", exact: true })
     .click();
   await expect(
     host.page.getByRole("heading", { name: "草稿临时网页", exact: true }),

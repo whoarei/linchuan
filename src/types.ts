@@ -88,6 +88,7 @@ export interface AppState {
     addresses: string[];
     version: string;
     platform: string;
+    capabilities: string[];
   };
   devices: Device[];
   conversations: Conversation[];

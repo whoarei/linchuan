@@ -1,5 +1,8 @@
 use linchuan_core::{App, Bootstrap, Options};
 use tauri::{Manager, State};
+mod assistance;
+mod assistance_input;
+mod assistance_linux;
 mod desktop;
 mod receiving;
 mod sending;
@@ -31,6 +34,9 @@ async fn check_release(
 #[tauri::command]
 async fn prepare_update(state: State<'_, Runtime>) -> Result<(), String> {
     if let Some(core) = state.0.get() {
+        if core.assistance_session().await.is_some() {
+            return Err("请先结束屏幕共享会话，再安装更新".into());
+        }
         if core.has_active_work().await {
             return Err("有文件正在准备或传输，请完成后再安装更新".into());
         }
@@ -43,9 +49,13 @@ async fn ensure_core(app: &tauri::AppHandle) -> Result<App, String> {
         .0
         .get_or_try_init(|| async {
             let directory = app.path().app_data_dir().map_err(|e| e.to_string())?;
-            let core = App::start(Options::new(directory))
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut options = Options::new(directory);
+            options.screen_sharing = cfg!(any(
+                target_os = "windows",
+                target_os = "linux",
+                target_os = "android"
+            ));
+            let core = App::start(options).await.map_err(|e| e.to_string())?;
             let initialized = async {
                 desktop::initialize(app, &core).await?;
                 receiving::start(app.clone(), core.clone()).await
@@ -68,6 +78,8 @@ async fn bootstrap(app: tauri::AppHandle) -> Result<Bootstrap, String> {
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(assistance::plugin())
+        .plugin(assistance_linux::plugin())
         .plugin(receiving::plugin());
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _| {
@@ -89,6 +101,7 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            assistance::on_window_event(window, event);
             desktop::on_window_event(window, event);
             sending::on_window_event(window, event);
         })
@@ -99,11 +112,31 @@ pub fn run() {
     desktop::configure_context(&mut context);
     builder
         .manage(Runtime(tokio::sync::OnceCell::new()))
+        .manage(assistance_input::Control::default())
         .invoke_handler(tauri::generate_handler![
             bootstrap,
             desktop_window_controls,
             check_release,
             prepare_update,
+            assistance::assistance_session,
+            assistance::assistance_invite,
+            assistance::assistance_join,
+            assistance::assistance_end,
+            assistance::assistance_browser_https_setup,
+            assistance::assistance_android_start,
+            assistance::assistance_android_stop,
+            assistance::assistance_android_status,
+            assistance::assistance_android_capabilities,
+            assistance::assistance_android_control,
+            assistance_input::assistance_input_available,
+            assistance_input::assistance_input_grant,
+            assistance_input::assistance_input_apply,
+            assistance_linux::assistance_linux_start,
+            assistance_linux::assistance_linux_join,
+            assistance_linux::assistance_linux_stop,
+            assistance_linux::assistance_linux_status,
+            assistance_linux::assistance_linux_frame,
+            assistance_linux::assistance_linux_message,
             sending::choose_send_files,
             desktop::desktop_settings,
             desktop::desktop_set_autostart,

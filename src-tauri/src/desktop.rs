@@ -55,8 +55,9 @@ mod platform {
     fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         let icon = app.default_window_icon().ok_or("应用图标不可用")?;
         let show = MenuItem::with_id(app, "show-main", "打开邻传", true, None::<&str>)?;
+        let stop = MenuItem::with_id(app, "stop-assistance", "停止远程协助", true, None::<&str>)?;
         let exit = MenuItem::with_id(app, "quit-app", "退出邻传", true, None::<&str>)?;
-        let menu = Menu::with_items(app, &[&show, &exit])?;
+        let menu = Menu::with_items(app, &[&show, &stop, &exit])?;
         let tray = TrayIconBuilder::with_id("linchuan-main")
             .icon(icon.clone())
             .tooltip("邻传 · 正在运行")
@@ -65,6 +66,7 @@ mod platform {
                 "show-main" => {
                     let _ = super::show(app);
                 }
+                "stop-assistance" => crate::assistance::stop_desktop(app),
                 "quit-app" => quit(app),
                 _ => {}
             })

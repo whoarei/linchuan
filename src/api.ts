@@ -42,16 +42,19 @@ if (!native)
     window.dispatchEvent(new Event("linchuan-session-change"));
   });
 export let pairingCode = "";
+export let browserHttps: { address: string; pairing_code: string } | undefined;
 export async function bootstrap() {
   if (native) {
     const result = await invoke<{
       address: string;
       token: string;
       pairing_code: string;
+      browser_https?: typeof browserHttps | null;
     }>("bootstrap");
     base = result.address;
     credential = result.token;
     pairingCode = result.pairing_code;
+    browserHttps = result.browser_https ?? undefined;
   }
 }
 export const address = () => base;
@@ -88,8 +91,13 @@ export class ApiError extends Error {
     super(message);
   }
 }
-export async function api<T = any>(path: string, body?: unknown): Promise<T> {
+export async function api<T = any>(
+  path: string,
+  body?: unknown,
+  options?: { keepalive?: boolean },
+): Promise<T> {
   const response = await fetch(base + path, {
+    keepalive: options?.keepalive,
     method: body === undefined ? "GET" : "POST",
     headers: {
       ...(credential ? { Authorization: `Bearer ${credential}` } : {}),

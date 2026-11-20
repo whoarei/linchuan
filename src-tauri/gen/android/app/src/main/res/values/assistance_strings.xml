@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="assistance_touch_description">在你同意本次远程协助后，允许对方轻触、滑动和向当前输入框输入文字。你可以随时收回控制。</string>
+</resources>

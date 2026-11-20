@@ -1,0 +1,1 @@
+ALTER TABLE browser_sessions ADD COLUMN secure INTEGER NOT NULL DEFAULT 0 CHECK(secure IN (0, 1));

@@ -1,4 +1,6 @@
 mod api;
+pub mod assistance;
+mod browser_https;
 mod conversations;
 mod discovery;
 pub mod files;
@@ -22,10 +24,15 @@ use std::{
 use tokio::sync::{broadcast, Mutex, Semaphore};
 const MAX_STREAMS: usize = 8;
 
+fn pairing_code() -> String {
+    format!("{:06}", uuid::Uuid::new_v4().as_u128() % 1_000_000)
+}
+
 pub struct Options {
     pub directory: PathBuf,
     pub name: Option<String>,
     pub discovery: bool,
+    pub screen_sharing: bool,
 }
 impl Options {
     pub fn new(directory: PathBuf) -> Self {
@@ -33,6 +40,7 @@ impl Options {
             directory,
             name: None,
             discovery: true,
+            screen_sharing: false,
         }
     }
 }
@@ -48,6 +56,7 @@ struct Inner {
     pub port: u16,
     token: String,
     code: String,
+    browser_https: Option<BrowserAccess>,
     pub state: Mutex<State>,
     events: broadcast::Sender<()>,
     client: reqwest::Client,
@@ -60,6 +69,7 @@ struct Inner {
     file_io: std::sync::RwLock<Option<files::PlatformFiles>>,
     outgoing: Semaphore,
     receive_directories: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    assistance: Option<Mutex<assistance::Sessions>>,
 }
 #[derive(Clone)]
 pub struct App(Arc<Inner>);
@@ -97,7 +107,7 @@ impl App {
                 kind: "local".into(),
                 host_device_id: config.id.clone(),
                 public_key: hex::encode(identity.verifying_key().to_bytes()),
-                capabilities: capabilities(),
+                capabilities: capabilities_with_assistance(options.screen_sharing),
                 address: String::new(),
                 last_seen: now(),
             },
@@ -118,7 +128,7 @@ impl App {
                 .truncate(false)
                 .open(entry.path().join(".active"))
             {
-                if lock.try_lock().is_ok() {
+                if try_run_lock(&lock).is_ok() {
                     drop(lock);
                     let _ = tokio::fs::remove_dir_all(entry.path()).await;
                 }
@@ -127,12 +137,23 @@ impl App {
         let work = temporary.join(uid());
         tokio::fs::create_dir_all(&work).await?;
         let run_lock = std::fs::File::create(work.join(".active"))?;
-        run_lock.try_lock()?;
+        try_run_lock(&run_lock)?;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         let port = listener.local_addr()?.port();
         let (events, _) = broadcast::channel(128);
         let (stop, _) = tokio::sync::watch::channel(false);
-        let random = uuid::Uuid::new_v4().as_u128() % 1_000_000;
+        let code = pairing_code();
+        let browser_https = if options.screen_sharing {
+            match browser_https::Server::load(&options.directory, &code).await {
+                Ok(server) => server,
+                Err(error) => {
+                    eprintln!("Browser HTTPS unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let app = Self(Arc::new(Inner {
             device_id: config.id.clone(),
             identity,
@@ -144,7 +165,8 @@ impl App {
             _run_lock: run_lock,
             port,
             token: secret(),
-            code: format!("{random:06}"),
+            code,
+            browser_https: browser_https.as_ref().map(|server| server.access.clone()),
             state: Mutex::new(restored),
             events,
             client: reqwest::Client::builder()
@@ -161,6 +183,7 @@ impl App {
             file_io: std::sync::RwLock::new(None),
             outgoing: Semaphore::new(4),
             receive_directories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            assistance: options.screen_sharing.then(Mutex::default),
         }));
         app.recover_receive_outputs()
             .await
@@ -176,7 +199,10 @@ impl App {
             }
             app.commit(&mut state).await?;
         }
-        let router = api::router(app.clone());
+        if let Some(server) = browser_https {
+            server.start(app.clone())?;
+        }
+        let router = api::router(app.clone(), false);
         let mut shutdown = app.0.stop.subscribe();
         tokio::spawn(async move {
             let _ = axum::serve(
@@ -351,7 +377,7 @@ impl App {
             protocol: 1,
             addresses: addresses(self.0.port),
             public_key: hex::encode(self.0.identity.verifying_key().to_bytes()),
-            capabilities: capabilities(),
+            capabilities: capabilities_with_assistance(self.0.assistance.is_some()),
         }
     }
     pub fn bootstrap(&self) -> Bootstrap {
@@ -359,6 +385,7 @@ impl App {
             address: format!("http://127.0.0.1:{}", self.0.port),
             token: self.0.token.clone(),
             pairing_code: self.0.code.clone(),
+            browser_https: self.0.browser_https.clone(),
         }
     }
     pub fn stop(&self) {
@@ -403,6 +430,18 @@ impl App {
             }
         }
         Err(api::Error::unauthorized())
+    }
+    async fn credential_matches_transport(&self, token: &str, secure: bool) -> bool {
+        if token == self.0.token {
+            return !secure;
+        }
+        self.0
+            .state
+            .lock()
+            .await
+            .sessions
+            .get(&identity::token_hash(token))
+            .is_none_or(|session| session.secure == secure)
     }
     async fn sweep(&self) {
         let mut paths = Vec::new();
@@ -560,6 +599,21 @@ fn capabilities() -> Vec<String> {
         "history-v1".into(),
         "dynamic-storage-v1".into(),
     ]
+}
+
+fn try_run_lock(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "android")]
+    return fs2::FileExt::try_lock_exclusive(file);
+    #[cfg(not(target_os = "android"))]
+    file.try_lock().map_err(Into::into)
+}
+
+fn capabilities_with_assistance(enabled: bool) -> Vec<String> {
+    let mut values = capabilities();
+    if enabled {
+        values.push(assistance::CAPABILITY.into());
+    }
+    values
 }
 
 impl App {

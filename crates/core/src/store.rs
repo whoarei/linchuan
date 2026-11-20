@@ -28,7 +28,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 3, "数据库版本高于当前程序支持的版本，请升级邻传");
+        anyhow::ensure!(version <= 4, "数据库版本高于当前程序支持的版本，请升级邻传");
         if version < 2 {
             let tx = conn.transaction()?;
             if version == 0 {
@@ -42,6 +42,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(include_str!("../migrations/003_file_sources.sql"))?;
             tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/004_browser_transport.sql"))?;
+            tx.pragma_update(None, "user_version", 4)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {
@@ -117,7 +123,7 @@ impl Store {
                 for m in &group.members {tx.execute("INSERT INTO group_members VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(group_id,device_id) DO UPDATE SET invite_id=excluded.invite_id,role=excluded.role,state=excluded.state,sequence=excluded.sequence,event_json=excluded.event_json,invited_at=CASE WHEN group_members.invite_id<>excluded.invite_id THEN excluded.invited_at ELSE group_members.invited_at END,joined_at=CASE WHEN group_members.invite_id<>excluded.invite_id THEN excluded.joined_at ELSE COALESCE(group_members.joined_at,excluded.joined_at) END,left_at=CASE WHEN group_members.invite_id<>excluded.invite_id THEN excluded.left_at ELSE COALESCE(group_members.left_at,excluded.left_at) END",params![group.id,m.device.id,m.invite_id,m.role,m.state,m.sequence,serde_json::to_string(&m.event)?,now_ms(),if m.state=="joined"{Some(now_ms())}else{None},if m.state=="left"{Some(now_ms())}else{None}])?;}
             }
             tx.execute("DELETE FROM browser_sessions",[])?;
-            for (hash,session) in &state.sessions {tx.execute("INSERT INTO browser_sessions VALUES(?1,?2,?3,?4) ON CONFLICT(token_hash) DO UPDATE SET last_seen_at=excluded.last_seen_at",params![hash,session.id,session.expires*1000,session.last_seen*1000])?;}
+            for (hash,session) in &state.sessions {tx.execute("INSERT INTO browser_sessions(token_hash,device_id,expires_at,last_seen_at,secure) VALUES(?1,?2,?3,?4,?5)",params![hash,session.id,session.expires*1000,session.last_seen*1000,session.secure])?;}
             for c in state.conversations.values() {tx.execute("INSERT INTO conversations(id,principal_id,kind,peer_id,group_id,last_read_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET last_read_at=MAX(last_read_at,excluded.last_read_at)",params![c.id,c.principal_id,c.kind,c.peer_id,c.group_id,c.last_read_at,c.created_at])?;}
             let local:HashSet<_>=state.sessions.values().map(|s|s.id.as_str()).chain(state.profiles.values().filter(|d|d.kind=="local").map(|d|d.id.as_str())).collect();
             for id in changed.keys() {
@@ -172,8 +178,8 @@ impl Store {
             for item in q.query_map([],|r|Ok(Device{id:r.get(0)?,name:r.get(1)?,platform:r.get(2)?,kind:r.get(3)?,host_device_id:r.get(4)?,public_key:r.get(5)?,address:r.get(6)?,capabilities:serde_json::from_str(&r.get::<_,String>(7)?).unwrap_or_default(),last_seen:0}))? {
                 let d=item?;if d.id!=owner&&d.kind=="app"{state.peers.insert(d.id.clone(),d.clone());}state.profiles.insert(d.id.clone(),d);
             }
-            let mut q=conn.prepare("SELECT s.token_hash,s.device_id,d.name,s.expires_at FROM browser_sessions s JOIN devices d ON d.id=s.device_id WHERE expires_at>?1")?;
-            for item in q.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,Session{id:r.get(1)?,name:r.get(2)?,last_seen:0,expires:r.get::<_,u64>(3)?/1000})))? {let(k,v)=item?;state.sessions.insert(k,v);}
+            let mut q=conn.prepare("SELECT s.token_hash,s.device_id,d.name,s.expires_at,s.secure FROM browser_sessions s JOIN devices d ON d.id=s.device_id WHERE expires_at>?1")?;
+            for item in q.query_map([now_ms()],|r|Ok((r.get::<_,String>(0)?,Session{id:r.get(1)?,name:r.get(2)?,last_seen:0,expires:r.get::<_,u64>(3)?/1000,secure:r.get(4)?})))? {let(k,v)=item?;state.sessions.insert(k,v);}
             let mut q=conn.prepare("SELECT id,name,owner_id,revision,created_at,snapshot_json FROM groups")?;
             for item in q.query_map([],|r|Ok(Group{id:r.get(0)?,name:r.get(1)?,owner_id:r.get(2)?,revision:r.get(3)?,created_at:r.get(4)?,snapshot:serde_json::from_str(&r.get::<_,String>(5)?).unwrap_or(None),members:Vec::new()}))? {
                 let mut g=item?;let mut m=conn.prepare("SELECT device_id,invite_id,role,state,sequence,event_json FROM group_members WHERE group_id=?1 ORDER BY device_id")?;

@@ -317,7 +317,7 @@ test("browser names are automatic, editable and remembered without changing iden
   await context.close();
 });
 
-test("matching nicknames are distinguished across nearby devices and conversations", async ({
+test("matching nicknames are distinguished within temporary browser conversations", async ({
   browser,
 }) => {
   const host = await owner(browser);
@@ -334,14 +334,15 @@ test("matching nicknames are distinguished across nearby devices and conversatio
     suffixLength += 4;
   const oneLabel = `摸鱼海獭 · ${one.id.slice(-suffixLength).toUpperCase()}`;
   const twoLabel = `摸鱼海獭 · ${two.id.slice(-suffixLength).toUpperCase()}`;
+  const history = host.page.getByRole("region", { name: "临时会话记录" });
   await expect(
-    host.page.getByRole("button", { name: `连接 ${oneLabel}`, exact: true }),
+    history.getByRole("button", { name: `打开 ${oneLabel}`, exact: true }),
   ).toBeVisible();
   await expect(
-    host.page.getByRole("button", { name: `连接 ${twoLabel}`, exact: true }),
+    history.getByRole("button", { name: `打开 ${twoLabel}`, exact: true }),
   ).toBeVisible();
-  await host.page
-    .getByRole("button", { name: `连接 ${oneLabel}`, exact: true })
+  await history
+    .getByRole("button", { name: `打开 ${oneLabel}`, exact: true })
     .click();
   await expect(
     host.page.getByRole("heading", { name: oneLabel, exact: true }),
@@ -350,7 +351,7 @@ test("matching nicknames are distinguished across nearby devices and conversatio
     host.page.getByRole("button", { name: `打开 ${oneLabel}`, exact: true }),
   ).toBeVisible();
   await expect(
-    host.page.getByRole("button", { name: `连接 ${twoLabel}`, exact: true }),
+    history.getByRole("button", { name: `打开 ${twoLabel}`, exact: true }),
   ).toBeVisible();
   await host.page.screenshot({
     path: ".playwright/nickname-collision.png",
@@ -363,7 +364,7 @@ test("matching nicknames are distinguished across nearby devices and conversatio
     host.page.getByRole("button", { name: "打开 好奇水豚", exact: true }),
   ).toBeVisible();
   await expect(
-    host.page.getByRole("button", { name: "连接 摸鱼海獭", exact: true }),
+    history.getByRole("button", { name: "打开 摸鱼海獭", exact: true }),
   ).toBeVisible();
   expect((await me(first)).id).toBe(one.id);
   expect((await me(second)).id).toBe(two.id);

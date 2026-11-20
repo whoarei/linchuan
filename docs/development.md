@@ -7,7 +7,7 @@ Node.js 22、Rust stable（首版使用 Rust 1.100，文件锁 API 要求 1.89+�
 Ubuntu 22.04：
 
 ```bash
-sudo apt-get install build-essential libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev patchelf libayatana-appindicator3-dev
+sudo apt-get install build-essential libwebkit2gtk-4.1-dev libssl-dev librsvg2-dev patchelf libayatana-appindicator3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-nice
 ```
 
 Android 需要 JDK 21、Android SDK Platform 36、Build Tools 35、NDK `27.2.12479018`，配置 `ANDROID_HOME`、`NDK_HOME`，安装 Rust target `aarch64-linux-android`。原生工程已提交，无需重新执行 `tauri android init`，以免覆盖网络权限和组播锁。
@@ -45,6 +45,16 @@ python3 scripts/test_updates.py
 `rust-embed` 会嵌入 `dist`；先构建前端再构建 Rust。首次 Linux 浏览器测试可使用 `npx playwright install --with-deps chromium` 安装系统依赖。HTTP 测试直接在局域网地址验证无证书配对、WS 和文件完整下载。ready.json 的 address 是本机 HTTP 地址；分享给局域网设备时使用信息接口的 addresses。
 
 全量核心测试包含原文件直传和兼容上传／下载两条实际超过 2 GiB 的校验，需要相应磁盘读写时间；建议测试磁盘至少保留 7 GiB 可用空间。新浏览器模型、原生文件选择 IPC 和浏览器下载状态的回归见 `tests/direct-model.spec.ts`，直接文件流和故障恢复见 `crates/core/tests/direct_transfers.rs`。
+
+## 网页远程协助
+
+浏览器配对后出现在分享方的「临时会话记录」中。打开在线会话，点击「分享屏幕」，浏览器收到邀请后可点击「加入观看」。
+
+启用网页控制时，在分享方的「连接其他设备 → 配置网页控制」中填写可从浏览器访问的域名或 IPv4 地址，导入匹配的 PEM 证书链和 PEM 私钥。观看方的浏览器需要信任这组证书。可填写固定端口以保留浏览器的配对状态。完全退出并重新打开邻传后，在地址列表中选择「网页协助（HTTPS）」，使用对应的配对码。
+
+分享整个屏幕后，HTTPS 网页可以请求控制。分享方需逐次允许，随时可以收回控制或结束共享。HTTP 网页可以加入观看。Windows 控制要求单显示器，Linux 控制要求单屏 X11，Android 控制需要在系统设置中启用邻传的协助触控权限。
+
+开发和部署也可以在邻传数据目录中提供 `browser-https.json`。例如 `{"host":"assist.example.net","port":8443,"certificate":"certificate.pem","key":"key.pem"}`。相对路径以数据目录为基准。应用界面导入的私钥保存在应用数据目录内。
 
 ## 打包
 

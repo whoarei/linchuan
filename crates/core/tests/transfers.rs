@@ -65,7 +65,6 @@ async fn files_larger_than_two_gib_stream_upload_and_download_intact() {
     use sha2::{Digest, Sha256};
     let host = Host::new("大文件流式验证").await;
     let recipient = host.pair("大文件接收浏览器").await;
-    let recipient_id = host.state(&recipient).await["me"]["id"].clone();
     let size = 2u64 * 1024 * 1024 * 1024 + 17;
     let draft = host
         .draft(json!([{"name":"over-two-gib.bin","size":size}]))
@@ -106,15 +105,16 @@ async fn files_larger_than_two_gib_stream_upload_and_download_intact() {
         "{}",
         response.text().await.unwrap()
     );
-    let sent = host
+    // A slow upload can outlast the browser's online window.
+    let recipient_id = host.state(&recipient).await["me"]["id"].clone();
+    let response = host
         .post(
             &format!("/api/drafts/{}/send", draft["id"].as_str().unwrap()),
             json!({"targets":[recipient_id],"text":"大文件验证"}),
         )
-        .await
-        .json::<Value>()
-        .await
-        .unwrap();
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let sent = response.json::<Value>().await.unwrap();
     let id = sent["ids"][0].as_str().unwrap();
     assert_eq!(
         client
