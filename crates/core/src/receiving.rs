@@ -75,7 +75,7 @@ impl App {
             let tx = c.transaction()?;
             tx.execute("INSERT INTO app_settings(key,value) VALUES('receive_directory',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[directory])?;
             tx.execute("INSERT OR IGNORE INTO app_settings(key,value) VALUES('receive_since',?1)", [now_ms().to_string()])?;
-            tx.execute("UPDATE saved_files SET status='pending',error=NULL,updated_at=?1 WHERE status='failed'",[now_ms()])?;
+            tx.execute("UPDATE saved_files SET status='pending',error=NULL,updated_at=?1 WHERE status='failed' AND (directory='' OR location<>'')",[now_ms()])?;
             tx.commit()?;
             Ok(())
         }).await?;
@@ -105,7 +105,7 @@ impl App {
             file.meta.name.clone(),
         );
         self.0.store.run(move |c, _| {
-            c.execute("INSERT INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) VALUES(?1,?2,?3,?4,'pending',?5) ON CONFLICT(message_id,file_id) DO UPDATE SET status='pending',error=NULL,updated_at=excluded.updated_at",params![message,id,transfer_id,name,now_ms()])?;
+            c.execute("INSERT INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) VALUES(?1,?2,?3,?4,'pending',?5) ON CONFLICT(message_id,file_id) DO UPDATE SET status='pending',directory=CASE WHEN location='' THEN '' ELSE directory END,error=NULL,updated_at=excluded.updated_at",params![message,id,transfer_id,name,now_ms()])?;
             Ok(())
         }).await?;
         drop(state);
@@ -123,15 +123,29 @@ impl App {
             Ok(files)
         }).await
     }
-    async fn receive_jobs(&self) -> anyhow::Result<Vec<SaveJob>> {
+    async fn receive_jobs(&self) -> anyhow::Result<Vec<(SaveJob, bool)>> {
         self.0.store.run(|c, root| {
             let directory: String = c.query_row("SELECT value FROM app_settings WHERE key='receive_directory'",[],|r|r.get(0)).optional()?.unwrap_or_default();
-            let rows:Vec<(String,String,String)>=c.prepare("SELECT message_id,file_id,transfer_id FROM saved_files WHERE status='pending' ORDER BY updated_at")?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            // Before an export has a saved location, its directory can hold a one-time target.
+            let rows: Vec<(String, String, String, Option<String>)> = c.prepare(
+                "SELECT message_id,file_id,transfer_id,CASE WHEN location='' THEN NULLIF(directory,'') END FROM saved_files WHERE status='pending' ORDER BY updated_at",
+            )?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
             let mut jobs=Vec::new();
-            for(message_id,file_id,transfer_id) in rows {
+            for(message_id,file_id,transfer_id,selected_directory) in rows {
                 if let Some(t)=crate::store::query_transfer(c,root,&transfer_id)? {
                     if let Some(f)=t.files.into_iter().find(|f|f.meta.id==file_id && f.available()) {
-                        jobs.push(SaveJob{message_id,file_id,source:f.path,name:safe_name(&f.meta.name),mime:f.meta.mime,directory:directory.clone(),size:f.meta.size,progress:None});
+                        let fixed_directory = selected_directory.is_some();
+                        let job = SaveJob {
+                            message_id,
+                            file_id,
+                            source: f.path,
+                            name: safe_name(&f.meta.name),
+                            mime: f.meta.mime,
+                            directory: selected_directory.unwrap_or_else(|| directory.clone()),
+                            size: f.meta.size,
+                            progress: None,
+                        };
+                        jobs.push((job, fixed_directory));
                     }
                 }
             }
@@ -154,7 +168,7 @@ impl App {
                 // Restore all queued exports after a restart before starting the
                 // first copy, so subsequent admissions also see these promises.
                 let mut prepared = Vec::with_capacity(jobs.len());
-                for job in jobs {
+                for (job, fixed_directory) in jobs {
                     let key = (job.message_id.clone(), job.file_id.clone());
                     let reservation = if completed.contains_key(&key) {
                         Ok(None)
@@ -166,9 +180,9 @@ impl App {
                         )
                         .await
                     };
-                    prepared.push((job, reservation));
+                    prepared.push((job, fixed_directory, reservation));
                 }
-                for (mut job, reservation) in prepared {
+                for (mut job, fixed_directory, reservation) in prepared {
                     if *stop.borrow() {
                         break;
                     }
@@ -182,10 +196,13 @@ impl App {
                         Ok(value.clone())
                     } else {
                         let tag = format!("export:{}:{}", job.message_id, job.file_id);
-                        let current_directory = self
-                            .receive_directory()
-                            .await
-                            .unwrap_or_else(|_| job.directory.clone());
+                        let current_directory = if fixed_directory {
+                            job.directory.clone()
+                        } else {
+                            self.receive_directory()
+                                .await
+                                .unwrap_or_else(|_| job.directory.clone())
+                        };
                         let reservation = if current_directory == job.directory {
                             reservation
                         } else {

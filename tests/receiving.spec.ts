@@ -44,6 +44,30 @@ async function client(browser: Browser, mobile = false) {
               : "/home/user/Downloads/邻传";
             return { directory: state.directory, label: state.directory };
           }
+          if (command === "receive_transfer_as") {
+            if (state.cancel) {
+              state.cancel = false;
+              return false;
+            }
+            if (state.failPicker) {
+              state.failPicker = false;
+              throw "目标磁盘空间不足";
+            }
+            // The real native command accepts directly in core after picking a folder.
+            const response = await fetch(
+              `${boot.address}/api/transfers/${args.transferId}/decision`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${boot.token}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ accept: true }),
+              },
+            );
+            if (!response.ok) throw new Error((await response.json()).error);
+            return true;
+          }
           if (command === "save_received_file") state.status = "saved";
           if (command === "relocate_received_file") {
             if (state.cancel) {
@@ -134,15 +158,12 @@ for (const mobile of [false, true]) {
   });
 }
 
-test("native saved files open through IPC after cache cleanup and failures can retry without browser download", async ({
-  browser,
-}) => {
-  const host = await client(browser);
+async function sendPendingFile(browser: Browser, address: string, code: string, name: string) {
   const sender = await browser.newContext();
   const page = await sender.newPage();
-  await page.goto(host.boot.address);
-  await page.getByLabel("你的设备名称").fill("固定目录测试浏览器");
-  await page.getByLabel("六位配对码").fill(host.boot.pairing_code);
+  await page.goto(address);
+  await page.getByLabel("你的设备名称").fill(name);
+  await page.getByLabel("六位配对码").fill(code);
   await page.getByRole("button", { name: "连接设备", exact: true }).click();
   await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await page.locator("input[type=file]").setInputFiles({
@@ -154,6 +175,43 @@ test("native saved files open through IPC after cache cleanup and failures can r
     .getByRole("textbox", { name: "发送文字" })
     .fill("自动保存到固定目录");
   await page.getByRole("button", { name: "发送", exact: true }).click();
+  return sender;
+}
+
+test("save as keeps an offer pending on cancellation or a storage error", async ({ browser }) => {
+  const host = await client(browser);
+  const name = "另存为测试浏览器";
+  const sender = await sendPendingFile(browser, host.boot.address, host.boot.pairing_code, name);
+  await host.page.getByRole("button", { name: `打开 ${name}`, exact: true }).click();
+  const actions = host.page.getByRole("group", { name: "接收文件" });
+  const saveAs = actions.getByRole("button", { name: "另存为", exact: true });
+  await expect(saveAs.locator("svg")).toBeVisible();
+  await expect(saveAs).toHaveText("");
+  await expect(actions.getByRole("button", { name: "接收", exact: true })).toBeVisible();
+  await expect(actions.getByRole("button", { name: "拒绝", exact: true })).toBeVisible();
+  await host.page.evaluate(() => ((window as any).__receiving.cancel = true));
+  await saveAs.click();
+  await expect(saveAs).toBeEnabled();
+  await expect(actions).toContainText("待接收");
+  await host.page.setViewportSize({ width: 390, height: 844 });
+  await expect(saveAs).toBeVisible();
+  expect(await host.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await host.page.evaluate(() => ((window as any).__receiving.failPicker = true));
+  await saveAs.click();
+  await expect(host.page.locator(".toast")).toContainText("目标磁盘空间不足");
+  await expect(actions).toContainText("待接收");
+  await saveAs.click();
+  await expect(actions).toHaveCount(0);
+  await expect(host.page.locator(".message-attachments")).toContainText("已保存");
+  await sender.close();
+  await host.context.close();
+});
+
+test("native saved files open through IPC after cache cleanup and failures can retry without browser download", async ({
+  browser,
+}) => {
+  const host = await client(browser);
+  const sender = await sendPendingFile(browser, host.boot.address, host.boot.pairing_code, "固定目录测试浏览器");
   await host.page
     .getByRole("button", { name: "打开 固定目录测试浏览器", exact: true })
     .click();

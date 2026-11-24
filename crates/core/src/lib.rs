@@ -233,6 +233,13 @@ impl App {
         Ok(app)
     }
     async fn commit(&self, state: &mut State) -> Result<(), api::Error> {
+        self.commit_with_receive_directory(state, None).await
+    }
+    async fn commit_with_receive_directory(
+        &self,
+        state: &mut State,
+        receive_directory: Option<(String, String)>,
+    ) -> Result<(), api::Error> {
         for transfer in state.transfers.values_mut() {
             if transfer.incoming_remote && transfer.view.terminal() && transfer.reserved > 0 {
                 let used: u64 = transfer
@@ -249,7 +256,7 @@ impl App {
             }
         }
         state.link_conversations(&self.0.device_id);
-        match self.0.store.save(state.clone()).await {
+        match self.0.store.save(state.clone(), receive_directory).await {
             Ok(()) => {
                 {
                     let mut leases = self.0.space_leases.lock().unwrap();

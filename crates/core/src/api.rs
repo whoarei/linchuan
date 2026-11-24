@@ -992,6 +992,7 @@ async fn set_decision(
     recipient: &str,
     owner: bool,
     accept: bool,
+    directory: Option<&str>,
 ) -> Result<()> {
     let transfer = state
         .transfers
@@ -1004,14 +1005,16 @@ async fn set_decision(
     if !owner && (transfer.view.group_id.is_some() || transfer.view.sender_id != app.0.device_id) {
         return Err(Error::forbidden());
     }
-    if accept
-        && owner
-        && transfer
-            .files
-            .iter()
-            .any(|f| matches!(f.storage, FileStorage::Browser | FileStorage::Receiving))
-    {
-        let directory = app.target_directory().await?;
+    let streams_to_disk = transfer
+        .files
+        .iter()
+        .any(|f| matches!(f.storage, FileStorage::Browser | FileStorage::Receiving));
+    let saves_from_cache = directory.is_some() && transfer.files.iter().any(StoredFile::cached);
+    if accept && owner && (streams_to_disk || saves_from_cache) {
+        let directory = match directory {
+            Some(directory) => directory.to_owned(),
+            None => app.target_directory().await?,
+        };
         let lease = app
             .0
             .space
@@ -1019,7 +1022,7 @@ async fn set_decision(
                 transfer
                     .files
                     .iter()
-                    .filter(|f| !f.complete)
+                    .filter(|f| !f.complete || (saves_from_cache && f.cached()))
                     .map(|f| {
                         (
                             format!("receive:{id}:{}", f.meta.id),
@@ -1031,16 +1034,20 @@ async fn set_decision(
             )
             .await
             .map_err(Error::conflict)?;
-        app.0
-            .space_leases
-            .lock()
-            .unwrap()
-            .insert(format!("incoming:{id}"), lease);
-        app.0
-            .receive_directories
-            .lock()
-            .unwrap()
-            .insert(id.to_owned(), directory);
+        if streams_to_disk {
+            app.0
+                .space_leases
+                .lock()
+                .unwrap()
+                .insert(format!("incoming:{id}"), lease);
+            app.0
+                .receive_directories
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), directory);
+        }
+        // Cached exports reserve again in the saver. Drop their preflight lease
+        // before committing the queue so the saver cannot count them twice.
     }
     transfer.view.status = if !accept {
         "rejected"
@@ -1075,7 +1082,7 @@ async fn auto_receive(app: &App, state: &mut crate::model::State, id: &str) {
     }
     let recipient = transfer.view.recipient_id.clone();
     let owner = recipient == app.0.device_id;
-    if let Err(error) = set_decision(app, state, id, &recipient, owner, true).await {
+    if let Err(error) = set_decision(app, state, id, &recipient, owner, true, None).await {
         // Leave the offer pending so the recipient can retry after fixing storage.
         state.transfers.get_mut(id).unwrap().view.error = Some(format!("自动接收未完成：{error}"));
     }
@@ -1098,16 +1105,54 @@ async fn decision(
     let accept = value["accept"]
         .as_bool()
         .ok_or_else(|| Error::bad("缺少接收决定"))?;
-    app.cache_transfer(&id).await?;
-    let mut state = app.0.state.lock().await;
-    set_decision(&app, &mut state, &id, &p.id, p.owner, accept).await?;
-    if let Err(error) = app.commit(&mut state).await {
-        release_acceptance(&app, &id);
-        return Err(error);
-    }
-    drop(state);
-    app.notify();
+    app.decide_transfer(&id, &p.id, p.owner, accept, None)
+        .await?;
     Ok(Json(json!({"ok":true})))
+}
+
+impl App {
+    pub async fn accept_transfer_to_directory(&self, id: &str, directory: String) -> Result<()> {
+        if directory.is_empty() {
+            return Err(Error::bad("请选择接收目录"));
+        }
+        self.decide_transfer(id, &self.0.device_id, true, true, Some(directory))
+            .await
+    }
+
+    async fn decide_transfer(
+        &self,
+        id: &str,
+        recipient: &str,
+        owner: bool,
+        accept: bool,
+        directory: Option<String>,
+    ) -> Result<()> {
+        self.cache_transfer(id).await?;
+        let mut state = self.0.state.lock().await;
+        set_decision(
+            self,
+            &mut state,
+            id,
+            recipient,
+            owner,
+            accept,
+            directory.as_deref(),
+        )
+        .await?;
+        if let Err(error) = self
+            .commit_with_receive_directory(
+                &mut state,
+                directory.map(|directory| (id.into(), directory)),
+            )
+            .await
+        {
+            release_acceptance(self, id);
+            return Err(error);
+        }
+        drop(state);
+        self.notify();
+        Ok(())
+    }
 }
 async fn cancel(
     AxState(app): AxState<App>,

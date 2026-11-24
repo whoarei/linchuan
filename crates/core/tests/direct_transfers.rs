@@ -391,19 +391,47 @@ async fn browser_scope_is_host_only_in_all_control_apis() {
 
 #[tokio::test]
 async fn browser_upload_waits_for_acceptance_and_writes_one_copy_to_the_frozen_target() {
+    browser_upload_to_frozen_target(false).await;
+}
+
+#[tokio::test]
+async fn save_as_bypasses_a_full_default_target_for_the_entire_transfer() {
+    browser_upload_to_frozen_target(true).await;
+}
+
+async fn browser_upload_to_frozen_target(save_as: bool) {
     let host = Host::new("宿主").await;
     let first = TempDir::new().unwrap();
     let second = TempDir::new().unwrap();
+    let default = if save_as { second.path() } else { first.path() };
     host.app
-        .configure_receiving(first.path().to_string_lossy().into_owned())
+        .configure_receiving(default.to_string_lossy().into_owned())
         .await
         .unwrap();
+    if save_as {
+        let full = default.to_path_buf();
+        host.app.set_space_probe(std::sync::Arc::new(move |path| {
+            let full = full.clone();
+            Box::pin(async move {
+                let mut disk = linchuan_core::storage::disk_space(Path::new(&path))?;
+                if Path::new(&path) == full {
+                    disk.available = 0;
+                }
+                Ok(disk)
+            })
+        }));
+    }
     let (token, _) = host.pair().await;
     let data = vec![61u8; 1024 * 1024 + 17];
+    let files = if save_as {
+        json!([{"name":"image.img","size":data.len()},{"name":"notes.txt","size":3}])
+    } else {
+        json!([{"name":"image.img","size":data.len()}])
+    };
     let draft: Value = host
         .post(
             "/api/drafts",
-            json!({"streaming":true,"files":[{"name":"image.img","size":data.len()}]}),
+            json!({"streaming":true,"files":files}),
             &token,
         )
         .await
@@ -429,7 +457,29 @@ async fn browser_upload_waits_for_acceptance_and_writes_one_copy_to_the_frozen_t
     );
     assert_eq!(bytes_in(&host.dir.path().join("files")), 0);
     assert_eq!(host.state(&host.token).await["storage_used"], 0);
-    host.accept(id, &host.token).await;
+    let message = sent["message_id"].as_str().unwrap();
+    if save_as {
+        let refused = host
+            .post(
+                &format!("/api/transfers/{id}/decision"),
+                json!({"accept":true}),
+                &host.token,
+            )
+            .await;
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert!(refused.text().await.unwrap().contains("磁盘空间不足"));
+        host.wait(message, "pending").await;
+        host.app
+            .accept_transfer_to_directory(id, first.path().to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            host.app.receive_directory().await.unwrap(),
+            default.to_string_lossy()
+        );
+    } else {
+        host.accept(id, &host.token).await;
+    }
     host.app
         .set_receive_directory(second.path().to_string_lossy().into_owned())
         .await
@@ -445,22 +495,43 @@ async fn browser_upload_waits_for_acceptance_and_writes_one_copy_to_the_frozen_t
             .status(),
         StatusCode::OK
     );
-    host.wait(sent["message_id"].as_str().unwrap(), "completed")
-        .await;
-    let saved = host
-        .app
-        .saved_files(vec![sent["message_id"].as_str().unwrap().into()])
-        .await
-        .unwrap();
-    assert_eq!(saved.len(), 1);
-    assert!(Path::new(&saved[0].location).starts_with(first.path()));
-    assert_eq!(std::fs::read(&saved[0].location).unwrap(), data);
-    assert_eq!(std::fs::read_dir(first.path()).unwrap().count(), 1);
+    if save_as {
+        let file = draft["files"][1]["id"].as_str().unwrap();
+        assert_eq!(
+            Client::new()
+                .put(format!(
+                    "{}/api/transfers/{id}/files/{file}/upload",
+                    host.url
+                ))
+                .bearer_auth(&token)
+                .body("end")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            std::fs::read(first.path().join("notes.txt")).unwrap(),
+            b"end"
+        );
+    }
+    host.wait(message, "completed").await;
+    let saved = host.app.saved_files(vec![message.into()]).await.unwrap();
+    assert_eq!(saved.len(), if save_as { 2 } else { 1 });
+    assert!(saved
+        .iter()
+        .all(|file| Path::new(&file.location).starts_with(first.path())));
+    assert_eq!(std::fs::read(first.path().join("image.img")).unwrap(), data);
+    assert_eq!(
+        std::fs::read_dir(first.path()).unwrap().count(),
+        saved.len()
+    );
     assert_eq!(bytes_in(second.path()), 0);
     assert_eq!(bytes_in(&host.dir.path().join("files")), 0);
     host.post("/api/storage/clear", json!({}), &host.token)
         .await;
-    assert!(Path::new(&saved[0].location).is_file());
+    assert!(saved.iter().all(|file| Path::new(&file.location).is_file()));
 }
 
 #[tokio::test]

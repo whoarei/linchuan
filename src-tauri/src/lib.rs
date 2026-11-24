@@ -143,6 +143,7 @@ pub fn run() {
             desktop::desktop_set_close_to_tray,
             desktop::desktop_quit,
             receiving::receive_settings,
+            receiving::receive_transfer_as,
             receiving::choose_receive_directory,
             receiving::reset_receive_directory,
             receiving::received_files,

@@ -106,7 +106,11 @@ impl Store {
         })
         .await?
     }
-    pub async fn save(&self, state: State) -> anyhow::Result<()> {
+    pub async fn save(
+        &self,
+        state: State,
+        receive_directory: Option<(String, String)>,
+    ) -> anyhow::Result<()> {
         let inner = self.inner.clone();
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || {
@@ -128,6 +132,9 @@ impl Store {
             let local:HashSet<_>=state.sessions.values().map(|s|s.id.as_str()).chain(state.profiles.values().filter(|d|d.kind=="local").map(|d|d.id.as_str())).collect();
             for id in changed.keys() {
                 let t=&state.transfers[id];let v=&t.view;
+                let directory = receive_directory.as_ref()
+                    .filter(|(delivery, _)| delivery == id)
+                    .map_or("", |(_, directory)| directory.as_str());
                 let existing:Option<(String,String,Option<String>)>=tx.query_row("SELECT sender_id,text,group_id FROM messages WHERE id=?1",[&v.message_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
                 if let Some((sender,text,group))=existing {anyhow::ensure!(sender==v.sender_id&&text==v.text&&group==v.group_id,"消息标识冲突，拒绝覆盖历史");}
                 tx.execute("INSERT OR IGNORE INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7)",params![v.message_id,v.sender_id,v.sender_name,v.group_id,v.text,v.created_at,now_ms()])?;
@@ -149,7 +156,15 @@ impl Store {
                         tx.execute("INSERT INTO file_blobs VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN file_blobs.state='expired' AND excluded.state='missing' THEN 'expired' ELSE excluded.state END",params![blob,relative,f.meta.size,availability,now_ms()])?;
                         tx.execute("INSERT INTO delivery_files VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET complete=excluded.complete",params![v.id,f.meta.id,blob,f.complete])?;
                         if v.status == "completed" && f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
-                            tx.execute("INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at) SELECT ?1,?2,?3,?4,'pending',?5 WHERE EXISTS(SELECT 1 FROM app_settings WHERE key='receive_directory') AND (SELECT received_at FROM messages WHERE id=?1)>=CAST((SELECT value FROM app_settings WHERE key='receive_since') AS INTEGER)",params![v.message_id,f.meta.id,v.id,f.meta.name,now_ms()])?;
+                            tx.execute(
+                                "INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at,directory)
+                                 SELECT ?1,?2,?3,?4,'pending',?5,?6
+                                 WHERE ?6<>'' OR (
+                                     EXISTS(SELECT 1 FROM app_settings WHERE key='receive_directory')
+                                     AND (SELECT received_at FROM messages WHERE id=?1)>=CAST((SELECT value FROM app_settings WHERE key='receive_since') AS INTEGER)
+                                 )",
+                                params![v.message_id, f.meta.id, v.id, f.meta.name, now_ms(), directory],
+                            )?;
                         }
                     } else if let FileStorage::Received {directory,name}=&f.storage {
                         if f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {

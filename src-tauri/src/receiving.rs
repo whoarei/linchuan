@@ -278,6 +278,22 @@ async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String>
     }
 }
 
+#[tauri::command]
+pub async fn receive_transfer_as(
+    app: tauri::AppHandle,
+    transfer_id: String,
+    runtime: State<'_, Runtime>,
+) -> Result<bool, String> {
+    let core = runtime.0.get().ok_or("服务尚未就绪")?;
+    let Some(directory) = pick_directory(app).await? else {
+        return Ok(false);
+    };
+    core.accept_transfer_to_directory(&transfer_id, directory)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 static FILE_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tauri::command]

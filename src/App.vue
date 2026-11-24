@@ -175,7 +175,8 @@ const toastError = ref(false);
 let toastTimer: ReturnType<typeof setTimeout>;
 const preview = ref<{ url: string; name: string }>();
 const thumbnails = ref<Record<string, string>>({});
-const decisionBusy = ref(new Set<string>());
+type ReceiveDecision = "reject" | "accept" | "save-as";
+const decisionBusy = ref(new Map<string, ReceiveDecision>());
 const thumbnailRequests = new Set<string>();
 const autoDownloads = new Set<string>();
 let thumbnailBytes = 0;
@@ -713,18 +714,27 @@ async function send() {
     controller = undefined;
   }
 }
-async function decide(transfer: Transfer, accept: boolean) {
+async function decide(transfer: Transfer, decision: ReceiveDecision) {
   if (decisionBusy.value.has(transfer.id)) return;
-  decisionBusy.value.add(transfer.id);
+  decisionBusy.value.set(transfer.id, decision);
   try {
-    await api("/api/transfers/"+transfer.id+"/decision", { accept });
+    if (decision === "save-as") {
+      const accepted = await invoke<boolean>("receive_transfer_as", {
+        transferId: transfer.id,
+      });
+      if (!accepted) return;
+    } else {
+      await api(`/api/transfers/${transfer.id}/decision`, {
+        accept: decision === "accept",
+      });
+    }
     await refresh();
-    if(accept && browserOnly.value && transfer.files.length) {
-      const message=messages.value.find((m)=>m.id===transfer.message_id);
-      if(message) for(const file of message.files) await download(file,message.id);
+    if (decision === "accept" && browserOnly.value && transfer.files.length) {
+      const message = messages.value.find((m) => m.id === transfer.message_id);
+      if (message) for (const file of message.files) await download(file, message.id);
     }
   } catch (error) {
-    notify((error as Error).message, true);
+    notify(error instanceof Error ? error.message : String(error), true);
   } finally {
     decisionBusy.value.delete(transfer.id);
   }
@@ -1512,19 +1522,33 @@ onUnmounted(() => {
                     aria-label="拒绝"
                     title="拒绝"
                     :disabled="decisionBusy.has(incomingPending(message)!.id)"
-                    @click="decide(incomingPending(message)!, false)"
+                    @click="decide(incomingPending(message)!, 'reject')"
                   >
-                    <X :size="18" />
+                    <LoaderCircle
+                      v-if="decisionBusy.get(incomingPending(message)!.id) === 'reject'"
+                      class="spin"
+                      :size="18"
+                    /><X v-else :size="18" />
+                  </button>
+                  <button
+                    v-if="native"
+                    class="icon-button"
+                    aria-label="另存为"
+                    title="另存为"
+                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    @click="decide(incomingPending(message)!, 'save-as')"
+                  >
+                    <FolderInput :size="18" aria-hidden="true" />
                   </button>
                   <button
                     class="icon-button"
                     aria-label="接收"
                     title="接收"
                     :disabled="decisionBusy.has(incomingPending(message)!.id)"
-                    @click="decide(incomingPending(message)!, true)"
+                    @click="decide(incomingPending(message)!, 'accept')"
                   >
                     <LoaderCircle
-                      v-if="decisionBusy.has(incomingPending(message)!.id)"
+                      v-if="decisionBusy.get(incomingPending(message)!.id) === 'accept'"
                       class="spin"
                       :size="18"
                     /><Check v-else :size="18" />
@@ -1765,13 +1789,13 @@ onUnmounted(() => {
                 ><button
                   class="secondary"
                   :disabled="decisionBusy.has(incomingPending(message)!.id)"
-                  @click="decide(incomingPending(message)!, false)"
+                  @click="decide(incomingPending(message)!, 'reject')"
                 >
                   拒绝</button
                 ><button
                   class="primary"
                   :disabled="decisionBusy.has(incomingPending(message)!.id)"
-                  @click="decide(incomingPending(message)!, true)"
+                  @click="decide(incomingPending(message)!, 'accept')"
                 >
                   接收
                 </button>

@@ -212,6 +212,17 @@ async fn incoming_file(sender: &Host, receiver: &Host, bytes: &[u8]) -> (String,
 }
 
 async fn legacy_cached_file(receiver: &Host, bytes: &[u8]) -> (String, String, String) {
+    let (message, transfer, file) = offer_legacy_cached_file(receiver, bytes).await;
+    receiver
+        .post(
+            &format!("/api/transfers/{transfer}/decision"),
+            json!({"accept":true}),
+        )
+        .await;
+    (message, transfer, file)
+}
+
+async fn offer_legacy_cached_file(receiver: &Host, bytes: &[u8]) -> (String, String, String) {
     let browser = receiver.pair("旧版上传页面").await;
     let draft: Value = receiver
         .post_as(
@@ -247,12 +258,6 @@ async fn legacy_cached_file(receiver: &Host, bytes: &[u8]) -> (String, String, S
         .await
         .unwrap();
     let transfer = sent["ids"][0].as_str().unwrap().to_owned();
-    receiver
-        .post(
-            &format!("/api/transfers/{transfer}/decision"),
-            json!({"accept":true}),
-        )
-        .await;
     (
         sent["message_id"].as_str().unwrap().to_owned(),
         transfer,
@@ -517,6 +522,42 @@ async fn failed_and_pending_saves_protect_cache_and_retry_in_changed_directory()
     assert!(record.location.starts_with(new_directory.to_str().unwrap()));
     assert_eq!(std::fs::read(record.location).unwrap(), b"retry contents");
     assert_eq!(std::fs::read(blocked).unwrap(), b"keep");
+    receiver.app.stop();
+    saver.await.unwrap();
+}
+
+#[tokio::test]
+async fn legacy_cached_attachment_keeps_its_save_as_directory_until_export() {
+    let receiver = Host::new("接收").await;
+    let default = TempDir::new().unwrap();
+    let chosen = TempDir::new().unwrap();
+    let directory = chosen.path().to_string_lossy().into_owned();
+    receiver
+        .app
+        .configure_receiving(default.path().to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let (message, transfer, _) = offer_legacy_cached_file(&receiver, b"cached contents").await;
+    receiver
+        .app
+        .accept_transfer_to_directory(&transfer, directory.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        saved(&receiver.app, &message, "pending").await.directory,
+        directory
+    );
+    let new_default = default.path().join("new-default");
+    receiver
+        .app
+        .set_receive_directory(new_default.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    let saver = start_saver(&receiver.app);
+    let record = saved(&receiver.app, &message, "saved").await;
+    assert_eq!(record.directory, directory);
+    assert_eq!(std::fs::read(record.location).unwrap(), b"cached contents");
+    assert!(!new_default.exists());
     receiver.app.stop();
     saver.await.unwrap();
 }
