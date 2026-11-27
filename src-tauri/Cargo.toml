@@ -35,4 +35,4 @@ gstreamer-sdp = "0.24"
 gstreamer-webrtc = { version = "0.24", features = ["v1_20"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

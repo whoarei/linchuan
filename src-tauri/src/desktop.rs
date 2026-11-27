@@ -52,6 +52,43 @@ mod platform {
             .store(true, Ordering::SeqCst);
         app.exit(0);
     }
+    #[cfg(target_os = "windows")]
+    fn set_taskbar_icon(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{io, ptr};
+        use tauri::utils::platform::WINDOWS_APP_ICON_RESOURCE_ID;
+        use windows_sys::Win32::{
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                LoadImageW, SendMessageW, ICON_BIG, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+                WM_SETICON,
+            },
+        };
+
+        let window = app.get_webview_window("main").ok_or("主窗口不可用")?;
+        let hwnd = window.hwnd()?;
+        let module = unsafe { GetModuleHandleW(ptr::null()) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        let resource = usize::from(WINDOWS_APP_ICON_RESOURCE_ID) as *const u16;
+        // The shared icon from the executable stays alive for the lifetime of the window.
+        let icon = unsafe {
+            LoadImageW(
+                module,
+                resource,
+                IMAGE_ICON,
+                0,
+                0,
+                LR_DEFAULTSIZE | LR_SHARED,
+            )
+        };
+        if icon.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        // Tauri's default window icon is assigned to ICON_SMALL on Windows.
+        unsafe { SendMessageW(hwnd.0, WM_SETICON, ICON_BIG as usize, icon as isize) };
+        Ok(())
+    }
     fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         let icon = app.default_window_icon().ok_or("应用图标不可用")?;
         let show = MenuItem::with_id(app, "show-main", "打开邻传", true, None::<&str>)?;
@@ -92,6 +129,10 @@ mod platform {
     }
     pub fn setup(app: &mut tauri::App) -> tauri::Result<()> {
         let handle = app.handle().clone();
+        #[cfg(target_os = "windows")]
+        if let Err(error) = set_taskbar_icon(&handle) {
+            eprintln!("任务栏图标设置失败：{error}");
+        }
         let available = match create_tray(&handle) {
             Ok(()) => true,
             Err(error) => {
