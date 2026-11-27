@@ -42,6 +42,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
 import ScreenAssistance from "./ScreenAssistance.vue";
 import ConversationRow from "./ConversationRow.vue";
+import ReceiveConflictForm from "./ReceiveConflictForm.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
 import { useDesktopSettings } from "./useDesktopSettings";
@@ -74,6 +75,8 @@ import type {
   MessageFile,
   Transfer,
   FileMeta,
+  ConflictAction,
+  ReceiveConflict,
 } from "./types";
 
 type Mode = "devices" | "settings" | "about";
@@ -153,6 +156,7 @@ const modal = ref<
   | "clear"
   | "leave"
   | "preview"
+  | "receive-conflicts"
 >("");
 const modalContainer = ref<HTMLElement>();
 useModalFocus(modal, modalContainer, closeModal);
@@ -180,6 +184,18 @@ const preview = ref<{ url: string; name: string }>();
 const thumbnails = ref<Record<string, string>>({});
 type ReceiveDecision = "reject" | "accept" | "save-as";
 const decisionBusy = ref(new Map<string, ReceiveDecision>());
+const conflictPrompt = ref<{
+  conflicts: ReceiveConflict[];
+  files: FileMeta[];
+  directory?: string;
+  canSkip: boolean;
+  resolve: (actions?: Record<string, ConflictAction>) => void;
+}>();
+function finishConflictPrompt(actions?: Record<string, ConflictAction>) {
+  conflictPrompt.value?.resolve(actions);
+  conflictPrompt.value = undefined;
+  modal.value = "";
+}
 const excludedFiles = ref(new Map<string, Set<string>>());
 type TransferSample = { bytes: number; time: number; rate?: number };
 const transferSamples = ref(new Map<string, TransferSample>());
@@ -775,31 +791,57 @@ async function send() {
   }
 }
 async function decide(transfer: Transfer, decision: ReceiveDecision) {
-  if (decisionBusy.value.has(transfer.id)) return;
-  const selected = selectedForReceive(transfer);
+  if (decisionBusy.value.size) return;
+  let selected = selectedForReceive(transfer);
   if (decision !== "reject" && transfer.files.length && !selected.length) return;
-  const fileIds = decision !== "reject" && selected.length !== transfer.files.length
-    ? selected.map((file) => file.id)
-    : undefined;
+  let directory: string | undefined;
+  const choices: Record<string, ConflictAction> = {};
   decisionBusy.value.set(transfer.id, decision);
   try {
-    if (decision === "save-as") {
-      const accepted = await invoke<boolean>("receive_transfer_as", {
-        transferId: transfer.id,
-        fileIds,
+    while (true) {
+      const fileIds = selected.length === transfer.files.length ? undefined : selected.map(f => f.id);
+      const accept = decision !== "reject" && (!transfer.files.length || selected.length > 0);
+      let conflicts: ReceiveConflict[];
+      if (decision === "save-as" && accept) {
+        const result = await invoke<boolean | { directory: string; conflicts: ReceiveConflict[] }>("receive_transfer_as", {
+          transferId: transfer.id, fileIds, directory, choices,
+        });
+        if (result === false) return;
+        if (result === true) break;
+        directory = result.directory;
+        conflicts = result.conflicts;
+      } else {
+        try {
+          await api(`/api/transfers/${transfer.id}/decision`, {
+            accept, file_ids: accept ? fileIds : undefined, choices,
+          });
+          break;
+        } catch (error) {
+          if (!(error instanceof ApiError) || !error.conflicts?.length) throw error;
+          conflicts = error.conflicts;
+        }
+      }
+      if (disposed || modal.value) return;
+      const actions = await new Promise<Record<string, ConflictAction> | undefined>(resolve => {
+        conflictPrompt.value = {
+          conflicts, files: selected, resolve,
+          canSkip: !!transfer.can_select_files || selected.length === 1,
+          directory: directory?.startsWith("content://") ? "所选文件夹" : directory || receiveSettings.value?.label,
+        };
+        modal.value = "receive-conflicts";
       });
-      if (!accepted) return;
-    } else {
-      await api(`/api/transfers/${transfer.id}/decision`, {
-        accept: decision === "accept",
-        file_ids: fileIds,
-      });
+      if (!actions) return;
+      for (const c of conflicts) {
+        const action = actions[c.key];
+        if (action === "skip") selected = selected.filter(f => f.id !== c.id);
+        else choices[c.key] = action;
+      }
     }
     await refresh();
     if (decision === "accept" && browserOnly.value && transfer.files.length) {
       const message = messages.value.find((m) => m.id === transfer.message_id);
       if (message) {
-        const files = message.files.filter((file) => !fileIds || fileIds.includes(file.id));
+        const files = message.files.filter((file) => selected.some(f => f.id === file.id));
         files.sort((a, b) => a.size - b.size);
         for (const file of files) await download(file, message.id);
       }
@@ -908,7 +950,8 @@ function closePreview() {
   preview.value = undefined;
 }
 function closeModal() {
-  modal.value = "";
+  if (conflictPrompt.value) finishConflictPrompt();
+  else modal.value = "";
   closePreview();
 }
 async function copy(value: string) {
@@ -1138,7 +1181,7 @@ function sessionChanged() {
   socket = undefined;
   controller?.abort();
   selected.value = "";
-  modal.value = "";
+  closeModal();
   code.value = "";
   showTemporaryHistory.value = undefined;
   messages.value = [];
@@ -1211,6 +1254,7 @@ onMounted(async () => {
 });
 onUnmounted(() => {
   disposed = true;
+  closeModal();
   nativeListeners.forEach((unlisten)=>unlisten());
   window.removeEventListener("linchuan-session-change", sessionChanged);
   clearInterval(poll);
@@ -1623,7 +1667,7 @@ onUnmounted(() => {
                     class="icon-button"
                     aria-label="拒绝"
                     title="拒绝"
-                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    :disabled="decisionBusy.size > 0"
                     @click="decide(incomingPending(message)!, 'reject')"
                   >
                     <LoaderCircle
@@ -1637,7 +1681,7 @@ onUnmounted(() => {
                     class="icon-button"
                     aria-label="另存为"
                     title="另存为"
-                    :disabled="decisionBusy.has(incomingPending(message)!.id) || !selectedForReceive(incomingPending(message)!).length"
+                    :disabled="decisionBusy.size > 0 || !selectedForReceive(incomingPending(message)!).length"
                     @click="decide(incomingPending(message)!, 'save-as')"
                   >
                     <FolderInput :size="18" aria-hidden="true" />
@@ -1646,7 +1690,7 @@ onUnmounted(() => {
                     class="icon-button"
                     aria-label="接收"
                     title="接收"
-                    :disabled="decisionBusy.has(incomingPending(message)!.id) || !selectedForReceive(incomingPending(message)!).length"
+                    :disabled="decisionBusy.size > 0 || !selectedForReceive(incomingPending(message)!).length"
                     @click="decide(incomingPending(message)!, 'accept')"
                   >
                     <LoaderCircle
@@ -1729,7 +1773,7 @@ onUnmounted(() => {
                       v-if="
                         file.available &&
                         (!native ||
-                          receipt(message.id, file.id)?.status === 'failed')
+                          ['failed', 'replaced'].includes(receipt(message.id, file.id)?.status || ''))
                       "
                       class="icon-button"
                       :disabled="
@@ -1809,7 +1853,7 @@ onUnmounted(() => {
                       class="attachment-checkbox"
                       :aria-label="`接收 ${file.name}`"
                       :checked="!excludedFiles.get(incomingPending(message)!.id)?.has(file.id)"
-                      :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                      :disabled="decisionBusy.size > 0"
                       @change="toggleReceiveFile(incomingPending(message)!, file.id, $event)"
                     />
                     <span class="file-icon"
@@ -1817,7 +1861,7 @@ onUnmounted(() => {
                         v-if="file.mime.startsWith('image/')"
                         :size="24" /><File v-else :size="24" /></span
                     ><span class="file-label"
-                      ><b>{{ file.name }}</b
+                      ><b>{{ receipt(message.id, file.id)?.status === "saved" ? receipt(message.id, file.id)?.name : file.name }}</b
                       ><small
                         :title="
                           receipt(message.id, file.id)?.status === 'saved'
@@ -1835,6 +1879,7 @@ onUnmounted(() => {
                         >
                           · 已保存</template
                         >
+                        <template v-else-if="receipt(message.id, file.id)?.status === 'replaced'"> · 原文件已被覆盖</template>
                         <template
                           v-else-if="
                             receipt(message.id, file.id)?.status === 'pending'
@@ -1884,13 +1929,13 @@ onUnmounted(() => {
                 <span>是否接收这条文字？</span
                 ><button
                   class="secondary"
-                  :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                  :disabled="decisionBusy.size > 0"
                   @click="decide(incomingPending(message)!, 'reject')"
                 >
                   拒绝</button
                 ><button
                   class="primary"
-                  :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                  :disabled="decisionBusy.size > 0"
                   @click="decide(incomingPending(message)!, 'accept')"
                 >
                   接收
@@ -2320,7 +2365,10 @@ onUnmounted(() => {
       >
         <X :size="20" />
       </button>
-      <template v-if="modal === 'connect'"
+      <ReceiveConflictForm v-if="modal === 'receive-conflicts' && conflictPrompt"
+        :conflicts="conflictPrompt.conflicts" :files="conflictPrompt.files" :can-skip="conflictPrompt.canSkip"
+        :directory="conflictPrompt.directory" :format-size="size" @confirm="finishConflictPrompt" @cancel="closeModal" />
+      <template v-else-if="modal === 'connect'"
         ><div class="modal-icon"><QrCode :size="24" /></div>
         <h2 id="modal-title">连接其他设备</h2>
         <p>在同一网络中，扫码或用浏览器打开地址。</p>

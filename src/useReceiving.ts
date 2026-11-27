@@ -11,7 +11,7 @@ interface SavedFile {
   message_id: string;
   file_id: string;
   name: string;
-  status: "pending" | "saved" | "failed";
+  status: "pending" | "saved" | "failed" | "replaced";
   error: string | null;
   location: string;
   directory: string;

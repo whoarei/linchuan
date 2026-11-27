@@ -166,7 +166,12 @@ fn assert_nickname(name: &str) {
     );
 }
 
-async fn incoming_file(sender: &Host, receiver: &Host, bytes: &[u8]) -> (String, String, String) {
+async fn incoming_file(
+    sender: &Host,
+    receiver: &Host,
+    bytes: &[u8],
+    keep_both: bool,
+) -> (String, String, String) {
     let target = sender.connect(receiver).await;
     let sent = sender
         .send(Some(target), None, "保存到下载目录", Some(bytes))
@@ -193,12 +198,19 @@ async fn incoming_file(sender: &Host, receiver: &Host, bytes: &[u8]) -> (String,
         receiver.app.queue_save_file(&id, &file).await.is_err(),
         "Unaccepted files must not be exported"
     );
-    receiver
-        .post(
-            &format!("/api/transfers/{id}/decision"),
-            json!({"accept":true}),
-        )
-        .await;
+    let path = format!("/api/transfers/{id}/decision");
+    let mut decision = json!({"accept":true});
+    if keep_both {
+        let response = receiver
+            .post_as(&path, decision.clone(), &receiver.token)
+            .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let conflict: Value = response.json().await.unwrap();
+        assert_eq!(conflict["conflicts"][0]["id"], file);
+        let key = conflict["conflicts"][0]["key"].as_str().unwrap();
+        decision["choices"] = json!({key:"keep_both"});
+    }
+    receiver.post(&path, decision).await;
     receiver
         .wait(|s| {
             s["transfers"]
@@ -289,6 +301,7 @@ async fn relocate_saved(
     let original = record.location.clone();
     let directory = target.to_string_lossy().into_owned();
     let job = SaveJob {
+        target: None,
         message_id: record.message_id.clone(),
         file_id: record.file_id.clone(),
         source: record.location.clone().into(),
@@ -337,7 +350,7 @@ async fn copy_preserves_location_and_move_updates_it_after_cache_cleanup_and_res
         .await
         .unwrap();
     let saver = start_saver(&receiver.app);
-    let (message, _, _) = incoming_file(&sender, &receiver, b"original file contents").await;
+    let (message, _, _) = incoming_file(&sender, &receiver, b"original file contents", false).await;
     let original = saved(&receiver.app, &message, "saved").await;
     std::fs::write(copies.path().join(&original.name), b"existing target").unwrap();
     let copy = relocate_saved(&receiver.app, original.clone(), copies.path(), false, false)
@@ -389,7 +402,7 @@ async fn move_failure_keeps_original_file_and_record_and_removes_target_copy() {
         .await
         .unwrap();
     let saver = start_saver(&receiver.app);
-    let (message, _, _) = incoming_file(&sender, &receiver, b"keep me").await;
+    let (message, _, _) = incoming_file(&sender, &receiver, b"keep me", false).await;
     let original = saved(&receiver.app, &message, "saved").await;
     let error = relocate_saved(&receiver.app, original.clone(), target.path(), true, true)
         .await
@@ -450,7 +463,7 @@ async fn received_files_save_without_overwriting_survive_restart_and_cache_clean
     std::fs::write(downloads.path().join("持久文件.txt"), b"existing").unwrap();
     let saver = start_saver(&receiver.app);
     let bytes = "图片与文件的完整字节\0\u{1}".as_bytes();
-    let (message, _, _) = incoming_file(&sender, &receiver, bytes).await;
+    let (message, _, _) = incoming_file(&sender, &receiver, bytes, true).await;
     let record = saved(&receiver.app, &message, "saved").await;
     assert_eq!(record.name, "持久文件 (1).txt");
     assert_eq!(std::fs::read(&record.location).unwrap(), bytes);
@@ -634,6 +647,7 @@ fn exported_filenames_are_portable_and_cannot_escape_the_directory() {
         assert!(!safe.contains(['/', '\\']));
         assert!(safe.len() <= 180);
         let saved = save_to_folder(SaveJob {
+            target: None,
             message_id: "m".into(),
             file_id: "f".into(),
             source: source.clone(),

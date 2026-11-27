@@ -418,6 +418,7 @@ mod tests {
                 created: now() - 7200,
                 sent: false,
                 files: vec![StoredFile {
+                    receive_target: None,
                     meta: FileMeta {
                         id: "f".into(),
                         name: "f".into(),

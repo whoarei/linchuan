@@ -343,16 +343,18 @@ async fn uri_sources_and_destination_descriptors_stream_without_path_based_copie
             let path = source_path.clone();
             Box::pin(async move { std::fs::File::open(path).map_err(|e| e.to_string()) })
         }),
-        begin: Arc::new(|_, _, _| Box::pin(async { Err("unused".into()) })),
-        finish: Arc::new(|_| Box::pin(async { Err("unused".into()) })),
-        abort: Arc::new(|_| Box::pin(async { Ok(()) })),
+        inspect: Arc::new(|_, _| Box::pin(async { Ok(None) })),
+        begin: Arc::new(|_, _| Box::pin(async { Err("unused".into()) })),
+        finish: Arc::new(|_, _| Box::pin(async { Err("unused".into()) })),
+        abort: Arc::new(|_, _| Box::pin(async { Ok(()) })),
     });
     receiver.app.set_platform_files(PlatformFiles {
         open: Arc::new(move |_| {
             let path = target_open.clone();
             Box::pin(async move { std::fs::File::open(path).map_err(|e| e.to_string()) })
         }),
-        begin: Arc::new(move |_, _, _| {
+        inspect: Arc::new(|_, _| Box::pin(async { Ok(None) })),
+        begin: Arc::new(move |_, _| {
             let path = target_create.clone();
             Box::pin(async move {
                 Ok(PlatformOutput {
@@ -365,14 +367,17 @@ async fn uri_sources_and_destination_descriptors_stream_without_path_based_copie
                 })
             })
         }),
-        finish: Arc::new(move |_| {
+        finish: Arc::new(move |location, _| {
             let count = finished.clone();
             Box::pin(async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Ok("target.bin".into())
+                Ok(linchuan_core::receiving::SaveLocation {
+                    location,
+                    name: "target.bin".into(),
+                })
             })
         }),
-        abort: Arc::new(|_| Box::pin(async { Ok(()) })),
+        abort: Arc::new(|_, _| Box::pin(async { Ok(()) })),
     });
     let disk = folder.path().to_path_buf();
     receiver.app.set_space_probe(Arc::new(move |_| {
@@ -732,6 +737,96 @@ async fn native_group_reads_one_original_independently_and_saves_one_copy_per_re
 }
 
 #[tokio::test]
+async fn repeated_image_waits_and_overwrite_retires_the_original_receipt() {
+    let host = Host::new("重名图片").await;
+    let dir = TempDir::new().unwrap();
+    host.app
+        .configure_receiving(dir.path().to_string_lossy().into())
+        .await
+        .unwrap();
+    let (browser, _) = host.pair().await;
+    let mut first = String::new();
+    let mut ticket = String::new();
+    for bytes in ["old", "new"] {
+        let draft: Value = host
+            .post(
+                "/api/drafts",
+                json!({"streaming":true,
+            "files":[{"name":"photo.png","size":3,"mime":"image/png"}]}),
+                &browser,
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+        let sent = host
+            .send(&draft, json!([host.app.info().await.id]), None, &browser)
+            .await;
+        let id = sent["ids"][0].as_str().unwrap();
+        let message = sent["message_id"].as_str().unwrap();
+        let file = draft["files"][0]["id"].as_str().unwrap();
+        if bytes == "new" {
+            host.wait(message, "pending").await;
+            let path = format!("/api/transfers/{id}/decision");
+            let prompt = host.post(&path, json!({"accept":true}), &host.token).await;
+            assert_eq!(prompt.status(), StatusCode::CONFLICT);
+            let prompt: Value = prompt.json().await.unwrap();
+            let key = prompt["conflicts"][0]["key"].as_str().unwrap();
+            assert_eq!(
+                host.post(
+                    &path,
+                    json!({"accept":true,"choices":{key:"replace"}}),
+                    &host.token
+                )
+                .await
+                .status(),
+                StatusCode::OK
+            );
+        }
+        let response = Client::new()
+            .put(format!(
+                "{}/api/transfers/{id}/files/{file}/upload",
+                host.url
+            ))
+            .bearer_auth(&browser)
+            .body(bytes)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        if bytes == "old" {
+            first = message.into();
+            let result: Value = host
+                .post(
+                    &format!("/api/transfers/{id}/files/{file}/ticket"),
+                    json!({}),
+                    &browser,
+                )
+                .await
+                .json()
+                .await
+                .unwrap();
+            ticket = result["url"].as_str().unwrap().into();
+        }
+    }
+    assert_eq!(std::fs::read(dir.path().join("photo.png")).unwrap(), b"new");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(
+        host.app.saved_files(vec![first]).await.unwrap()[0].status,
+        "replaced"
+    );
+    assert_eq!(
+        Client::new()
+            .get(format!("{}{ticket}", host.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
 async fn cancelled_browser_upload_removes_partial_target_and_preserves_existing_user_file() {
     let host = Host::new("宿主").await;
     let folder = TempDir::new().unwrap();
@@ -756,7 +851,23 @@ async fn cancelled_browser_upload_removes_partial_target_and_preserves_existing_
         .send(&draft, json!([host.app.info().await.id]), None, &token)
         .await;
     let id = sent["ids"][0].as_str().unwrap().to_owned();
-    host.accept(&id, &host.token).await;
+    let decision = format!("/api/transfers/{id}/decision");
+    let prompt = host
+        .post(&decision, json!({"accept":true}), &host.token)
+        .await;
+    assert_eq!(prompt.status(), StatusCode::CONFLICT);
+    let prompt: Value = prompt.json().await.unwrap();
+    let key = prompt["conflicts"][0]["key"].as_str().unwrap();
+    assert_eq!(
+        host.post(
+            &decision,
+            json!({"accept":true, "choices":{key:"replace"}}),
+            &host.token
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
     let body = reqwest::Body::wrap_stream(futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv()

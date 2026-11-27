@@ -1,4 +1,8 @@
-use crate::{model::now_ms, App};
+use crate::{
+    model::now_ms,
+    receive_conflicts::{inspect_local, numbered, ReceiveTarget},
+    App,
+};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -21,6 +25,7 @@ pub struct SavedFile {
 }
 #[derive(Clone, Debug)]
 pub struct SaveJob {
+    pub target: Option<ReceiveTarget>,
     pub message_id: String,
     pub file_id: String,
     pub source: PathBuf,
@@ -127,15 +132,16 @@ impl App {
         self.0.store.run(|c, root| {
             let directory: String = c.query_row("SELECT value FROM app_settings WHERE key='receive_directory'",[],|r|r.get(0)).optional()?.unwrap_or_default();
             // Before an export has a saved location, its directory can hold a one-time target.
-            let rows: Vec<(String, String, String, Option<String>)> = c.prepare(
-                "SELECT message_id,file_id,transfer_id,CASE WHEN location='' THEN NULLIF(directory,'') END FROM saved_files WHERE status='pending' ORDER BY updated_at",
-            )?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(String, String, String, Option<String>, bool)> = c.prepare(
+                "SELECT message_id,file_id,transfer_id,CASE WHEN location='' THEN NULLIF(directory,'') END,location<>'' FROM saved_files WHERE status='pending' ORDER BY updated_at",
+            )?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?.collect::<rusqlite::Result<_>>()?;
             let mut jobs=Vec::new();
-            for(message_id,file_id,transfer_id,selected_directory) in rows {
+            for(message_id,file_id,transfer_id,selected_directory,has_location) in rows {
                 if let Some(t)=crate::store::query_transfer(c,root,&transfer_id)? {
                     if let Some(f)=t.files.into_iter().find(|f|f.meta.id==file_id && f.available()) {
                         let fixed_directory = selected_directory.is_some();
                         let job = SaveJob {
+                            target: f.receive_target.filter(|_| !has_location),
                             message_id,
                             file_id,
                             source: f.path,
@@ -191,6 +197,12 @@ impl App {
                     let Ok(_permit) = self.0.streams.acquire().await else {
                         return;
                     };
+                    let replaces = job.target.as_ref().is_some_and(|t| t.replace.is_some());
+                    let _publication = if replaces {
+                        Some(self.0.publishing_replacement.lock().await)
+                    } else {
+                        None
+                    };
                     let result = if let Some((value, directory)) = completed.get(&key) {
                         job.directory = directory.clone();
                         Ok(value.clone())
@@ -225,10 +237,16 @@ impl App {
                     };
                     let success = result.is_ok();
                     let outcome = self.0.store.run(move |c, _| {
+                        let tx = c.transaction()?;
                         match result {
-                            Ok(value) => { c.execute("UPDATE saved_files SET status='saved',name=?1,directory=?2,location=?3,error=NULL,updated_at=?4 WHERE message_id=?5 AND file_id=?6",params![value.name,job.directory,value.location,now_ms(),job.message_id,job.file_id])?; }
-                            Err(error) => { c.execute("UPDATE saved_files SET status='failed',error=?1,updated_at=?2 WHERE message_id=?3 AND file_id=?4",params![error,now_ms(),job.message_id,job.file_id])?; }
+                            Ok(value) => {
+                                if let Some(target) = job.target.as_ref().filter(|t| t.replace.is_some() && t.directory == job.directory) {
+                                    crate::store::mark_replaced(&tx, target.previous_location.as_deref().unwrap_or(&value.location))?;
+                                }
+                                tx.execute("UPDATE saved_files SET status='saved',name=?1,directory=?2,location=?3,error=NULL,updated_at=?4 WHERE message_id=?5 AND file_id=?6",params![value.name,job.directory,value.location,now_ms(),job.message_id,job.file_id])?; }
+                            Err(error) => { tx.execute("UPDATE saved_files SET status='failed',error=?1,updated_at=?2 WHERE message_id=?3 AND file_id=?4",params![error,now_ms(),job.message_id,job.file_id])?; }
                         }
+                        tx.commit()?;
                         Ok(())
                     }).await;
                     if outcome.is_ok() {
@@ -266,6 +284,7 @@ impl App {
             .find(|f| f.meta.id == file_id && f.available())
             .ok_or("文件副本已清理")?;
         Ok(SaveJob {
+            target: None,
             message_id: t.view.message_id.clone(),
             file_id: file_id.into(),
             source: f.path.clone(),
@@ -450,17 +469,24 @@ pub fn save_to_folder(job: SaveJob) -> Result<SaveLocation, String> {
         )
         .map_err(anyhow::Error::msg)?;
         temporary.as_file_mut().sync_all()?;
-        let path = Path::new(&name);
-        let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("file");
-        let extension = path.extension().and_then(|v| v.to_str());
+        if let Some(target) = &job.target {
+            let target = if target.directory == job.directory {
+                target.clone()
+            } else {
+                ReceiveTarget {
+                    previous_location: None,
+                    directory: job.directory,
+                    name,
+                    replace: None,
+                }
+            };
+            return publish_file(temporary.into_temp_path(), &target).map_err(anyhow::Error::msg);
+        }
         for number in 0..10000 {
             let candidate = if number == 0 {
                 name.clone()
             } else {
-                format!(
-                    "{stem} ({number}){}",
-                    extension.map(|e| format!(".{e}")).unwrap_or_default()
-                )
+                numbered(&name, number)
             };
             let target = directory.join(&candidate);
             match temporary.persist_noclobber(&target) {
@@ -480,4 +506,29 @@ pub fn save_to_folder(job: SaveJob) -> Result<SaveLocation, String> {
         anyhow::bail!("同名文件过多，请更换接收目录")
     };
     save().map_err(|e| e.to_string())
+}
+
+pub(crate) fn publish_file(
+    temp: tempfile::TempPath,
+    target: &ReceiveTarget,
+) -> Result<SaveLocation, String> {
+    let path = Path::new(&target.directory).join(&target.name);
+    if let Some(stamp) = &target.replace {
+        if !inspect_local(&path)?.is_some_and(|e| e.replaceable && &e.stamp == stamp) {
+            return Err(format!("目标文件“{}”已变化，请重新接收", target.name));
+        }
+        temp.persist(&path).map_err(|e| e.error.to_string())?;
+    } else {
+        temp.persist_noclobber(&path).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("目标名称“{}”已被占用，请重新接收", target.name)
+            } else {
+                e.error.to_string()
+            }
+        })?;
+    }
+    Ok(SaveLocation {
+        location: path.to_string_lossy().into_owned(),
+        name: target.name.clone(),
+    })
 }

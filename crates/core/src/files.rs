@@ -1,23 +1,25 @@
 //! File ownership and platform I/O. User files never enter cache cleanup.
-use crate::{api::Error, model::*, App};
+use crate::{
+    api::Error,
+    model::*,
+    receive_conflicts::{ExistingEntry, ReceiveTarget},
+    receiving::SaveLocation,
+    App,
+};
 use axum::body::Body;
 use futures_util::StreamExt;
 use serde::Serialize;
-use std::{
-    future::Future,
-    path::{Path, PathBuf},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{future::Future, path::Path, pin::Pin, sync::Arc};
 use tokio::io::AsyncWriteExt;
 
 pub type IoFuture<T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send>>;
 #[derive(Clone)]
 pub struct PlatformFiles {
     pub open: Arc<dyn Fn(String) -> IoFuture<std::fs::File> + Send + Sync>,
-    pub begin: Arc<dyn Fn(String, String, String) -> IoFuture<PlatformOutput> + Send + Sync>,
-    pub finish: Arc<dyn Fn(String) -> IoFuture<String> + Send + Sync>,
-    pub abort: Arc<dyn Fn(String) -> IoFuture<()> + Send + Sync>,
+    pub inspect: Arc<dyn Fn(String, String) -> IoFuture<Option<ExistingEntry>> + Send + Sync>,
+    pub begin: Arc<dyn Fn(ReceiveTarget, String) -> IoFuture<PlatformOutput> + Send + Sync>,
+    pub finish: Arc<dyn Fn(String, ReceiveTarget) -> IoFuture<SaveLocation> + Send + Sync>,
+    pub abort: Arc<dyn Fn(String, Option<ReceiveTarget>) -> IoFuture<()> + Send + Sync>,
 }
 pub struct PlatformOutput {
     pub file: std::fs::File,
@@ -103,7 +105,10 @@ impl App {
                 let location = source.path.to_string_lossy().into_owned();
                 if location.starts_with("content://") {
                     let Some(io) = &platform else { continue };
-                    if (io.abort)(location).await.is_err() {
+                    if (io.abort)(location, source.receive_target.clone())
+                        .await
+                        .is_err()
+                    {
                         continue;
                     }
                 } else {
@@ -155,6 +160,7 @@ impl App {
         }
         let id = uid();
         let file = StoredFile {
+            receive_target: None,
             meta: FileMeta {
                 id: id.clone(),
                 name: name.clone(),
@@ -283,22 +289,19 @@ impl App {
         file: &StoredFile,
         body: Body,
     ) -> Result<StoredFile, Error> {
-        let directory = self
-            .0
-            .receive_directories
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
+        let target = file
+            .receive_target
+            .clone()
             .ok_or_else(|| Error::conflict("接收任务尚未就绪"))?;
-        let name = crate::receiving::safe_name(&file.meta.name);
+        let directory = target.directory.clone();
+        let name = target.name.clone();
         let platform = self.0.file_io.read().unwrap().clone();
         let mobile = directory == "@downloads" || directory.starts_with("content://");
         let (output, location) = if mobile {
             let io = platform
                 .as_ref()
                 .ok_or_else(|| Error::bad("接收目录不可用"))?;
-            let output = (io.begin)(directory.clone(), name.clone(), file.meta.mime.clone())
+            let output = (io.begin)(target.clone(), file.meta.mime.clone())
                 .await
                 .map_err(Error::bad)?;
             (output.file, output.location)
@@ -319,7 +322,17 @@ impl App {
         let mut saved = file.clone();
         saved.path = location.clone().into();
         saved.storage = FileStorage::Received {
-            directory: directory.clone(),
+            directory: if mobile && target.replace.is_some() && !location.starts_with("content://")
+            {
+                saved
+                    .path
+                    .parent()
+                    .ok_or_else(|| Error::bad("临时文件位置无效"))?
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                directory.clone()
+            },
             name: name.clone(),
         };
         saved.complete = false;
@@ -328,7 +341,7 @@ impl App {
             drop(output);
             if mobile {
                 if let Some(io) = &platform {
-                    let _ = (io.abort)(location).await;
+                    let _ = (io.abort)(location, file.receive_target.clone()).await;
                 }
             } else {
                 let _ = tokio::fs::remove_file(location).await;
@@ -385,7 +398,7 @@ impl App {
         if let Err(error) = result {
             if mobile {
                 if let Some(io) = &platform {
-                    let _ = (io.abort)(location).await;
+                    let _ = (io.abort)(location, file.receive_target.clone()).await;
                 }
             } else {
                 let _ = tokio::fs::remove_file(&location).await;
@@ -393,23 +406,30 @@ impl App {
             self.release_space_tag(&format!("receive:{id}:{}", file.meta.id));
             return Err(error);
         }
+        let _publication = if target.replace.is_some() {
+            Some(self.0.publishing_replacement.lock().await)
+        } else {
+            None
+        };
         let (location, actual_name) = if mobile {
             let io = platform.as_ref().unwrap();
-            match (io.finish)(location.clone()).await {
-                Ok(name) => (location, name),
+            match (io.finish)(location.clone(), target).await {
+                Ok(saved) => (saved.location, saved.name),
                 Err(error) => {
-                    let _ = (io.abort)(location).await;
+                    let _ = (io.abort)(location, file.receive_target.clone()).await;
                     return Err(Error::bad(error));
                 }
             }
         } else {
-            let dir = directory.clone();
             tokio::task::spawn_blocking(move || {
-                publish_local(Path::new(&location), Path::new(&dir), &name)
+                let temp =
+                    tempfile::TempPath::try_from_path(&location).map_err(|e| e.to_string())?;
+                let saved = crate::receiving::publish_file(temp, &target)?;
+                Ok((saved.location, saved.name))
             })
             .await
             .map_err(|e| Error::bad(e.to_string()))?
-            .map_err(Error::bad)?
+            .map_err(|e: String| Error::bad(e))?
         };
         saved.path = location.into();
         saved.storage = FileStorage::Received {
@@ -437,8 +457,20 @@ impl App {
         let id = id.to_owned();
         let file_id = file.meta.id.clone();
         let json = serde_json::to_string(file).map_err(|e| Error::bad(e.to_string()))?;
+        let replaced = file
+            .receive_target
+            .as_ref()
+            .filter(|t| published && t.replace.is_some())
+            .map(|t| {
+                t.previous_location
+                    .clone()
+                    .unwrap_or_else(|| file.path.to_string_lossy().into_owned())
+            });
         self.0.store.run(move |db, _| {
-            db.execute("INSERT INTO receive_outputs VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET source_json=excluded.source_json,published=excluded.published", rusqlite::params![id,file_id,json,published])?;
+            let tx = db.transaction()?;
+            if let Some(location) = replaced { crate::store::mark_replaced(&tx, &location)?; }
+            tx.execute("INSERT INTO receive_outputs VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET source_json=excluded.source_json,published=excluded.published", rusqlite::params![id,file_id,json,published])?;
+            tx.commit()?;
             Ok(())
         }).await.map_err(|e| Error::storage(e.to_string()))
     }
@@ -460,31 +492,6 @@ impl App {
         self.notify();
         Ok(())
     }
-}
-
-fn publish_local(temp: &Path, directory: &Path, name: &str) -> Result<(String, String), String> {
-    let mut temporary = tempfile::TempPath::try_from_path(temp).map_err(|e| e.to_string())?;
-    let path = PathBuf::from(name);
-    let stem = path.file_stem().and_then(|v| v.to_str()).unwrap_or("file");
-    let ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .map(|s| format!(".{s}"))
-        .unwrap_or_default();
-    for index in 0..10000 {
-        let name = if index == 0 {
-            name.into()
-        } else {
-            format!("{stem} ({index}){ext}")
-        };
-        let target = directory.join(&name);
-        match temporary.persist_noclobber(&target) {
-            Ok(()) => return Ok((target.to_string_lossy().into_owned(), name)),
-            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => temporary = e.path,
-            Err(e) => return Err(e.error.to_string()),
-        }
-    }
-    Err("同名文件过多，请更换接收目录".into())
 }
 
 #[cfg(test)]
@@ -514,11 +521,6 @@ mod tests {
             .lock()
             .unwrap()
             .insert(format!("incoming:{id}"), lease);
-        app.0
-            .receive_directories
-            .lock()
-            .unwrap()
-            .insert(id.clone(), app.cache_location());
         let mut state = app.0.state.lock().await;
         state.profiles.insert(
             browser.clone(),
@@ -559,6 +561,7 @@ mod tests {
                     error: None,
                 },
                 files: vec![StoredFile {
+                    receive_target: None,
                     meta,
                     path: Default::default(),
                     complete: false,
@@ -581,7 +584,6 @@ mod tests {
         );
         assert!(!app.has_active_work().await);
         assert!(app.0.space_leases.lock().unwrap().is_empty());
-        assert!(app.0.receive_directories.lock().unwrap().is_empty());
         app.stop();
     }
 }

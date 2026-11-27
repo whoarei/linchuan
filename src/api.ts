@@ -1,5 +1,6 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { RequestTimeoutError, withDeadline } from "./request";
+import type { ReceiveConflict } from "./types";
 export const native = isTauri();
 let base = native ? "" : window.location.origin;
 const credentialKey = "linchuan-token";
@@ -90,6 +91,7 @@ export class ApiError extends Error {
   constructor(
     message: string,
     public status: number,
+    public conflicts?: ReceiveConflict[],
   ) {
     super(message);
   }
@@ -113,7 +115,7 @@ export async function api<T = any>(
       });
       if (!response.ok) {
         const value = await response.json().catch(() => ({}));
-        throw new ApiError(value.error || "请求失败", response.status);
+        throw new ApiError(value.error || "请求失败", response.status, value.conflicts);
       }
       return await response.json();
     });

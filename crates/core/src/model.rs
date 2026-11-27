@@ -128,6 +128,8 @@ pub enum FileStorage {
 }
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct StoredFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receive_target: Option<crate::receive_conflicts::ReceiveTarget>,
     pub meta: FileMeta,
     pub path: PathBuf,
     pub complete: bool,

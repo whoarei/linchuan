@@ -1,4 +1,8 @@
-use crate::{model::*, App};
+use crate::{
+    model::*,
+    receive_conflicts::{ConflictChoices, FileConflict},
+    App,
+};
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State as AxState, WebSocketUpgrade},
@@ -15,7 +19,7 @@ use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 
 #[derive(Debug)]
-pub struct Error(StatusCode, String);
+pub struct Error(StatusCode, String, Vec<FileConflict>);
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.1)
@@ -23,34 +27,54 @@ impl std::fmt::Display for Error {
 }
 impl std::error::Error for Error {}
 impl Error {
+    pub(crate) fn file_conflicts(files: Vec<FileConflict>) -> Self {
+        Self(
+            StatusCode::CONFLICT,
+            "请选择同名文件的处理方式".into(),
+            files,
+        )
+    }
+    pub fn conflicts(&self) -> &[FileConflict] {
+        &self.2
+    }
     pub fn bad(message: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, message.into())
+        Self(StatusCode::BAD_REQUEST, message.into(), vec![])
     }
     pub fn storage(message: impl Into<String>) -> Self {
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("数据库操作失败：{}", message.into()),
+            vec![],
         )
     }
     pub fn unauthorized() -> Self {
-        Self(StatusCode::UNAUTHORIZED, "连接已失效，请重新配对".into())
+        Self(
+            StatusCode::UNAUTHORIZED,
+            "连接已失效，请重新配对".into(),
+            vec![],
+        )
     }
     pub fn forbidden() -> Self {
         Self(
             StatusCode::FORBIDDEN,
             "浏览器只能与当前连接的客户端互传".into(),
+            vec![],
         )
     }
     pub(crate) fn missing() -> Self {
-        Self(StatusCode::NOT_FOUND, "内容不存在或已过期".into())
+        Self(StatusCode::NOT_FOUND, "内容不存在或已过期".into(), vec![])
     }
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
-        Self(StatusCode::CONFLICT, message.into())
+        Self(StatusCode::CONFLICT, message.into(), vec![])
     }
 }
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({"error": self.1}))).into_response()
+        let mut body = json!({"error": self.1});
+        if !self.2.is_empty() {
+            body["conflicts"] = json!(self.2);
+        }
+        (self.0, Json(body)).into_response()
     }
 }
 impl From<std::io::Error> for Error {
@@ -58,6 +82,7 @@ impl From<std::io::Error> for Error {
         Self(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("文件操作失败：{e}"),
+            vec![],
         )
     }
 }
@@ -273,6 +298,7 @@ pub(crate) fn rate_limit(state: &mut crate::model::State, key: String, limit: u3
         return Err(Error(
             StatusCode::TOO_MANY_REQUESTS,
             "请求过于频繁，请稍后重试".into(),
+            vec![],
         ));
     }
     Ok(())
@@ -504,6 +530,7 @@ async fn create_draft(
         } else {
             let file_id = uid();
             files.push(StoredFile {
+                receive_target: None,
                 path: app.0.work.join(&id).join(&file_id),
                 meta: FileMeta {
                     id: file_id,
@@ -989,6 +1016,7 @@ fn automatically_received(files: &[FileMeta]) -> bool {
     files.iter().all(|f| f.mime.starts_with("image/"))
 }
 struct ReceiveDecision<'a> {
+    choices: ConflictChoices,
     accept: bool,
     directory: Option<&'a str>,
     file_ids: Option<Vec<String>>,
@@ -1000,11 +1028,18 @@ async fn set_decision(
     recipient: &str,
     owner: bool,
     ReceiveDecision {
+        choices,
         accept,
         directory,
         file_ids,
     }: ReceiveDecision<'_>,
 ) -> Result<()> {
+    let active: Vec<_> = state
+        .transfers
+        .values()
+        .filter(|t| !t.view.terminal() && t.view.id != id)
+        .flat_map(|t| t.files.iter().filter_map(|f| f.receive_target.clone()))
+        .collect();
     let transfer = state
         .transfers
         .get_mut(id)
@@ -1041,12 +1076,22 @@ async fn set_decision(
         .files
         .iter()
         .any(|f| matches!(f.storage, FileStorage::Browser | FileStorage::Receiving));
-    let saves_from_cache = directory.is_some() && transfer.files.iter().any(StoredFile::cached);
+    let saves_from_cache = transfer.files.iter().any(StoredFile::cached);
     if accept && owner && (streams_to_disk || saves_from_cache) {
+        let explicit_directory = directory.is_some();
         let directory = match directory {
             Some(directory) => directory.to_owned(),
             None => app.target_directory().await?,
         };
+        let files: Vec<_> = transfer
+            .files
+            .iter()
+            .filter(|f| selected.as_ref().is_none_or(|ids| ids.contains(&f.meta.id)))
+            .map(|f| &f.meta)
+            .collect();
+        let mut targets = app
+            .plan_receive(&directory, &files, &active, &choices)
+            .await?;
         let lease = app
             .0
             .space
@@ -1055,7 +1100,9 @@ async fn set_decision(
                     .files
                     .iter()
                     .filter(|f| selected.as_ref().is_none_or(|ids| ids.contains(&f.meta.id)))
-                    .filter(|f| !f.complete || (saves_from_cache && f.cached()))
+                    .filter(|f| {
+                        !f.complete || (saves_from_cache && f.cached() && explicit_directory)
+                    })
                     .map(|f| {
                         (
                             format!("receive:{id}:{}", f.meta.id),
@@ -1067,17 +1114,15 @@ async fn set_decision(
             )
             .await
             .map_err(Error::conflict)?;
+        for f in &mut transfer.files {
+            f.receive_target = targets.remove(&f.meta.id);
+        }
         if streams_to_disk {
             app.0
                 .space_leases
                 .lock()
                 .unwrap()
                 .insert(format!("incoming:{id}"), lease);
-            app.0
-                .receive_directories
-                .lock()
-                .unwrap()
-                .insert(id.to_owned(), directory);
         }
         // Cached exports reserve again in the saver. Drop their preflight lease
         // before committing the queue so the saver cannot count them twice.
@@ -1117,6 +1162,7 @@ async fn auto_receive(app: &App, state: &mut crate::model::State, id: &str) {
     let recipient = transfer.view.recipient_id.clone();
     let owner = recipient == app.0.device_id;
     let decision = ReceiveDecision {
+        choices: Default::default(),
         accept: true,
         directory: None,
         file_ids: None,
@@ -1132,7 +1178,6 @@ fn release_acceptance(app: &App, id: &str) {
         .lock()
         .unwrap()
         .remove(&format!("incoming:{id}"));
-    app.0.receive_directories.lock().unwrap().remove(id);
 }
 async fn decision(
     AxState(app): AxState<App>,
@@ -1151,6 +1196,10 @@ async fn decision(
         &p.id,
         p.owner,
         ReceiveDecision {
+            choices: serde_json::from_value(
+                value.get("choices").cloned().unwrap_or_else(|| json!({})),
+            )
+            .map_err(|_| Error::bad("同名文件选项无效"))?,
             accept,
             directory: None,
             file_ids,
@@ -1172,6 +1221,16 @@ impl App {
         directory: String,
         file_ids: Option<Vec<String>>,
     ) -> Result<()> {
+        self.accept_files_with_choices(id, directory, file_ids, Default::default())
+            .await
+    }
+    pub async fn accept_files_with_choices(
+        &self,
+        id: &str,
+        directory: String,
+        file_ids: Option<Vec<String>>,
+        choices: ConflictChoices,
+    ) -> Result<()> {
         if directory.is_empty() {
             return Err(Error::bad("请选择接收目录"));
         }
@@ -1180,6 +1239,7 @@ impl App {
             &self.0.device_id,
             true,
             ReceiveDecision {
+                choices,
                 accept: true,
                 directory: Some(&directory),
                 file_ids,
@@ -1312,7 +1372,24 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
         .clone()
         .try_acquire_owned()
         .map_err(|_| Error::conflict("同时下载过多，请稍后重试"))?;
+    let publication = if matches!(ticket.file.storage, FileStorage::Received { .. }) {
+        // A ticket issued for an earlier message may outlive an overwrite.
+        let guard = app.0.publishing_replacement.lock().await;
+        let id = ticket.transfer_id.clone();
+        let file = ticket.file.meta.id.clone();
+        let location = ticket.file.path.to_string_lossy().into_owned();
+        let owns_file: bool = app.0.store.run(move |db, _| Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM saved_files s JOIN deliveries d ON d.message_id=s.message_id WHERE d.id=?1 AND s.file_id=?2 AND s.status='saved' AND s.location=?3)",
+            rusqlite::params![id,file,location], |r| r.get(0))?)).await.map_err(|e| Error::storage(e.to_string()))?;
+        if !owns_file {
+            return Err(Error::missing());
+        }
+        Some(guard)
+    } else {
+        None
+    };
     let input = app.open_source(&ticket.file).await.map_err(Error::bad)?;
+    drop(publication);
     let length = ticket.file.meta.size;
     let encoded: String = url::form_urlencoded::byte_serialize(ticket.file.meta.name.as_bytes())
         .collect::<String>()
@@ -1678,6 +1755,7 @@ async fn peer_offer(
         .files
         .iter()
         .map(|f| StoredFile {
+            receive_target: None,
             meta: f.clone(),
             path: Default::default(),
             complete: false,
@@ -2020,6 +2098,7 @@ mod transfer_timeout_tests {
     use super::*;
     fn file(path: std::path::PathBuf, size: u64) -> StoredFile {
         StoredFile {
+            receive_target: None,
             path,
             meta: FileMeta {
                 id: "file".into(),

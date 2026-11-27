@@ -33,6 +33,8 @@ import java.io.File
 @InvokeArg
 class ReceiveOptions {
   var directory: String = "@downloads"
+  var strict: Boolean = false
+  var replace: String? = null
   var sourcePath: String = ""
   var name: String = "file"
   var mime: String = "application/octet-stream"
@@ -43,31 +45,36 @@ class ReceiveOptions {
 class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
   private val resolver get() = activity.contentResolver
 
+  private fun localDirectory(directory: String): Pair<File, File> {
+    val root: File
+    val target: File
+    if (directory == "@downloads") {
+      root = Environment.getExternalStorageDirectory()
+      target = File(root, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
+    } else {
+      val uri = Uri.parse(directory)
+      if (uri.authority != "com.android.externalstorage.documents")
+        throw Exception("所选文档提供器无法查询本地磁盘空间，请选择本机存储目录")
+      val id = DocumentsContract.getTreeDocumentId(uri)
+      val volume = id.substringBefore(':')
+      root = if (volume.equals("primary", true)) Environment.getExternalStorageDirectory()
+        else if (Build.VERSION.SDK_INT >= 30) {
+          activity.getSystemService(StorageManager::class.java).storageVolumes
+            .firstOrNull { it.uuid.equals(volume, true) }?.directory ?: throw Exception("存储卷不可用")
+        } else File("/storage/$volume")
+      target = File(root, id.substringAfter(':', ""))
+      val canonicalRoot = root.canonicalPath
+      if (target.canonicalPath != canonicalRoot && !target.canonicalPath.startsWith(canonicalRoot + File.separator))
+        throw Exception("目录不属于所选存储卷")
+    }
+    return Pair(root, target)
+  }
+
   @Command
   fun storageInfo(invoke: Invoke) {
     try {
       val directory = invoke.parseArgs(ReceiveOptions::class.java).directory
-      val root: File
-      val target: File
-      if (directory == "@downloads") {
-        root = Environment.getExternalStorageDirectory()
-        target = File(root, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
-      } else {
-        val uri = Uri.parse(directory)
-        if (uri.authority != "com.android.externalstorage.documents")
-          throw Exception("所选文档提供器无法查询本地磁盘空间，请选择本机存储目录")
-        val id = DocumentsContract.getTreeDocumentId(uri)
-        val volume = id.substringBefore(':')
-        root = if (volume.equals("primary", true)) Environment.getExternalStorageDirectory()
-          else if (Build.VERSION.SDK_INT >= 30) {
-            activity.getSystemService(StorageManager::class.java).storageVolumes
-              .firstOrNull { it.uuid.equals(volume, true) }?.directory ?: throw Exception("存储卷不可用")
-          } else File("/storage/$volume")
-        target = File(root, id.substringAfter(':', ""))
-        val canonicalRoot = root.canonicalPath
-        if (target.canonicalPath != canonicalRoot && !target.canonicalPath.startsWith(canonicalRoot + File.separator))
-          throw Exception("目录不属于所选存储卷")
-      }
+      val (root, target) = localDirectory(directory)
       var existing = target
       while (!existing.isDirectory) existing = existing.parentFile ?: throw Exception("目标磁盘不可用")
       // Emulated shared storage and private app storage consume the same /data volume.
@@ -75,6 +82,66 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
       invoke.resolve(JSObject().put("volume", "unix:${Os.stat(physical.absolutePath).st_dev}")
         .put("available", StatFs(existing.absolutePath).availableBytes).put("path", existing.absolutePath))
     } catch (e: Exception) { invoke.reject("无法检查目标剩余空间：${e.message}") }
+  }
+
+  private data class Entry(val location: String, val file: File?, val size: Long?, val stamp: String, val providerRename: Boolean) {
+    val replaceable get() = providerRename || file?.let { it.isFile && it.canWrite() && it.parentFile?.canWrite() == true } == true
+  }
+
+  private fun findEntry(directory: String, name: String): Entry? {
+    val folder = localDirectory(directory).second
+    fun entry(location: String, disk: File, bytes: Long?, modified: Long, providerRename: Boolean = false): Entry {
+      val file = disk.takeIf { it.exists() && it.canonicalFile.parentFile == folder.canonicalFile &&
+        it.canonicalFile == File(folder.canonicalFile, it.name) }
+      val stat = file?.let { Os.stat(it.absolutePath) }
+      return Entry(location, file, bytes, "$location:$modified:$bytes:${stat?.st_ino}:${file?.lastModified()}", providerRename)
+    }
+    if (directory.startsWith("content://")) {
+      val tree = Uri.parse(directory)
+      val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+      val cols = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, OpenableColumns.DISPLAY_NAME,
+        OpenableColumns.SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED, DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_FLAGS)
+      val cursor = resolver.query(children, cols, null, null, null) ?: throw Exception("无法检查所选目录")
+      cursor.use {
+        while (it.moveToNext()) {
+          val actual = it.getString(1)
+          if (actual.equals(name, true)) {
+            val uri = DocumentsContract.buildDocumentUriUsingTree(tree, it.getString(0))
+            val size = if (it.getString(4) == DocumentsContract.Document.MIME_TYPE_DIR || it.isNull(2)) null else it.getLong(2)
+            val flags = it.getInt(5)
+            val canRename = it.getString(4) != DocumentsContract.Document.MIME_TYPE_DIR &&
+              flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME != 0 && flags and DocumentsContract.Document.FLAG_SUPPORTS_DELETE != 0
+            return entry(uri.toString(), File(folder, actual), size, it.getLong(3), canRename)
+          }
+        }
+      }
+    } else if (Build.VERSION.SDK_INT >= 29) {
+      val collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+      resolver.query(collection, arrayOf("_id", "_display_name", "_size", "date_modified", "_data"),
+        "relative_path=? AND _display_name=?", arrayOf("${Environment.DIRECTORY_DOWNLOADS}/邻传/", name), null)?.use {
+        if (it.moveToFirst()) {
+          val uri = android.content.ContentUris.withAppendedId(collection, it.getLong(0))
+          val disk = it.getString(4)?.let { path -> File(path) } ?: File(folder, it.getString(1))
+          val writable = try { resolver.openFileDescriptor(uri, "rw")?.use { true } ?: false } catch (_: Exception) { false }
+          return entry(uri.toString(), disk, it.getLong(2), it.getLong(3), writable)
+        }
+      }
+    }
+    val disk = File(folder, name)
+    if (!disk.exists()) return null
+    return entry(disk.absolutePath, disk, disk.length().takeIf { disk.isFile }, disk.lastModified())
+  }
+
+  @Command
+  fun inspectFile(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(ReceiveOptions::class.java)
+      val entry = findEntry(args.directory, args.name)
+      val result = JSObject()
+      if (entry != null) result.put("entry", JSObject().put("stamp", entry.stamp)
+        .put("size", entry.size).put("replaceable", entry.replaceable).put("location", entry.location))
+      invoke.resolve(result)
+    } catch (e: Exception) { invoke.reject("无法检查同名文件：${e.message}") }
   }
 
   @Command
@@ -89,15 +156,25 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
       var location: String? = null
       try {
         val descriptor: ParcelFileDescriptor
-        if (args.directory == "@downloads" && Build.VERSION.SDK_INT >= 29) {
+        val existing = if (args.strict) findEntry(args.directory, args.name) else null
+        if (args.replace != null && (existing == null || !existing.replaceable || existing.stamp != args.replace))
+          throw Exception("目标文件已变化，请重新接收")
+        if (args.replace == null && existing != null) throw Exception("目标名称已被占用，请重新接收")
+        val outputName = if (args.replace != null) temporaryName("part", args.name) else args.name
+        if (args.replace != null && !existing!!.providerRename) {
+          val temp = File.createTempFile(".linchuan-", ".part", existing.file!!.parentFile)
+          location = temp.absolutePath
+          descriptor = ParcelFileDescriptor.open(temp, ParcelFileDescriptor.MODE_WRITE_ONLY)
+        } else if (args.directory == "@downloads" && Build.VERSION.SDK_INT >= 29) {
           val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, args.name)
+            put(MediaStore.Downloads.DISPLAY_NAME, outputName)
             put(MediaStore.Downloads.MIME_TYPE, args.mime)
             put(MediaStore.Downloads.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/邻传")
             put(MediaStore.Downloads.IS_PENDING, 1)
           }
           val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: throw Exception("无法创建文件")
           location = uri.toString()
+          if (args.strict && displayName(uri) != outputName) throw Exception("目标名称已被占用，请重新接收")
           descriptor = resolver.openFileDescriptor(uri, "w") ?: throw Exception("目标目录不可写")
         } else if (args.directory.startsWith("content://")) {
           val tree = Uri.parse(args.directory)
@@ -108,15 +185,16 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
           resolver.query(children, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
             while (it.moveToNext()) names.add(it.getString(0))
           }
-          val name = (0..9999).asSequence().map { numbered(args.name, it) }.firstOrNull { it !in names }
+          val name = if (args.strict) outputName else (0..9999).asSequence().map { numbered(args.name, it) }.firstOrNull { it !in names }
             ?: throw Exception("同名文件过多")
           val uri = DocumentsContract.createDocument(resolver, parent, args.mime, name) ?: throw Exception("无法创建文件")
           location = uri.toString()
+          if (args.strict && displayName(uri) != outputName) throw Exception("目标名称已被占用，请重新接收")
           descriptor = resolver.openFileDescriptor(uri, "w") ?: throw Exception("目标目录不可写")
         } else {
           val folder = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "邻传")
           if (!folder.isDirectory && !folder.mkdirs()) throw Exception("无法创建下载目录")
-          val target = (0..9999).asSequence().map { File(folder, numbered(args.name, it)) }.firstOrNull { it.createNewFile() }
+          val target = (0..(if (args.strict) 0 else 9999)).asSequence().map { File(folder, numbered(args.name, it)) }.firstOrNull { it.createNewFile() }
             ?: throw Exception("同名文件过多")
           location = target.absolutePath
           descriptor = ParcelFileDescriptor.open(target, ParcelFileDescriptor.MODE_WRITE_ONLY)
@@ -138,7 +216,22 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun completeFile(invoke: Invoke) {
     try {
-      val location = invoke.parseArgs(ReceiveOptions::class.java).location
+      val args = invoke.parseArgs(ReceiveOptions::class.java)
+      val location = args.location
+      if (args.replace != null) {
+        val entry = findEntry(args.directory, args.name)
+        if (entry == null || !entry.replaceable || entry.stamp != args.replace) throw Exception("目标文件已变化，请重新接收")
+        if (location.startsWith("content://")) {
+          val published = publishDocument(args, entry.location)
+          invoke.resolve(result(args.name, published))
+          return
+        }
+        val target = entry.file!!
+        Os.rename(location, target.absolutePath)
+        MediaScannerConnection.scanFile(activity, arrayOf(target.absolutePath), null, null)
+        invoke.resolve(result(args.name, entry.location))
+        return
+      }
       val name = if (location.startsWith("content://")) {
         val uri = Uri.parse(location)
         if (uri.authority == "media" && Build.VERSION.SDK_INT >= 29) {
@@ -153,6 +246,84 @@ class ReceivingPlugin(private val activity: Activity) : Plugin(activity) {
       }
       invoke.resolve(result(name, location))
     } catch (e: Exception) { invoke.reject("保存未完成：${e.message}") }
+  }
+
+  private fun temporaryName(kind: String, name: String): String {
+    val extension = File(name).extension
+    return "linchuan-$kind-${java.util.UUID.randomUUID()}" + if (extension.isEmpty()) "" else ".$extension"
+  }
+
+  private fun renameDocument(location: String, name: String, publish: Boolean = false): String {
+    val uri = Uri.parse(location)
+    val renamed = if (uri.authority == "media" && Build.VERSION.SDK_INT >= 29) {
+      val values = ContentValues().apply {
+        put(MediaStore.Downloads.DISPLAY_NAME, name)
+        if (publish) put(MediaStore.Downloads.IS_PENDING, 0)
+      }
+      if (resolver.update(uri, values, null, null) != 1) throw Exception("下载文件改名失败")
+      uri
+    } else DocumentsContract.renameDocument(resolver, uri, name) ?: throw Exception("文档改名失败")
+    if (displayName(renamed) != name) throw Exception("目标名称已被占用")
+    return renamed.toString()
+  }
+
+  private val replacements get() = activity.getSharedPreferences("receive-replacements", Activity.MODE_PRIVATE)
+
+  // Document providers cannot replace an existing name directly. Keep the original
+  // nearby until the completed download has its final name, including across a restart.
+  private fun publishDocument(args: ReceiveOptions, original: String): String {
+    val backup = temporaryName("original", args.name)
+    val record = org.json.JSONObject().put("directory", args.directory).put("name", args.name).put("backup", backup)
+    if (!replacements.edit().putString(args.location, record.toString()).commit()) throw Exception("无法登记文件替换")
+    val published = try {
+      renameDocument(original, backup)
+      renameDocument(args.location, args.name, true)
+    } catch (e: Exception) {
+      finishReplacement(args.location, record)
+      throw e
+    }
+    record.put("published", published)
+    replacements.edit().putString(args.location, record.toString()).commit()
+    try { finishReplacement(args.location, record) }
+    catch (e: Exception) { android.util.Log.w("Receiving", "稍后清理覆盖前的副本", e) }
+    return published
+  }
+
+  private fun finishReplacement(location: String, record: org.json.JSONObject) {
+    val directory = record.getString("directory")
+    val name = record.getString("name")
+    val backup = findEntry(directory, record.getString("backup"))
+    if (backup != null) {
+      val final = findEntry(directory, name)
+      if (final == null) renameDocument(backup.location, name)
+      else if (final.location == location || final.location == record.optString("published")) removeLocation(backup.location)
+      else throw Exception("目标名称已被占用，原文件保存在 ${record.getString("backup")}")
+    }
+    replacements.edit().remove(location).commit()
+  }
+
+  @Command
+  fun recoverReplacements(invoke: Invoke) {
+    for ((location, record) in replacements.all) {
+      try { finishReplacement(location, org.json.JSONObject(record as String)) }
+      catch (e: Exception) { android.util.Log.w("Receiving", "原文件仍保留，稍后重试恢复", e) }
+    }
+    invoke.resolve(JSObject())
+  }
+
+  @Command
+  fun abortFile(invoke: Invoke) {
+    try {
+      val args = invoke.parseArgs(ReceiveOptions::class.java)
+      // A MediaStore URI is stable across a rename. Recovery can still refer
+      // to the staging URI just after the document has been published.
+      if (args.replace != null && args.location.startsWith("content://")) {
+        val current = displayName(Uri.parse(args.location))
+        if (current == null || current == args.name) { invoke.resolve(JSObject()); return }
+      }
+      removeLocation(args.location)
+      invoke.resolve(JSObject())
+    } catch (e: Exception) { invoke.reject(e.message) }
   }
 
   @Command

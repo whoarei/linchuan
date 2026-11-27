@@ -14,6 +14,15 @@ export interface FileMeta {
   size: number;
   mime: string;
 }
+export interface ReceiveConflict {
+  id: string;
+  name: string;
+  key: string;
+  existing_size: number | null;
+  replaceable: boolean;
+  reason: string;
+}
+export type ConflictAction = "replace" | "keep_both" | "skip";
 export interface Transfer {
   id: string;
   message_id: string;

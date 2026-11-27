@@ -1,5 +1,5 @@
 import { test, expect, type Browser } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 
 async function client(browser: Browser, mobile = false) {
   const boot = JSON.parse(
@@ -62,10 +62,14 @@ async function client(browser: Browser, mobile = false) {
                   Authorization: `Bearer ${boot.token}`,
                   "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ accept: true, file_ids: args.fileIds }),
+                body: JSON.stringify({ accept: true, file_ids: args.fileIds, choices: args.choices }),
               },
             );
-            if (!response.ok) throw new Error((await response.json()).error);
+            if (!response.ok) {
+              const error = await response.json();
+              if (error.conflicts) return { directory: state.directory, conflicts: error.conflicts };
+              throw new Error(error.error);
+            }
             return true;
           }
           if (command === "save_received_file") state.status = "saved";
@@ -158,7 +162,7 @@ for (const mobile of [false, true]) {
   });
 }
 
-async function sendPendingFile(browser: Browser, address: string, code: string, name: string) {
+async function sendPendingFile(browser: Browser, address: string, code: string, name: string, filename = "自动保存.txt") {
   const sender = await browser.newContext();
   const page = await sender.newPage();
   await page.goto(address);
@@ -167,7 +171,7 @@ async function sendPendingFile(browser: Browser, address: string, code: string, 
   await page.getByRole("button", { name: "连接设备", exact: true }).click();
   await expect(page.getByRole("textbox", {name:"发送文字"})).toBeVisible();
   await page.locator("input[type=file]").setInputFiles({
-    name: "自动保存.txt",
+    name: filename,
     mimeType: "text/plain",
     buffer: Buffer.from("saved bytes"),
   });
@@ -181,7 +185,7 @@ async function sendPendingFile(browser: Browser, address: string, code: string, 
 test("save as keeps an offer pending on cancellation or a storage error", async ({ browser }) => {
   const host = await client(browser);
   const name = "另存为测试浏览器";
-  const sender = await sendPendingFile(browser, host.boot.address, host.boot.pairing_code, name);
+  const sender = await sendPendingFile(browser, host.boot.address, host.boot.pairing_code, name, "另存为.txt");
   await host.page.getByRole("button", { name: `打开 ${name}`, exact: true }).click();
   const actions = host.page.getByRole("group", { name: "接收文件" });
   const saveAs = actions.getByRole("button", { name: "另存为", exact: true });
@@ -200,9 +204,19 @@ test("save as keeps an offer pending on cancellation or a storage error", async 
   await saveAs.click();
   await expect(host.page.locator(".toast")).toContainText("目标磁盘空间不足");
   await expect(actions).toContainText("待接收");
+  const folder = ".playwright/device-0/received";
+  await mkdir(folder, { recursive: true });
+  await writeFile(`${folder}/另存为.txt`, "existing");
   await saveAs.click();
+  const conflict = host.page.getByRole("dialog", { name: "接收文件时遇到重名" });
+  await expect(conflict.getByRole("button", { name: "跳过", exact: true })).toBeEnabled();
+  await conflict.getByRole("button", { name: "保留两份" }).click();
   await expect(actions).toHaveCount(0);
   await expect(host.page.locator(".message-attachments")).toContainText("已保存");
+  expect(await readFile(`${folder}/另存为.txt`, "utf8")).toBe("existing");
+  expect(await readFile(`${folder}/另存为 (1).txt`, "utf8")).toBe("saved bytes");
+  expect(await host.page.evaluate(() => (window as any).__receiving.calls
+    .filter((c: any) => c.command === "receive_transfer_as").at(-1).args.directory)).toBeTruthy();
   await sender.close();
   await host.context.close();
 });
@@ -259,6 +273,48 @@ test("selected files upload smallest first and both sides display transfer speed
   const image = transfer.files.find((f: any) => f.name === "update.img");
   expect(uploads).toEqual([checksum, image].map((file) => `${host.boot.address}/api/transfers/${transfer.id}/files/${file.id}/upload`));
   expect(await host.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await sender.close();
+  await host.context.close();
+});
+
+test("name conflicts stay pending until the recipient confirms a mixed batch", async ({ browser }) => {
+  const host = await client(browser, true);
+  const folder = ".playwright/device-0/received";
+  const names = ["覆盖.txt", "保留.txt", "跳过.txt"];
+  await mkdir(folder, { recursive: true });
+  await Promise.all([...names, "保留 (1).txt"].map(name => writeFile(`${folder}/${name}`, "old")));
+  const sender = await browser.newContext();
+  const page = await sender.newPage();
+  await page.goto(host.boot.address);
+  await page.getByLabel("你的设备名称").fill("重名测试浏览器");
+  await page.getByLabel("六位配对码").fill(host.boot.pairing_code);
+  await page.getByRole("button", { name: "连接设备", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "发送文字" })).toBeVisible();
+  await page.locator("input[type=file]").setInputFiles([...names, "正常.txt"].map(name => ({
+    name, mimeType: "text/plain", buffer: Buffer.from("new-" + name),
+  })));
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await host.page.getByRole("button", { name: "打开 重名测试浏览器", exact: true }).click();
+  const accept = host.page.getByRole("button", { name: "接收", exact: true });
+  await accept.click();
+  const dialog = host.page.getByRole("dialog", { name: "接收文件时遇到重名" });
+  await expect(dialog.getByRole("button", { name: "继续接收" })).toBeDisabled();
+  await dialog.getByRole("button", { name: "返回" }).click();
+  await expect(accept).toBeEnabled();
+  expect(await readFile(`${folder}/覆盖.txt`, "utf8")).toBe("old");
+  await expect(readFile(`${folder}/正常.txt`)).rejects.toThrow();
+  await accept.click();
+  await dialog.getByLabel("批量处理同名文件").selectOption("keep_both");
+  await dialog.getByLabel("覆盖.txt 的处理方式").selectOption("replace");
+  await dialog.getByLabel("跳过.txt 的处理方式").selectOption("skip");
+  await dialog.getByRole("button", { name: "继续接收" }).click();
+  await expect.poll(() => readFile(`${folder}/覆盖.txt`, "utf8")).toBe("new-覆盖.txt");
+  await expect.poll(() => readFile(`${folder}/正常.txt`, "utf8").catch(() => "")).toBe("new-正常.txt");
+  await expect.poll(() => readFile(`${folder}/保留 (2).txt`, "utf8").catch(() => "")).toBe("new-保留.txt");
+  for (const name of ["保留.txt", "保留 (1).txt", "跳过.txt"]) {
+    expect(await readFile(`${folder}/${name}`, "utf8")).toBe("old");
+  }
+  await expect(host.page.locator(".attachment-card").filter({ hasText: "跳过.txt" })).toContainText("未选择接收");
   await sender.close();
   await host.context.close();
 });

@@ -9,6 +9,7 @@ mod identity;
 mod model;
 mod names;
 mod preferences;
+pub mod receive_conflicts;
 pub mod receiving;
 pub mod storage;
 mod store;
@@ -68,7 +69,7 @@ struct Inner {
     sources: std::sync::Mutex<std::collections::HashMap<String, (StoredFile, u64)>>,
     file_io: std::sync::RwLock<Option<files::PlatformFiles>>,
     outgoing: Semaphore,
-    receive_directories: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    publishing_replacement: Mutex<()>,
     assistance: Option<Mutex<assistance::Sessions>>,
 }
 #[derive(Clone)]
@@ -186,7 +187,7 @@ impl App {
             sources: std::sync::Mutex::new(std::collections::HashMap::new()),
             file_io: std::sync::RwLock::new(None),
             outgoing: Semaphore::new(4),
-            receive_directories: std::sync::Mutex::new(std::collections::HashMap::new()),
+            publishing_replacement: Mutex::new(()),
             assistance: options.screen_sharing.then(Mutex::default),
         }));
         app.recover_receive_outputs()
@@ -265,11 +266,6 @@ impl App {
                 {
                     let mut leases = self.0.space_leases.lock().unwrap();
                     for t in state.transfers.values().filter(|t| t.view.terminal()) {
-                        self.0
-                            .receive_directories
-                            .lock()
-                            .unwrap()
-                            .remove(&t.view.id);
                         leases.remove(&format!("incoming:{}", t.view.id));
                         if t.view.status != "completed" {
                             leases.remove(&format!("export:{}", t.view.id));

@@ -28,7 +28,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 5, "数据库版本高于当前程序支持的版本，请升级邻传");
+        anyhow::ensure!(version <= 6, "数据库版本高于当前程序支持的版本，请升级邻传");
         if version < 2 {
             let tx = conn.transaction()?;
             if version == 0 {
@@ -54,6 +54,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(include_str!("../migrations/005_file_selection.sql"))?;
             tx.pragma_update(None, "user_version", 5)?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/006_replaced_files.sql"))?;
+            tx.pragma_update(None, "user_version", 6)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {
@@ -175,7 +181,7 @@ impl Store {
                         }
                     } else if let FileStorage::Received {directory,name}=&f.storage {
                         if f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
-                            tx.execute("INSERT INTO saved_files(message_id,file_id,transfer_id,name,directory,location,status,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'saved',?7) ON CONFLICT(message_id,file_id) DO UPDATE SET name=excluded.name,directory=excluded.directory,location=excluded.location,status='saved',error=NULL,updated_at=excluded.updated_at WHERE saved_files.status<>'saved'",params![v.message_id,f.meta.id,v.id,name,directory,f.path.to_string_lossy(),now_ms()])?;
+                            tx.execute("INSERT INTO saved_files(message_id,file_id,transfer_id,name,directory,location,status,updated_at) VALUES(?1,?2,?3,?4,?5,?6,'saved',?7) ON CONFLICT(message_id,file_id) DO UPDATE SET name=excluded.name,directory=excluded.directory,location=excluded.location,status='saved',error=NULL,updated_at=excluded.updated_at WHERE saved_files.status NOT IN ('saved','replaced')",params![v.message_id,f.meta.id,v.id,name,directory,f.path.to_string_lossy(),now_ms()])?;
                         }
                     }
                     if f.complete && matches!(f.storage,FileStorage::Received{..}) {
@@ -335,6 +341,7 @@ pub(crate) fn query_transfer(
             "数据库附件路径异常"
         );
         files.push(StoredFile {
+            receive_target: None,
             meta,
             path: root.join(path),
             complete,
@@ -389,7 +396,8 @@ pub(crate) fn query_transfer(
     });
     for f in &mut files {
         if matches!(f.storage, FileStorage::Received { .. }) {
-            if let Some((location,directory,name))=conn.query_row("SELECT location,directory,name FROM saved_files WHERE message_id=?1 AND file_id=?2 AND status='saved'",params![view.message_id,f.meta.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()? {
+            if let Some((location,directory,name,status))=conn.query_row("SELECT location,directory,name,status FROM saved_files WHERE message_id=?1 AND file_id=?2 AND status IN ('saved','replaced')",params![view.message_id,f.meta.id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()? {
+                if status == "replaced" { f.complete = false; f.path.clear(); continue; }
                 f.path=location.into();f.storage=FileStorage::Received{directory,name};
             }
         }
@@ -403,4 +411,15 @@ pub(crate) fn query_transfer(
         incoming_remote: remote,
         reserved: 0,
     }))
+}
+
+/// Older messages must not reopen the new contents at a reused destination.
+pub(crate) fn mark_replaced(db: &Connection, location: &str) -> rusqlite::Result<()> {
+    let sql = if cfg!(windows) {
+        "UPDATE saved_files SET status='replaced',location='' WHERE status='saved' AND location=?1 COLLATE NOCASE"
+    } else {
+        "UPDATE saved_files SET status='replaced',location='' WHERE status='saved' AND location=?1"
+    };
+    db.execute(sql, [location])?;
+    Ok(())
 }

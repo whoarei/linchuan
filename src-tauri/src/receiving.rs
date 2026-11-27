@@ -1,5 +1,6 @@
 use crate::Runtime;
 use linchuan_core::{
+    receive_conflicts::{ConflictChoices, FileConflict},
     receiving::{SaveJob, SaveLocation, SavedFile},
     App,
 };
@@ -71,6 +72,7 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
         struct Input {
             fd: i32,
         }
+        let inspect_app = app.clone();
         let open_app = app.clone();
         let begin_app = app.clone();
         let finish_app = app.clone();
@@ -84,13 +86,21 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
                     Ok(unsafe { std::fs::File::from_raw_fd(input.fd) })
                 })
             }),
-            begin: Arc::new(move |directory, name, mime| {
+            inspect: Arc::new(move |directory, name| {
+                let app = inspect_app.clone();
+                Box::pin(async move {
+                    #[derive(serde::Deserialize)]
+                    struct Inspection { entry: Option<linchuan_core::receive_conflicts::ExistingEntry> }
+                    Ok(mobile::<Inspection>(app, "inspectFile", serde_json::json!({"directory": directory, "name":name})).await?.entry)
+                })
+            }),
+            begin: Arc::new(move |target, mime| {
                 let app = begin_app.clone();
                 Box::pin(async move {
                     let output: Descriptor = mobile(
                         app,
                         "beginFile",
-                        serde_json::json!({"directory":directory,"name":name,"mime":mime}),
+                        serde_json::json!({"directory":target.directory,"name":target.name,"mime":mime,"strict":true,"replace":target.replace}),
                     )
                     .await?;
                     Ok(PlatformOutput {
@@ -99,31 +109,33 @@ pub async fn start(app: tauri::AppHandle, core: App) -> Result<(), String> {
                     })
                 })
             }),
-            finish: Arc::new(move |location| {
+            finish: Arc::new(move |location, target| {
                 let app = finish_app.clone();
                 Box::pin(async move {
                     let saved: SaveLocation = mobile(
                         app,
                         "completeFile",
-                        serde_json::json!({"location":location}),
+                        serde_json::json!({"location":location,"directory":target.directory,"name":target.name,"replace":target.replace}),
                     )
                     .await?;
-                    Ok(saved.name)
+                    Ok(saved)
                 })
             }),
-            abort: Arc::new(move |location| {
+            abort: Arc::new(move |location, target| {
                 let app = abort_app.clone();
                 Box::pin(async move {
                     mobile::<serde_json::Value>(
                         app,
-                        "deleteFile",
-                        serde_json::json!({"location":location}),
+                        "abortFile",
+                        serde_json::json!({"location":location,"name":target.as_ref().map_or("", |t| t.name.as_str()),"replace":target.as_ref().and_then(|t| t.replace.as_deref())}),
                     )
                     .await?;
                     Ok(())
                 })
             }),
         });
+        mobile::<serde_json::Value>(app.clone(), "recoverReplacements", serde_json::json!({}))
+            .await?;
         let handle = app.clone();
         core.set_space_probe(std::sync::Arc::new(move |directory| {
             let handle = handle.clone();
@@ -198,12 +210,11 @@ async fn save_android(
         fd: i32,
         location: String,
     }
-    let output: Output = mobile(
-        app.clone(),
-        "beginFile",
-        serde_json::json!({"name":job.name,"mime":job.mime,"directory":job.directory}),
-    )
-    .await?;
+    let target = job.target.as_ref().filter(|t| t.directory == job.directory);
+    let name = target.map_or(job.name.as_str(), |t| t.name.as_str());
+    let replace = target.and_then(|t| t.replace.as_deref());
+    let mut args = serde_json::json!({"name":name,"mime":job.mime,"directory":job.directory,"strict":job.target.is_some(),"replace":replace});
+    let output: Output = mobile(app.clone(), "beginFile", args.clone()).await?;
     // Kotlin detaches ownership of this descriptor to Rust in beginFile.
     let target = unsafe { std::fs::File::from_raw_fd(output.fd) };
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -212,19 +223,13 @@ async fn save_android(
     .await
     .map_err(|e| e.to_string())
     .and_then(|v| v);
+    args["location"] = serde_json::json!(output.location);
     let value = match result {
-        Ok(()) => {
-            mobile(
-                app.clone(),
-                "completeFile",
-                serde_json::json!({"location":output.location}),
-            )
-            .await
-        }
+        Ok(()) => mobile(app.clone(), "completeFile", args.clone()).await,
         Err(error) => Err(error),
     };
     if value.is_err() {
-        let _ = delete_location(app, output.location).await;
+        let _ = mobile::<serde_json::Value>(app, "abortFile", args).await;
     }
     value
 }
@@ -278,21 +283,49 @@ async fn pick_directory(app: tauri::AppHandle) -> Result<Option<String>, String>
     }
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum ReceiveResult {
+    Done(bool),
+    Conflicts {
+        directory: String,
+        conflicts: Vec<FileConflict>,
+    },
+}
+
 #[tauri::command]
 pub async fn receive_transfer_as(
     app: tauri::AppHandle,
     transfer_id: String,
     file_ids: Option<Vec<String>>,
+    directory: Option<String>,
+    choices: Option<ConflictChoices>,
     runtime: State<'_, Runtime>,
-) -> Result<bool, String> {
+) -> Result<ReceiveResult, String> {
     let core = runtime.0.get().ok_or("服务尚未就绪")?;
-    let Some(directory) = pick_directory(app).await? else {
-        return Ok(false);
+    let directory = match directory {
+        Some(d) => d,
+        None => match pick_directory(app).await? {
+            Some(d) => d,
+            None => return Ok(ReceiveResult::Done(false)),
+        },
     };
-    core.accept_selected_files_to_directory(&transfer_id, directory, file_ids)
+    match core
+        .accept_files_with_choices(
+            &transfer_id,
+            directory.clone(),
+            file_ids,
+            choices.unwrap_or_default(),
+        )
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(true)
+    {
+        Ok(()) => Ok(ReceiveResult::Done(true)),
+        Err(e) if !e.conflicts().is_empty() => Ok(ReceiveResult::Conflicts {
+            directory,
+            conflicts: e.conflicts().to_vec(),
+        }),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 static FILE_OPERATIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -323,6 +356,7 @@ pub async fn relocate_received_file(
     let _permit = core.active_file_operation().await?;
     let mut job = if let Some(record) = &source {
         SaveJob {
+            target: None,
             message_id: message_id.clone(),
             file_id: file_id.clone(),
             source: record.location.clone().into(),
