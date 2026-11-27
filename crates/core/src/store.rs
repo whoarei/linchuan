@@ -28,7 +28,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 6, "数据库版本高于当前程序支持的版本，请升级邻传");
+        anyhow::ensure!(version <= 7, "数据库版本高于当前程序支持的版本，请升级邻传");
         if version < 2 {
             let tx = conn.transaction()?;
             if version == 0 {
@@ -60,6 +60,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(include_str!("../migrations/006_replaced_files.sql"))?;
             tx.pragma_update(None, "user_version", 6)?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/007_scan_receive_outputs.sql"))?;
+            tx.pragma_update(None, "user_version", 7)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {

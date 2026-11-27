@@ -154,7 +154,8 @@ pub fn run() {
             receiving::save_received_file,
             receiving::relocate_received_file,
             receiving::open_received_file,
-            receiving::open_receive_directory
+            receiving::open_receive_directory,
+            receiving::open_scan_directory
         ])
         .build(context)
         .expect("邻传启动失败")

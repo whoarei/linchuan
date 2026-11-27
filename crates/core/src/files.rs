@@ -4,6 +4,8 @@ use crate::{
     model::*,
     receive_conflicts::{ExistingEntry, ReceiveTarget},
     receiving::SaveLocation,
+    scan::Page,
+    storage::Progress,
     App,
 };
 use axum::body::Body;
@@ -31,6 +33,11 @@ pub struct SelectedFile {
     pub name: String,
     pub size: u64,
     pub mime: String,
+}
+
+enum Incoming<'a> {
+    Transfer(&'a str),
+    Scan(&'a Page, Option<Progress>),
 }
 
 fn modified(meta: &std::fs::Metadata) -> Option<u64> {
@@ -130,7 +137,45 @@ impl App {
                 self.0.store.run(move |db,_|{db.execute("DELETE FROM receive_outputs WHERE delivery_id=?1 AND file_id=?2 AND published=0",rusqlite::params![id,file])?;Ok(())}).await.map_err(|e|e.to_string())?;
             }
         }
+        self.recover_scan_outputs().await
+    }
+
+    async fn recover_scan_outputs(&self) -> Result<(), String> {
+        let rows = self
+            .0
+            .store
+            .run(|db, _| {
+                let mut q = db.prepare("SELECT source_json FROM scan_receive_outputs")?;
+                let rows = q.query_map([], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let platform = self.0.file_io.read().unwrap().clone();
+        for row in rows {
+            let file: StoredFile = serde_json::from_str(&row).map_err(|e| e.to_string())?;
+            let Some(target) = &file.receive_target else {
+                continue;
+            };
+            if remove_partial(&file.path.to_string_lossy(), target, platform.as_ref()).await {
+                self.clear_scan_output(&file.meta.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         Ok(())
+    }
+
+    async fn clear_scan_output(&self, id: &str) -> Result<(), Error> {
+        let id = id.to_owned();
+        self.0
+            .store
+            .run(move |db, _| {
+                db.execute("DELETE FROM scan_receive_outputs WHERE file_id=?1", [id])?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::storage(e.to_string()))
     }
     pub fn set_platform_files(&self, files: PlatformFiles) {
         *self.0.file_io.write().unwrap() = Some(files);
@@ -289,6 +334,27 @@ impl App {
         file: &StoredFile,
         body: Body,
     ) -> Result<StoredFile, Error> {
+        self.receive_to_target(file, body, Incoming::Transfer(id))
+            .await
+    }
+
+    pub(crate) async fn receive_scan_file(
+        &self,
+        page: &Page,
+        file: &StoredFile,
+        body: Body,
+        space: Option<Progress>,
+    ) -> Result<StoredFile, Error> {
+        self.receive_to_target(file, body, Incoming::Scan(page, space))
+            .await
+    }
+
+    async fn receive_to_target(
+        &self,
+        file: &StoredFile,
+        body: Body,
+        incoming: Incoming<'_>,
+    ) -> Result<StoredFile, Error> {
         let target = file
             .receive_target
             .clone()
@@ -296,7 +362,7 @@ impl App {
         let directory = target.directory.clone();
         let name = target.name.clone();
         let platform = self.0.file_io.read().unwrap().clone();
-        let mobile = directory == "@downloads" || directory.starts_with("content://");
+        let mobile = platform_destination(&directory);
         let (output, location) = if mobile {
             let io = platform
                 .as_ref()
@@ -337,28 +403,38 @@ impl App {
         };
         saved.complete = false;
         saved.uploading = false;
-        if let Err(error) = self.output_journal(id, &saved, false).await {
+        let journal = match &incoming {
+            Incoming::Transfer(id) => self.output_journal(id, &saved, false).await,
+            Incoming::Scan(..) => self.record_scan_output(&saved).await,
+        };
+        if let Err(error) = journal {
             drop(output);
-            if mobile {
-                if let Some(io) = &platform {
-                    let _ = (io.abort)(location, file.receive_target.clone()).await;
-                }
-            } else {
-                let _ = tokio::fs::remove_file(location).await;
-            }
+            remove_partial(&location, &target, platform.as_ref()).await;
             return Err(error);
         }
         let mut output = tokio::fs::File::from_std(output);
+        let space = match &incoming {
+            Incoming::Transfer(id) => {
+                self.space_progress(&format!("receive:{id}:{}", file.meta.id), &directory)
+            }
+            Incoming::Scan(_, space) => space.clone(),
+        };
         let result = async {
-            let space = self.space_progress(&format!("receive:{id}:{}", file.meta.id), &directory);
             let mut stream = body.into_data_stream();
             let mut count = 0u64;
             let mut updated = std::time::Instant::now();
             let mut deadline = tokio::time::Instant::now() + crate::storage::IDLE_TIMEOUT;
             loop {
-                let chunk = tokio::time::timeout_at(deadline, stream.next())
-                    .await
-                    .map_err(|_| Error::bad("连续 5 分钟未收到文件数据，请重新发送"))?;
+                let read = tokio::time::timeout_at(deadline, stream.next());
+                let chunk = match &incoming {
+                    Incoming::Transfer(_) => read.await,
+                    Incoming::Scan(page, _) => tokio::select! {
+                        biased;
+                        _ = page.inactive() => return Err(crate::scan::inactive_error()),
+                        chunk = read => chunk,
+                    },
+                }
+                .map_err(|_| Error::bad("连续 5 分钟未收到文件数据，请重新发送"))?;
                 let Some(chunk) = chunk else { break };
                 let chunk = chunk.map_err(|_| Error::bad("文件传输中断"))?;
                 if chunk.is_empty() {
@@ -379,31 +455,44 @@ impl App {
                     if let Some(space) = &space {
                         space.check().map_err(Error::conflict)?;
                     }
-                    self.stream_progress(id, &file.meta.id, count).await?;
+                    if let Incoming::Transfer(id) = &incoming {
+                        self.stream_progress(id, &file.meta.id, count).await?;
+                    }
                     updated = std::time::Instant::now();
                 }
             }
             if count != file.meta.size {
                 return Err(Error::bad("文件不完整，请重新发送"));
             }
-            self.stream_progress(id, &file.meta.id, count).await?;
+            if let Incoming::Transfer(id) = &incoming {
+                self.stream_progress(id, &file.meta.id, count).await?;
+            }
             output.flush().await?;
             if output.metadata().await?.is_file() {
                 output.sync_all().await?;
+            }
+            if let Incoming::Scan(page, _) = &incoming {
+                page.ensure_active()?;
+                if mobile {
+                    // On Android the provider can use the same URI before and after publishing.
+                    self.clear_scan_output(&file.meta.id).await?;
+                }
             }
             Ok(())
         }
         .await;
         drop(output);
         if let Err(error) = result {
-            if mobile {
-                if let Some(io) = &platform {
-                    let _ = (io.abort)(location, file.receive_target.clone()).await;
+            let removed = remove_partial(&location, &target, platform.as_ref()).await;
+            match &incoming {
+                Incoming::Transfer(id) => {
+                    self.release_space_tag(&format!("receive:{id}:{}", file.meta.id))
                 }
-            } else {
-                let _ = tokio::fs::remove_file(&location).await;
+                Incoming::Scan(..) if removed => {
+                    let _ = self.clear_scan_output(&file.meta.id).await;
+                }
+                Incoming::Scan(..) => {}
             }
-            self.release_space_tag(&format!("receive:{id}:{}", file.meta.id));
             return Err(error);
         }
         let _publication = if target.replace.is_some() {
@@ -439,14 +528,36 @@ impl App {
         saved.complete = true;
         // Checkpoint the published location before acknowledging the network request.
         // Recovery preserves this user file even if the following delivery commit fails.
-        self.output_journal(id, &saved, true).await?;
+        if let Incoming::Transfer(id) = &incoming {
+            self.output_journal(id, &saved, true).await?;
+        }
         if !mobile {
             if let FileStorage::Received { directory, .. } = &saved.storage {
                 crate::sync_directory(directory.into()).await?;
             }
+            if let Incoming::Scan(..) = &incoming {
+                let _ = self.clear_scan_output(&file.meta.id).await;
+            }
         }
-        self.release_space_tag(&format!("receive:{id}:{}", file.meta.id));
+        if let Incoming::Transfer(id) = incoming {
+            self.release_space_tag(&format!("receive:{id}:{}", file.meta.id));
+        }
         Ok(saved)
+    }
+    async fn record_scan_output(&self, file: &StoredFile) -> Result<(), Error> {
+        let id = file.meta.id.clone();
+        let json = serde_json::to_string(file).map_err(|e| Error::bad(e.to_string()))?;
+        self.0
+            .store
+            .run(move |db, _| {
+                db.execute(
+                    "INSERT INTO scan_receive_outputs VALUES(?1,?2)",
+                    rusqlite::params![id, json],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::storage(e.to_string()))
     }
     async fn output_journal(
         &self,
@@ -491,6 +602,27 @@ impl App {
         drop(state);
         self.notify();
         Ok(())
+    }
+}
+
+fn platform_destination(directory: &str) -> bool {
+    directory == "@downloads" || directory.starts_with("content://")
+}
+
+async fn remove_partial(
+    location: &str,
+    target: &ReceiveTarget,
+    platform: Option<&PlatformFiles>,
+) -> bool {
+    if platform_destination(&target.directory) {
+        let Some(io) = platform else { return false };
+        return (io.abort)(location.into(), Some(target.clone()))
+            .await
+            .is_ok();
+    }
+    match tokio::fs::remove_file(location).await {
+        Ok(()) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
     }
 }
 

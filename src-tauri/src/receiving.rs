@@ -626,6 +626,24 @@ pub async fn open_receive_directory(
         .receive_directory()
         .await
         .map_err(|e| e.to_string())?;
+    open_directory(app, directory).await
+}
+
+#[tauri::command]
+pub async fn open_scan_directory(
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+    id: String,
+) -> Result<(), String> {
+    let directory = runtime
+        .0
+        .get()
+        .ok_or("服务尚未就绪")?
+        .scan_receive_directory(&id)?;
+    open_directory(app, directory).await
+}
+
+async fn open_directory(app: tauri::AppHandle, directory: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         let _: serde_json::Value = mobile(

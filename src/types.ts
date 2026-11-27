@@ -14,6 +14,12 @@ export interface FileMeta {
   size: number;
   mime: string;
 }
+export interface NativeSelection {
+  source_id: string;
+  name: string;
+  size: number;
+  mime: string;
+}
 export interface ReceiveConflict {
   id: string;
   name: string;

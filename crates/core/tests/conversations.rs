@@ -586,6 +586,7 @@ async fn schema_one_upgrade_preserves_history_without_exporting_old_files() {
         let conn = rusqlite::Connection::open(receiver.dir.path().join("linchuan.db")).unwrap();
         conn.execute_batch(
             "DROP TABLE saved_files; DROP TABLE file_sources; DROP TABLE receive_outputs;
+             DROP TABLE scan_receive_outputs;
              ALTER TABLE browser_sessions DROP COLUMN secure;
              ALTER TABLE deliveries DROP COLUMN selected_file_ids;
              PRAGMA user_version=1; UPDATE messages SET received_at=1;",

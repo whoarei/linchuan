@@ -64,6 +64,9 @@ impl Error {
     pub(crate) fn missing() -> Self {
         Self(StatusCode::NOT_FOUND, "内容不存在或已过期".into(), vec![])
     }
+    pub(crate) fn gone(message: impl Into<String>) -> Self {
+        Self(StatusCode::GONE, message.into(), vec![])
+    }
     pub(crate) fn conflict(message: impl Into<String>) -> Self {
         Self(StatusCode::CONFLICT, message.into(), vec![])
     }
@@ -132,6 +135,19 @@ pub fn router(app: App, secure: bool) -> Router {
         ]);
     Router::new()
         .route("/api/info", get(info))
+        .route("/scan/{key}", get(scan_page))
+        .route(
+            "/api/scan",
+            get(crate::scan::list).post(crate::scan::create),
+        )
+        .route("/api/scan/{id}/close", post(crate::scan::close))
+        .route("/api/scan/visit/{key}", get(crate::scan::visit))
+        .route(
+            "/api/scan/visit/{key}/files/{id}",
+            get(crate::scan::download)
+                .put(crate::scan::submit)
+                .layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/pair", post(pair))
         .route("/api/session/logout", post(logout))
         .route("/api/state", get(state))
@@ -480,7 +496,7 @@ async fn add_peer(
     app.remember_peer(device).await?;
     Ok(Json(json!({"id":id})))
 }
-fn validate_files(files: &[FileInput]) -> Result<u64> {
+pub(crate) fn validate_files(files: &[FileInput]) -> Result<u64> {
     if files.len() > 64 {
         return Err(Error::bad("一次最多发送 64 个文件"));
     }
@@ -1391,9 +1407,7 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
     let input = app.open_source(&ticket.file).await.map_err(Error::bad)?;
     drop(publication);
     let length = ticket.file.meta.size;
-    let encoded: String = url::form_urlencoded::byte_serialize(ticket.file.meta.name.as_bytes())
-        .collect::<String>()
-        .replace('+', "%20");
+    let name = ticket.file.meta.name.clone();
     if ticket.track {
         let mut state = app.0.state.lock().await;
         let t = state
@@ -1486,7 +1500,14 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
             }
         },
     );
-    let mut response = Body::from_stream(stream).into_response();
+    attachment(Body::from_stream(stream), length, &name)
+}
+
+pub(crate) fn attachment(body: Body, length: u64, name: &str) -> Result<Response> {
+    let encoded = url::form_urlencoded::byte_serialize(name.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    let mut response = body.into_response();
     let headers = response.headers_mut();
     headers.insert(
         "content-type",
@@ -2050,6 +2071,15 @@ use tokio::sync::broadcast;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../../dist/"]
 struct Assets;
+async fn scan_page() -> Response {
+    let mut response = asset(axum::http::Uri::from_static("/")).await;
+    response.headers_mut().insert(
+        axum::http::header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
 async fn asset(uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let path = if path.is_empty() { "index.html" } else { path };

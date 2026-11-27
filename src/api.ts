@@ -99,7 +99,7 @@ export class ApiError extends Error {
 export async function api<T = any>(
   path: string,
   body?: unknown,
-  options?: { keepalive?: boolean },
+  options?: { keepalive?: boolean; anonymous?: boolean },
 ): Promise<T> {
   try {
     return await withDeadline(async (signal) => {
@@ -108,7 +108,7 @@ export async function api<T = any>(
         keepalive: options?.keepalive,
         method: body === undefined ? "GET" : "POST",
         headers: {
-          ...(credential ? { Authorization: `Bearer ${credential}` } : {}),
+          ...(credential && !options?.anonymous ? { Authorization: `Bearer ${credential}` } : {}),
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -132,11 +132,12 @@ export function upload(
   file: File,
   onProgress: (bytes: number) => void,
   signal: AbortSignal,
+  options?: { anonymous?: boolean },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", base + path);
-    xhr.setRequestHeader("Authorization", `Bearer ${credential}`);
+    if (!options?.anonymous) xhr.setRequestHeader("Authorization", `Bearer ${credential}`);
     xhr.timeout = 0;
     let lastLoaded = 0;
     let idleTimer: ReturnType<typeof setTimeout>;

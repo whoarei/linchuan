@@ -43,6 +43,7 @@ import DesktopTitleBar from "./DesktopTitleBar.vue";
 import ScreenAssistance from "./ScreenAssistance.vue";
 import ConversationRow from "./ConversationRow.vue";
 import ReceiveConflictForm from "./ReceiveConflictForm.vue";
+import ScanPublisher from "./ScanPublisher.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
 import { useDesktopSettings } from "./useDesktopSettings";
@@ -73,13 +74,14 @@ import type {
   Group,
   Message,
   MessageFile,
+  NativeSelection,
   Transfer,
   FileMeta,
   ConflictAction,
   ReceiveConflict,
 } from "./types";
 
-type Mode = "devices" | "settings" | "about";
+type Mode = "devices" | "scan" | "settings" | "about";
 const {
   settings: desktopSettings,
   busy: desktopBusy,
@@ -126,7 +128,6 @@ const before = ref<number | null>(null);
 const historyBusy = ref(false);
 const text = ref("");
 type SelectedFile = File & { source_id?: string };
-type NativeSelection = { source_id: string; name: string; size: number; mime: string };
 const files = ref<SelectedFile[]>([]);
 const fileCache = new Map<string, SelectedFile[]>();
 const browserOnly = computed(() => state.value?.me.owner === false);
@@ -1201,6 +1202,7 @@ function sessionChanged() {
 }
 function setMode(value: Mode) {
   flushDraft();
+  dragging.value = false;
   mode.value = value;
   if (value === "settings") {
     newName.value = state.value?.me.name || "";
@@ -1240,9 +1242,13 @@ onMounted(async () => {
   void start();
   if (!native) return;
   const listeners = [
-    listen<NativeSelection[]>("linchuan-files", (event) => nativeSelections(event.payload)),
+    listen<NativeSelection[]>("linchuan-files", (event) => {
+      if (mode.value !== "scan") nativeSelections(event.payload);
+    }),
     listen<string>("linchuan-file-error", (event) => notify(event.payload, true)),
-    listen<boolean>("linchuan-dragging", (event) => { dragging.value = event.payload && canWrite.value; }),
+    listen<boolean>("linchuan-dragging", (event) => {
+      dragging.value = mode.value !== "scan" && event.payload && canWrite.value;
+    }),
   ];
   await Promise.all(listeners.map(async (listener) => {
     try {
@@ -1348,6 +1354,16 @@ onUnmounted(() => {
       >
         <MessageSquare :size="23" /><span>{{ browserOnly ? "收发" : "设备" }}</span
         ><i v-if="unread" class="rail-unread" />
+      </button>
+      <button
+        v-if="native && state?.me.owner"
+        class="rail-button"
+        :class="{ active: mode === 'scan' }"
+        :aria-current="mode === 'scan' ? 'page' : undefined"
+        title="收发"
+        @click="setMode('scan')"
+      >
+        <QrCode :size="23" /><span>收发</span>
       </button>
       <div class="rail-spacer" />
       <button
@@ -2091,6 +2107,11 @@ onUnmounted(() => {
         </button>
       </div>
     </main>
+    <ScanPublisher
+      v-else-if="mode === 'scan' && native && state?.me.owner"
+      :addresses="state.info.addresses.length ? state.info.addresses : [address()]"
+      @copy="copy"
+    />
     <main v-else-if="mode === 'settings'" class="settings-page">
       <header class="section-header">
         <h1>设置</h1>

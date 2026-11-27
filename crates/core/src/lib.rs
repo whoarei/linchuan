@@ -11,6 +11,7 @@ mod names;
 mod preferences;
 pub mod receive_conflicts;
 pub mod receiving;
+mod scan;
 pub mod storage;
 mod store;
 mod transport;
@@ -88,6 +89,7 @@ struct Inner {
     outgoing: Semaphore,
     publishing_replacement: Mutex<()>,
     assistance: Option<Mutex<assistance::Sessions>>,
+    scan: scan::Pages,
 }
 #[derive(Clone)]
 pub struct App(Arc<Inner>);
@@ -207,6 +209,7 @@ impl App {
             outgoing: Semaphore::new(4),
             publishing_replacement: Mutex::new(()),
             assistance: options.screen_sharing.then(Mutex::default),
+            scan: scan::Pages::default(),
         }));
         app.recover_receive_outputs()
             .await
@@ -469,6 +472,7 @@ impl App {
             .is_none_or(|session| session.secure == secure)
     }
     async fn sweep(&self) {
+        self.0.scan.sweep();
         let mut paths = Vec::new();
         let mut state = self.0.state.lock().await;
         let mut expired = false;

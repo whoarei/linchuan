@@ -62,7 +62,7 @@ pub(crate) fn inspect_local(path: &Path) -> Result<Option<ExistingEntry>, String
     }
 }
 
-fn name_key(name: &str) -> String {
+pub(crate) fn name_key(name: &str) -> String {
     if cfg!(any(windows, target_os = "android", target_os = "macos")) {
         name.to_lowercase()
     } else {
@@ -82,7 +82,7 @@ pub(crate) fn numbered(name: &str, index: usize) -> String {
 }
 
 impl App {
-    async fn inspect_entry(
+    pub(crate) async fn inspect_entry(
         &self,
         directory: &str,
         name: &str,
