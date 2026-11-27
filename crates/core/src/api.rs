@@ -914,6 +914,8 @@ async fn send(
             text: request.text.clone(),
             files: draft.files.iter().map(|f| f.meta.clone()).collect(),
             status: if offline { "failed" } else { "pending" }.into(),
+            can_select_files: matches!(address, Some(None)) && draft.files.len() > 1,
+            selected_file_ids: None,
             bytes: 0,
             total: draft.files.iter().map(|f| f.meta.size).sum(),
             created: now(),
@@ -928,6 +930,7 @@ async fn send(
             Transfer {
                 view,
                 files: draft.files.clone(),
+                stream_bytes: Default::default(),
                 peer_token: None,
                 incoming_remote: false,
                 reserved: 0,
@@ -985,14 +988,22 @@ async fn send(
 fn automatically_received(files: &[FileMeta]) -> bool {
     files.iter().all(|f| f.mime.starts_with("image/"))
 }
+struct ReceiveDecision<'a> {
+    accept: bool,
+    directory: Option<&'a str>,
+    file_ids: Option<Vec<String>>,
+}
 async fn set_decision(
     app: &App,
     state: &mut crate::model::State,
     id: &str,
     recipient: &str,
     owner: bool,
-    accept: bool,
-    directory: Option<&str>,
+    ReceiveDecision {
+        accept,
+        directory,
+        file_ids,
+    }: ReceiveDecision<'_>,
 ) -> Result<()> {
     let transfer = state
         .transfers
@@ -1005,6 +1016,27 @@ async fn set_decision(
     if !owner && (transfer.view.group_id.is_some() || transfer.view.sender_id != app.0.device_id) {
         return Err(Error::forbidden());
     }
+    let selected = if let Some(ids) = file_ids {
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        if !accept
+            || ids.is_empty()
+            || unique.len() != ids.len()
+            || !ids
+                .iter()
+                .all(|id| transfer.view.files.iter().any(|f| &f.id == id))
+        {
+            return Err(Error::bad("请至少选择一个有效文件"));
+        }
+        if ids.len() == transfer.files.len() {
+            None
+        } else if transfer.view.can_select_files {
+            Some(ids)
+        } else {
+            return Err(Error::conflict("发送方版本仅支持整批接收"));
+        }
+    } else {
+        None
+    };
     let streams_to_disk = transfer
         .files
         .iter()
@@ -1022,6 +1054,7 @@ async fn set_decision(
                 transfer
                     .files
                     .iter()
+                    .filter(|f| selected.as_ref().is_none_or(|ids| ids.contains(&f.meta.id)))
                     .filter(|f| !f.complete || (saves_from_cache && f.cached()))
                     .map(|f| {
                         (
@@ -1049,6 +1082,7 @@ async fn set_decision(
         // Cached exports reserve again in the saver. Drop their preflight lease
         // before committing the queue so the saver cannot count them twice.
     }
+    transfer.view.select_files(selected);
     transfer.view.status = if !accept {
         "rejected"
     } else if transfer.files.is_empty() {
@@ -1082,7 +1116,12 @@ async fn auto_receive(app: &App, state: &mut crate::model::State, id: &str) {
     }
     let recipient = transfer.view.recipient_id.clone();
     let owner = recipient == app.0.device_id;
-    if let Err(error) = set_decision(app, state, id, &recipient, owner, true, None).await {
+    let decision = ReceiveDecision {
+        accept: true,
+        directory: None,
+        file_ids: None,
+    };
+    if let Err(error) = set_decision(app, state, id, &recipient, owner, decision).await {
         // Leave the offer pending so the recipient can retry after fixing storage.
         state.transfers.get_mut(id).unwrap().view.error = Some(format!("自动接收未完成：{error}"));
     }
@@ -1105,18 +1144,48 @@ async fn decision(
     let accept = value["accept"]
         .as_bool()
         .ok_or_else(|| Error::bad("缺少接收决定"))?;
-    app.decide_transfer(&id, &p.id, p.owner, accept, None)
-        .await?;
+    let file_ids = serde_json::from_value(value["file_ids"].clone())
+        .map_err(|_| Error::bad("文件标识无效"))?;
+    app.decide_transfer(
+        &id,
+        &p.id,
+        p.owner,
+        ReceiveDecision {
+            accept,
+            directory: None,
+            file_ids,
+        },
+    )
+    .await?;
     Ok(Json(json!({"ok":true})))
 }
 
 impl App {
     pub async fn accept_transfer_to_directory(&self, id: &str, directory: String) -> Result<()> {
+        self.accept_selected_files_to_directory(id, directory, None)
+            .await
+    }
+
+    pub async fn accept_selected_files_to_directory(
+        &self,
+        id: &str,
+        directory: String,
+        file_ids: Option<Vec<String>>,
+    ) -> Result<()> {
         if directory.is_empty() {
             return Err(Error::bad("请选择接收目录"));
         }
-        self.decide_transfer(id, &self.0.device_id, true, true, Some(directory))
-            .await
+        self.decide_transfer(
+            id,
+            &self.0.device_id,
+            true,
+            ReceiveDecision {
+                accept: true,
+                directory: Some(&directory),
+                file_ids,
+            },
+        )
+        .await
     }
 
     async fn decide_transfer(
@@ -1124,25 +1193,16 @@ impl App {
         id: &str,
         recipient: &str,
         owner: bool,
-        accept: bool,
-        directory: Option<String>,
+        decision: ReceiveDecision<'_>,
     ) -> Result<()> {
         self.cache_transfer(id).await?;
         let mut state = self.0.state.lock().await;
-        set_decision(
-            self,
-            &mut state,
-            id,
-            recipient,
-            owner,
-            accept,
-            directory.as_deref(),
-        )
-        .await?;
+        let directory = decision.directory;
+        set_decision(self, &mut state, id, recipient, owner, decision).await?;
         if let Err(error) = self
             .commit_with_receive_directory(
                 &mut state,
-                directory.map(|directory| (id.into(), directory)),
+                directory.map(|directory| (id.into(), directory.into())),
             )
             .await
         {
@@ -1203,10 +1263,11 @@ async fn ticket(
         return Err(Error::forbidden());
     }
     if transfer.view.recipient_id == p.id
-        && !matches!(
-            transfer.view.status.as_str(),
-            "accepted" | "transferring" | "completed"
-        )
+        && (!transfer.view.includes_file(&file_id)
+            || !matches!(
+                transfer.view.status.as_str(),
+                "accepted" | "transferring" | "completed"
+            ))
     {
         return Err(Error::conflict("请先接收文件"));
     }
@@ -1262,7 +1323,9 @@ async fn download(AxState(app): AxState<App>, Path(key): Path<String>) -> Result
             .transfers
             .get_mut(&ticket.transfer_id)
             .ok_or_else(Error::missing)?;
-        if !matches!(t.view.status.as_str(), "accepted" | "transferring") {
+        if !matches!(t.view.status.as_str(), "accepted" | "transferring")
+            || !t.view.includes_file(&ticket.file.meta.id)
+        {
             return Err(Error::conflict("传输已结束"));
         }
         let f = t
@@ -1396,14 +1459,17 @@ impl DownloadStream {
             file.uploading = false;
         }
         t.view.created = now();
-        t.view.bytes = t
-            .files
+        if done {
+            t.stream_bytes.remove(&self.ticket.file.meta.id);
+        } else {
+            t.stream_bytes
+                .insert(self.ticket.file.meta.id.clone(), self.bytes);
+        }
+        t.refresh_stream_bytes(true);
+        if t.files
             .iter()
-            .filter(|f| f.downloaded && f.meta.id != self.ticket.file.meta.id)
-            .map(|f| f.meta.size)
-            .sum::<u64>()
-            + self.bytes;
-        if t.files.iter().all(|f| f.downloaded) {
+            .all(|f| f.downloaded || !t.view.includes_file(&f.meta.id))
+        {
             t.view.status = "completed".into();
         }
         if done {
@@ -1431,6 +1497,7 @@ impl Drop for DownloadStream {
                 if let Some(f) = t.files.iter_mut().find(|f| f.meta.id == file) {
                     f.uploading = false;
                 }
+                t.stream_bytes.remove(&file);
                 if !t.view.terminal() {
                     t.view.status = if t.files.iter().any(|f| f.uploading) {
                         "transferring"
@@ -1439,12 +1506,7 @@ impl Drop for DownloadStream {
                     }
                     .into();
                     t.view.error = Some("下载中断，可重新下载；原文件需要保持可用".into());
-                    t.view.bytes = t
-                        .files
-                        .iter()
-                        .filter(|f| f.downloaded)
-                        .map(|f| f.meta.size)
-                        .sum();
+                    t.refresh_stream_bytes(true);
                 }
                 let _ = app.commit(&mut state).await;
             }
@@ -1456,6 +1518,7 @@ impl Drop for DownloadStream {
 async fn peer_offer(
     AxState(app): AxState<App>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(mut offer): Json<Offer>,
 ) -> Result<Json<OfferResponse>> {
     if offer.protocol != 1
@@ -1628,6 +1691,10 @@ async fn peer_offer(
         .get(&recipient)
         .map(|d| d.name.clone())
         .unwrap_or(info.name);
+    let can_select_files = offer.files.len() > 1
+        && headers
+            .get(FILE_SELECTION_HEADER)
+            .is_some_and(|value| value == "1");
     let view = TransferView {
         id: id.clone(),
         message_id: offer.message_id,
@@ -1640,6 +1707,8 @@ async fn peer_offer(
         text: offer.text,
         files: offer.files,
         status: "pending".into(),
+        can_select_files,
+        selected_file_ids: None,
         bytes: 0,
         total,
         created: now(),
@@ -1650,6 +1719,7 @@ async fn peer_offer(
         Transfer {
             view,
             files,
+            stream_bytes: Default::default(),
             peer_token: Some(token.clone()),
             incoming_remote: true,
             reserved: 0,
@@ -1704,6 +1774,9 @@ async fn peer_upload(
         if !matches!(t.view.status.as_str(), "accepted" | "transferring") {
             return Err(Error::conflict("对方尚未同意或传输已结束"));
         }
+        if !t.view.includes_file(&file_id) {
+            return Err(Error::conflict("接收方未选择此文件"));
+        }
         let file = t
             .files
             .iter_mut()
@@ -1731,12 +1804,8 @@ async fn peer_upload(
         t.view.status = "failed".into();
         t.view.error = result.as_ref().err().map(ToString::to_string);
     }
-    t.view.bytes = t
-        .files
-        .iter()
-        .filter(|f| f.complete)
-        .map(|f| f.meta.size)
-        .sum();
+    t.stream_bytes.remove(&file_id);
+    t.refresh_stream_bytes(false);
     app.commit(&mut state).await?;
     drop(state);
     app.notify();
@@ -1775,6 +1844,9 @@ async fn browser_upload(
         if !matches!(t.view.status.as_str(), "accepted" | "transferring") {
             return Err(Error::conflict("对方尚未接收或传输已结束"));
         }
+        if !t.view.includes_file(&file_id) {
+            return Err(Error::conflict("接收方未选择此文件"));
+        }
         let f = t
             .files
             .iter_mut()
@@ -1802,15 +1874,16 @@ async fn browser_upload(
         t.view.status = "failed".into();
         t.view.error = result.as_ref().err().map(ToString::to_string);
     }
-    if result.is_ok() && active && t.files.iter().all(|f| f.complete) {
+    if result.is_ok()
+        && active
+        && t.files
+            .iter()
+            .all(|f| f.complete || !t.view.includes_file(&f.meta.id))
+    {
         t.view.status = "completed".into();
     }
-    t.view.bytes = t
-        .files
-        .iter()
-        .filter(|f| f.complete)
-        .map(|f| f.meta.size)
-        .sum();
+    t.stream_bytes.remove(&file_id);
+    t.refresh_stream_bytes(false);
     app.commit(&mut state).await?;
     drop(state);
     app.notify();
@@ -1828,7 +1901,9 @@ async fn peer_complete(
     let mut state = app.0.state.lock().await;
     let t = authorized_transfer(&mut state, &id, token(&headers)?)?;
     if !matches!(t.view.status.as_str(), "accepted" | "transferring")
-        || t.files.iter().any(|f| !f.complete)
+        || t.files
+            .iter()
+            .any(|f| !f.complete && t.view.includes_file(&f.meta.id))
     {
         return Err(Error::conflict("传输尚未完成或已结束"));
     }

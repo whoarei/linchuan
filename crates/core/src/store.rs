@@ -28,7 +28,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        anyhow::ensure!(version <= 4, "数据库版本高于当前程序支持的版本，请升级邻传");
+        anyhow::ensure!(version <= 5, "数据库版本高于当前程序支持的版本，请升级邻传");
         if version < 2 {
             let tx = conn.transaction()?;
             if version == 0 {
@@ -48,6 +48,12 @@ impl Store {
             let tx = conn.transaction()?;
             tx.execute_batch(include_str!("../migrations/004_browser_transport.sql"))?;
             tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
+        if version < 5 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/005_file_selection.sql"))?;
+            tx.pragma_update(None, "user_version", 5)?;
             tx.commit()?;
         }
         let get = |key: &str| -> rusqlite::Result<Option<String>> {
@@ -143,7 +149,8 @@ impl Store {
                     if let Some(old)=previous {anyhow::ensure!(old==(f.name.clone(),f.size,f.mime.clone()),"附件清单与历史消息冲突");}
                     tx.execute("INSERT OR IGNORE INTO attachments VALUES(?1,?2,?3,?4,?5,?6)",params![v.message_id,f.id,f.name,f.size,f.mime,index])?;
                 }
-                tx.execute("INSERT INTO deliveries VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET status=excluded.status,bytes=excluded.bytes,error=excluded.error,updated_at=excluded.updated_at",params![v.id,v.message_id,v.recipient_id,v.recipient_name,v.status,v.bytes,v.total,v.error,t.incoming_remote,v.created_at,now_ms()])?;
+                let selected = v.selected_file_ids.as_ref().map(serde_json::to_string).transpose()?;
+                tx.execute("INSERT INTO deliveries(id,message_id,recipient_id,recipient_name,status,bytes,total,error,incoming_remote,created_at,updated_at,selected_file_ids) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(id) DO UPDATE SET status=excluded.status,bytes=excluded.bytes,total=excluded.total,error=excluded.error,updated_at=excluded.updated_at,selected_file_ids=excluded.selected_file_ids",params![v.id,v.message_id,v.recipient_id,v.recipient_name,v.status,v.bytes,v.total,v.error,t.incoming_remote,v.created_at,now_ms(),selected])?;
                 for f in &t.files {
                     let mut persisted=f.clone();
                     if f.cached(){persisted.path=f.path.strip_prefix(&root)?.into();}
@@ -155,7 +162,7 @@ impl Store {
                         let blob=identity::token_hash(relative);let availability=if f.available(){"available"}else{"missing"};
                         tx.execute("INSERT INTO file_blobs VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET state=CASE WHEN file_blobs.state='expired' AND excluded.state='missing' THEN 'expired' ELSE excluded.state END",params![blob,relative,f.meta.size,availability,now_ms()])?;
                         tx.execute("INSERT INTO delivery_files VALUES(?1,?2,?3,?4) ON CONFLICT(delivery_id,file_id) DO UPDATE SET complete=excluded.complete",params![v.id,f.meta.id,blob,f.complete])?;
-                        if v.status == "completed" && f.complete && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
+                        if v.status == "completed" && f.complete && v.includes_file(&f.meta.id) && state.profiles.get(&v.recipient_id).is_some_and(|d|d.kind=="local") {
                             tx.execute(
                                 "INSERT OR IGNORE INTO saved_files(message_id,file_id,transfer_id,name,status,updated_at,directory)
                                  SELECT ?1,?2,?3,?4,'pending',?5,?6
@@ -255,7 +262,7 @@ impl Store {
             for(position,id,sender_id,sender_name,text,created_at,direction)in rows{
                 let ids:Vec<String>=conn.prepare("SELECT d.id FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.message_id=?1 AND (m.sender_id=?2 OR d.recipient_id=?2) ORDER BY CASE WHEN d.status='completed' THEN 0 ELSE 1 END,d.created_at,d.id")?.query_map(params![id,principal],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
                 let mut deliveries=Vec::new();let mut files=Vec::new();
-                for delivery in ids {if let Some(t)=query_transfer(conn,root,&delivery)?{if files.is_empty(){files=t.files.iter().map(|f|MessageFile{meta:f.meta.clone(),available:f.available()&&(sender_id==principal||t.view.status=="completed"||(t.view.recipient_id==principal&&matches!(t.view.status.as_str(),"accepted"|"transferring"))),transfer_id:t.view.id.clone(),original:matches!(f.storage,FileStorage::Original{..})}).collect();}deliveries.push(t.view);}}
+                for delivery in ids {if let Some(t)=query_transfer(conn,root,&delivery)?{if files.is_empty(){files=t.files.iter().map(|f|MessageFile{meta:f.meta.clone(),available:f.available()&&(sender_id==principal||(t.view.includes_file(&f.meta.id)&&(t.view.status=="completed"||(t.view.recipient_id==principal&&matches!(t.view.status.as_str(),"accepted"|"transferring"))))),transfer_id:t.view.id.clone(),original:matches!(f.storage,FileStorage::Original{..})}).collect();}deliveries.push(t.view);}}
                 result.push(MessageView{id,position,sender_id,sender_name,text,created_at,direction,files,deliveries});
             }
             result.reverse();Ok(result)
@@ -299,10 +306,11 @@ pub(crate) fn query_transfer(
     root: &Path,
     id: &str,
 ) -> anyhow::Result<Option<Transfer>> {
-    let view=conn.query_row("SELECT d.id,m.id,m.group_id,m.created_at,m.sender_id,m.sender_name,d.recipient_id,d.recipient_name,m.text,d.status,d.bytes,d.total,m.created_at,d.error,d.incoming_remote FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.id=?1",[id],|r|Ok((TransferView{id:r.get(0)?,message_id:r.get(1)?,group_id:r.get(2)?,created_at:r.get(3)?,sender_id:r.get(4)?,sender_name:r.get(5)?,recipient_id:r.get(6)?,recipient_name:r.get(7)?,text:r.get(8)?,status:r.get(9)?,bytes:r.get(10)?,total:r.get(11)?,created:r.get::<_,u64>(12)?/1000,error:r.get(13)?,files:Vec::new()},r.get::<_,bool>(14)?))).optional()?;
-    let Some((mut view, remote)) = view else {
+    let view=conn.query_row("SELECT d.id,m.id,m.group_id,m.created_at,m.sender_id,m.sender_name,d.recipient_id,d.recipient_name,m.text,d.status,d.bytes,d.total,m.created_at,d.error,d.incoming_remote,d.selected_file_ids FROM deliveries d JOIN messages m ON m.id=d.message_id WHERE d.id=?1",[id],|r|Ok((TransferView{id:r.get(0)?,message_id:r.get(1)?,group_id:r.get(2)?,created_at:r.get(3)?,sender_id:r.get(4)?,sender_name:r.get(5)?,recipient_id:r.get(6)?,recipient_name:r.get(7)?,text:r.get(8)?,status:r.get(9)?,bytes:r.get(10)?,total:r.get(11)?,created:r.get::<_,u64>(12)?/1000,error:r.get(13)?,files:Vec::new(),can_select_files:false,selected_file_ids:None},r.get::<_,bool>(14)?,r.get::<_,Option<String>>(15)?))).optional()?;
+    let Some((mut view, remote, selected)) = view else {
         return Ok(None);
     };
+    view.selected_file_ids = selected.as_deref().map(serde_json::from_str).transpose()?;
     let mut q=conn.prepare("SELECT a.file_id,a.name,a.size,a.mime,b.relative_path,f.complete FROM attachments a JOIN delivery_files f ON f.file_id=a.file_id AND f.delivery_id=?1 JOIN file_blobs b ON b.id=f.blob_id WHERE a.message_id=?2 ORDER BY a.position")?;
     let rows: Vec<_> = q
         .query_map(params![id, view.message_id], |r| {
@@ -390,6 +398,7 @@ pub(crate) fn query_transfer(
     Ok(Some(Transfer {
         view,
         files,
+        stream_bytes: HashMap::new(),
         peer_token: None,
         incoming_remote: remote,
         reserved: 0,

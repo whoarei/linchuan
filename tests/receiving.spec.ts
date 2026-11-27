@@ -62,7 +62,7 @@ async function client(browser: Browser, mobile = false) {
                   Authorization: `Bearer ${boot.token}`,
                   "Content-Type": "application/json",
                 },
-                body: JSON.stringify({ accept: true }),
+                body: JSON.stringify({ accept: true, file_ids: args.fileIds }),
               },
             );
             if (!response.ok) throw new Error((await response.json()).error);
@@ -94,7 +94,7 @@ async function client(browser: Browser, mobile = false) {
                   t.recipient_id === app.me.id,
               )
               .flatMap((t: any) =>
-                t.files.map((f: any) => ({
+                t.files.filter((f: any) => !t.selected_file_ids || t.selected_file_ids.includes(f.id)).map((f: any) => ({
                   message_id: t.message_id,
                   file_id: f.id,
                   name: f.name,
@@ -203,6 +203,62 @@ test("save as keeps an offer pending on cancellation or a storage error", async 
   await saveAs.click();
   await expect(actions).toHaveCount(0);
   await expect(host.page.locator(".message-attachments")).toContainText("已保存");
+  await sender.close();
+  await host.context.close();
+});
+
+test("selected files upload smallest first and both sides display transfer speed", async ({ browser }) => {
+  const host = await client(browser, true);
+  const sender = await browser.newContext();
+  const page = await sender.newPage();
+  await page.goto(host.boot.address);
+  await page.getByLabel("你的设备名称").fill("多文件浏览器");
+  await page.getByLabel("六位配对码").fill(host.boot.pairing_code);
+  await page.getByRole("button", { name: "连接设备", exact: true }).click();
+  await expect(page.getByRole("textbox", { name: "发送文字" })).toBeVisible();
+
+  const cdp = await sender.newCDPSession(page);
+  await cdp.send("Network.emulateNetworkConditions", {
+    offline: false,
+    latency: 0,
+    downloadThroughput: -1,
+    uploadThroughput: 128 * 1024,
+  });
+  const size = 768 * 1024;
+  const uploads: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "PUT" && request.url().endsWith("/upload")) uploads.push(request.url());
+  });
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "update.img", mimeType: "application/octet-stream", buffer: Buffer.alloc(size) },
+    { name: "skip.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(1024) },
+    { name: "update.sha256", mimeType: "text/plain", buffer: Buffer.from("checksum") },
+  ]);
+  await page.getByRole("button", { name: "发送", exact: true }).click();
+  await host.page.getByRole("button", { name: "打开 多文件浏览器", exact: true }).click();
+  const attachments = host.page.locator(".message-attachments");
+  await attachments.getByRole("checkbox", { name: "接收 skip.bin" }).uncheck();
+  await expect(attachments).toContainText("已选 2/3 个文件");
+  await attachments.getByRole("button", { name: "另存为", exact: true }).click();
+
+  const speed = /[1-9]\d*(?:\.\d+)? (?:B|KB|MB|GB)\/s/;
+  await Promise.all([
+    expect(attachments.locator(".attachment-transfer")).toContainText(speed),
+    expect(page.locator(".delivery-details")).toContainText(speed),
+  ]);
+  expect(await readFile(".playwright/device-0/received/update.sha256", "utf8")).toBe("checksum");
+  await expect(attachments.locator(".attachment-card").filter({ hasText: "update.img" })).toContainText("已保存", { timeout: 12_000 });
+  await expect(attachments.locator(".attachment-card").filter({ hasText: "skip.bin" })).toContainText("未选择接收");
+  await expect(page.locator(".delivery-summary")).toContainText("已传送 2/3 个文件");
+  const { transfers } = await (await host.page.request.get(`${host.boot.address}/api/state`, {
+    headers: { Authorization: `Bearer ${host.boot.token}` },
+  })).json();
+  const transfer = transfers.find((t: any) => t.files.some((f: any) => f.name === "update.sha256"));
+  expect(transfer.total).toBe(size + Buffer.byteLength("checksum"));
+  const checksum = transfer.files.find((f: any) => f.name === "update.sha256");
+  const image = transfer.files.find((f: any) => f.name === "update.img");
+  expect(uploads).toEqual([checksum, image].map((file) => `${host.boot.address}/api/transfers/${transfer.id}/files/${file.id}/upload`));
+  expect(await host.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await sender.close();
   await host.context.close();
 });

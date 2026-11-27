@@ -113,6 +113,7 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
         .0
         .client
         .post(format!("{address}/api/peer/offer"))
+        .header(FILE_SELECTION_HEADER, "1")
         .json(&offer)
         .timeout(Duration::from_secs(10))
         .send()
@@ -126,22 +127,36 @@ async fn run(app: &App, id: &str, address: &str) -> anyhow::Result<()> {
     let endpoint = format!("{address}/api/peer/transfers/{}", remote.id);
     let result=async{
         let start=Instant::now();
-        loop{
+        let selected = loop{
             if !active(app,id).await{return Ok(());}
             anyhow::ensure!(start.elapsed()<Duration::from_secs(300),"等待接收确认超时，请重新发送");
             let response=app.0.client.get(&endpoint).bearer_auth(&remote.token).timeout(Duration::from_secs(5)).send().await?;
             anyhow::ensure!(response.status().is_success(),"接收请求已过期");
             let status:TransferView=response.json().await?;
             match status.status.as_str(){
-                "accepted"=>break,
+                "accepted"=>break status.selected_file_ids,
                 "completed"=>{update(app,id,"completed",status.total).await;return Ok(());},
                 "rejected"|"cancelled"|"failed"|"interrupted"=>{update(app,id,&status.status,0).await;return Ok(());},
                 _=>tokio::time::sleep(Duration::from_millis(400)).await,
             }
+        };
+        let mut files: Vec<_> = transfer.files.iter()
+            .filter(|file| selected.as_ref().is_none_or(|ids| ids.contains(&file.meta.id)))
+            .collect();
+        anyhow::ensure!(selected.as_ref().is_none_or(|ids| !ids.is_empty() && ids.len() == files.len()), "接收方返回了无效的文件清单");
+        files.sort_by_key(|file| file.meta.size);
+        {
+            let mut state = app.0.state.lock().await;
+            let Some(t) = state.transfers.get_mut(id).filter(|t| !t.view.terminal()) else {
+                return Ok(());
+            };
+            t.view.select_files(selected);
+            t.view.status = "transferring".into();
+            app.commit(&mut state).await?;
         }
+        app.notify();
         let mut bytes=0;
-        if !update(app,id,"transferring",bytes).await{return Ok(());}
-        for file in &transfer.files{
+        for file in files{
             if !active(app,id).await{return Ok(());}
             let _permit=app.0.outgoing.acquire().await?;
             let input=app.open_source(file).await.map_err(anyhow::Error::msg)?;

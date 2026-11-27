@@ -7,6 +7,7 @@ use std::{
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RETENTION: u64 = 24 * 60 * 60;
+pub const FILE_SELECTION_HEADER: &str = "x-linchuan-file-selection";
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,12 +171,32 @@ pub struct TransferView {
     pub text: String,
     pub files: Vec<FileMeta>,
     pub status: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub can_select_files: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_file_ids: Option<Vec<String>>,
     pub bytes: u64,
     pub total: u64,
     pub created: u64,
     pub error: Option<String>,
 }
 impl TransferView {
+    pub fn includes_file(&self, id: &str) -> bool {
+        self.selected_file_ids
+            .as_ref()
+            .is_none_or(|ids| ids.iter().any(|selected| selected == id))
+    }
+
+    pub fn select_files(&mut self, selected: Option<Vec<String>>) {
+        self.selected_file_ids = selected;
+        self.total = self
+            .files
+            .iter()
+            .filter(|f| self.includes_file(&f.id))
+            .map(|f| f.size)
+            .sum();
+    }
+
     pub fn terminal(&self) -> bool {
         matches!(
             self.status.as_str(),
@@ -187,9 +208,33 @@ impl TransferView {
 pub struct Transfer {
     pub view: TransferView,
     pub files: Vec<StoredFile>,
+    pub stream_bytes: HashMap<String, u64>,
     pub peer_token: Option<String>,
     pub incoming_remote: bool,
     pub reserved: u64,
+}
+impl Transfer {
+    pub fn refresh_stream_bytes(&mut self, downloading: bool) {
+        self.view.bytes = self
+            .files
+            .iter()
+            .filter(|f| self.view.includes_file(&f.meta.id))
+            .map(|f| {
+                let done = if downloading {
+                    f.downloaded
+                } else {
+                    f.complete
+                };
+                if done {
+                    f.meta.size
+                } else if self.view.terminal() {
+                    0
+                } else {
+                    self.stream_bytes.get(&f.meta.id).copied().unwrap_or(0)
+                }
+            })
+            .sum();
+    }
 }
 #[derive(Clone)]
 pub struct Ticket {

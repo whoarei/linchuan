@@ -157,6 +157,107 @@ impl Drop for Host {
 }
 
 #[tokio::test]
+async fn device_delivery_persists_the_receiver_selection_on_both_sides() {
+    let sender = Host::new("选择发送").await;
+    let receiver = Host::new("选择接收").await;
+    let large = sender.dir.path().join("update.img");
+    let checksum = sender.dir.path().join("update.sha256");
+    std::fs::write(&large, vec![1; 32 * 1024]).unwrap();
+    std::fs::write(&checksum, b"checksum").unwrap();
+    let mut files = Vec::new();
+    for path in [&large, &checksum] {
+        let source = sender
+            .app
+            .register_file(
+                path.to_string_lossy().into_owned(),
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                String::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        files.push(json!({"name":source.name,"size":source.size,"source_id":source.source_id}));
+    }
+    let draft: Value = sender
+        .post("/api/drafts", json!({"files":files}), &sender.token)
+        .await
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let file_id = draft["files"][1]["id"].as_str().unwrap();
+    let target = sender.connect(&receiver).await;
+    let sent = sender
+        .send(&draft, json!([target]), None, &sender.token)
+        .await;
+    let message = sent["message_id"].as_str().unwrap();
+    let pending = receiver.wait(message, "pending").await;
+    assert_eq!(pending["can_select_files"], true);
+    let id = pending["id"].as_str().unwrap();
+    let response = receiver
+        .post(
+            &format!("/api/transfers/{id}/decision"),
+            json!({"accept":true,"file_ids":[file_id,file_id]}),
+            &receiver.token,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    std::fs::remove_file(large).unwrap();
+    let selected_dir = TempDir::new().unwrap();
+    receiver
+        .app
+        .set_space_probe(std::sync::Arc::new(|directory| {
+            Box::pin(async move {
+                let mut disk = linchuan_core::storage::disk_space(Path::new(&directory))?;
+                disk.available = linchuan_core::storage::DISK_HEADROOM + 16;
+                Ok(disk)
+            })
+        }));
+    let response = receiver
+        .post(
+            &format!("/api/transfers/{id}/decision"),
+            json!({"accept":true}),
+            &receiver.token,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    receiver
+        .app
+        .accept_selected_files_to_directory(
+            id,
+            selected_dir.path().to_string_lossy().into_owned(),
+            Some(vec![file_id.into()]),
+        )
+        .await
+        .unwrap();
+    for host in [&sender, &receiver] {
+        let completed = host.wait(message, "completed").await;
+        assert_eq!(completed["bytes"], 8);
+        assert_eq!(completed["total"], 8);
+        assert_eq!(completed["selected_file_ids"], json!([file_id]));
+        assert_eq!(completed["files"].as_array().unwrap().len(), 2);
+        let database = rusqlite::Connection::open(host.dir.path().join("linchuan.db")).unwrap();
+        let persisted: String = database
+            .query_row(
+                "SELECT selected_file_ids FROM deliveries WHERE message_id=?1",
+                [message],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&persisted).unwrap(),
+            json!([file_id])
+        );
+    }
+    assert_eq!(
+        std::fs::read(selected_dir.path().join("update.sha256")).unwrap(),
+        b"checksum"
+    );
+    assert_eq!(std::fs::read_dir(selected_dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn published_receive_survives_delivery_commit_failure_and_restart_without_copying_again() {
     let mut host = Host::new("恢复接收").await;
     let folder = TempDir::new().unwrap();

@@ -25,6 +25,8 @@ export interface Transfer {
   text: string;
   files: FileMeta[];
   status: string;
+  can_select_files?: boolean;
+  selected_file_ids?: string[];
   bytes: number;
   total: number;
   created: number;

@@ -671,6 +671,13 @@ small {
   padding: 13px;
   min-width: 0;
 }
+.attachment-checkbox {
+  flex: 0 0 auto;
+  margin: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: #6483d9;
+}
 .file-icon {
   width: 39px;
   height: 43px;

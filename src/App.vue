@@ -177,6 +177,9 @@ const preview = ref<{ url: string; name: string }>();
 const thumbnails = ref<Record<string, string>>({});
 type ReceiveDecision = "reject" | "accept" | "save-as";
 const decisionBusy = ref(new Map<string, ReceiveDecision>());
+const excludedFiles = ref(new Map<string, Set<string>>());
+type TransferSample = { bytes: number; time: number; rate?: number };
+const transferSamples = ref(new Map<string, TransferSample>());
 const thumbnailRequests = new Set<string>();
 const autoDownloads = new Set<string>();
 let thumbnailBytes = 0;
@@ -324,6 +327,31 @@ function size(bytes: number) {
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), 3);
   return `${(bytes / 1024 ** i).toFixed(i ? 1 : 0)} ${units[i]}`;
 }
+function sampleTransferRates(transfers: Transfer[]) {
+  const time = performance.now();
+  const samples = new Map<string, TransferSample>();
+  for (const transfer of transfers) {
+    if (transfer.status !== "accepted" && transfer.status !== "transferring") continue;
+    const previous = transferSamples.value.get(transfer.id);
+    const bytes = transfer.bytes;
+    if (!previous || bytes < previous.bytes) {
+      samples.set(transfer.id, { bytes, time });
+    } else if (time - previous.time >= 800) {
+      const rate = Math.round((bytes - previous.bytes) * 1000 / (time - previous.time));
+      samples.set(transfer.id, { bytes, time, rate });
+    } else {
+      samples.set(transfer.id, previous);
+    }
+  }
+  transferSamples.value = samples;
+}
+function transferProgress(transfer: Transfer) {
+  const rate = transferSamples.value.get(transfer.id)?.rate;
+  const amount = `${size(transfer.bytes)} / ${size(transfer.total)}`;
+  return transfer.status === "transferring" && rate !== undefined
+    ? `${amount} · ${size(rate)}/s`
+    : amount;
+}
 function timestamp(ms: number) {
   const date = new Date(ms);
   const today = new Date();
@@ -339,6 +367,8 @@ function online(id?: string) {
 function summary(message: Message) {
   const ds = message.deliveries;
   const done = ds.filter((d) => d.status === "completed").length;
+  if (ds.length && done === ds.length && ds.some((d) => d.selected_file_ids))
+    return ds.length === 1 ? `已传送 ${ds[0].selected_file_ids!.length}/${message.files.length} 个文件` : "部分文件送达";
   if (ds.length && done === ds.length) return message.files.length && ds.some((d)=>d.recipient_id.startsWith("browser-")) ? "已发送至浏览器" : "已送达";
   if (done && ds.every((d) => terminal(d.status)))
     return `部分送达 ${done}/${ds.length}`;
@@ -379,6 +409,18 @@ function incomingActive(message: Message) {
     ? delivery
     : undefined;
 }
+function selectedForReceive(transfer: Transfer) {
+  return transfer.files.filter((file) => !excludedFiles.value.get(transfer.id)?.has(file.id));
+}
+function toggleReceiveFile(transfer: Transfer, fileId: string, event: Event) {
+  const excluded = new Set(excludedFiles.value.get(transfer.id));
+  if ((event.target as HTMLInputElement).checked) excluded.delete(fileId);
+  else excluded.add(fileId);
+  excludedFiles.value.set(transfer.id, excluded);
+}
+function includesFile(transfer: Transfer | undefined, fileId: string) {
+  return transfer?.selected_file_ids?.includes(fileId) ?? true;
+}
 function visibleDeliveries(message: Message) {
   return message.deliveries.filter(
     (delivery) =>
@@ -402,6 +444,11 @@ async function refresh() {
   try {
     const next = await api<AppState>("/api/state");
     if (disposed || requestToken !== token()) return;
+    sampleTransferRates(next.transfers);
+    for (const id of excludedFiles.value.keys()) {
+      if (!next.transfers.some((t) => t.id === id && t.status === "pending"))
+        excludedFiles.value.delete(id);
+    }
     state.value = next;
     if (!next.me.owner) {
       let host=next.conversations.find((c)=>c.kind==="direct" && c.peer_id===next.info.id);
@@ -670,20 +717,26 @@ async function send() {
       const transferId=result.ids[0];
       try {
         const deadline=Date.now()+5*60_000;
+        let accepted: Transfer;
         while(true) {
           if(signal.aborted) throw new Error("已取消发送");
           const next=await api<AppState>("/api/state");
           const transfer=next.transfers.find((t)=>t.id===transferId);
           if(!transfer || terminal(transfer.status)) throw new Error(transfer?.error || (transfer?.status==="rejected"?"对方已拒绝接收":"传输已结束"));
-          if(transfer.status==="accepted") break;
+          if (transfer.status === "accepted") { accepted = transfer; break; }
           if(Date.now()>deadline) throw new Error("等待接收超时，请重新发送");
           await new Promise((resolve)=>setTimeout(resolve,400));
         }
+        const uploads = draft.files
+          .map((meta, index) => ({ id: meta.id, file: selectedFiles[index] }))
+          .filter(({ id }) => includesFile(accepted, id))
+          .sort((a, b) => a.file.size - b.file.size);
+        uploadTotal.value = accepted.total;
         sendPhase.value="正在发送文件…";
         let count=0;
-        for(let i=0;i<selectedFiles.length;i++) {
-          await upload("/api/transfers/"+transferId+"/files/"+draft.files[i].id+"/upload",selectedFiles[i],(bytes)=>(progress.value=count+bytes),signal);
-          count+=selectedFiles[i].size;
+        for (const { id, file } of uploads) {
+          await upload(`/api/transfers/${transferId}/files/${id}/upload`, file, (bytes) => (progress.value = count + bytes), signal);
+          count += file.size;
         }
       } catch(error) {
         await api("/api/transfers/"+transferId+"/cancel",{}).catch(()=>{});
@@ -716,22 +769,33 @@ async function send() {
 }
 async function decide(transfer: Transfer, decision: ReceiveDecision) {
   if (decisionBusy.value.has(transfer.id)) return;
+  const selected = selectedForReceive(transfer);
+  if (decision !== "reject" && transfer.files.length && !selected.length) return;
+  const fileIds = decision !== "reject" && selected.length !== transfer.files.length
+    ? selected.map((file) => file.id)
+    : undefined;
   decisionBusy.value.set(transfer.id, decision);
   try {
     if (decision === "save-as") {
       const accepted = await invoke<boolean>("receive_transfer_as", {
         transferId: transfer.id,
+        fileIds,
       });
       if (!accepted) return;
     } else {
       await api(`/api/transfers/${transfer.id}/decision`, {
         accept: decision === "accept",
+        file_ids: fileIds,
       });
     }
     await refresh();
     if (decision === "accept" && browserOnly.value && transfer.files.length) {
       const message = messages.value.find((m) => m.id === transfer.message_id);
-      if (message) for (const file of message.files) await download(file, message.id);
+      if (message) {
+        const files = message.files.filter((file) => !fileIds || fileIds.includes(file.id));
+        files.sort((a, b) => a.size - b.size);
+        for (const file of files) await download(file, message.id);
+      }
     }
   } catch (error) {
     notify(error instanceof Error ? error.message : String(error), true);
@@ -1512,11 +1576,13 @@ onUnmounted(() => {
                   role="group"
                   aria-label="接收文件"
                 >
-                  <span
-                    >待接收<template v-if="message.files.length > 1">
-                      · {{ message.files.length }} 个文件，一起接收</template
-                    ></span
-                  >
+                  <span>
+                    待接收<template v-if="incomingPending(message)!.can_select_files">
+                      · 已选 {{ selectedForReceive(incomingPending(message)!).length }}/{{ message.files.length }} 个文件
+                    </template><template v-else-if="message.files.length > 1">
+                      · {{ message.files.length }} 个文件，一起接收
+                    </template>
+                  </span>
                   <button
                     class="icon-button"
                     aria-label="拒绝"
@@ -1535,7 +1601,7 @@ onUnmounted(() => {
                     class="icon-button"
                     aria-label="另存为"
                     title="另存为"
-                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    :disabled="decisionBusy.has(incomingPending(message)!.id) || !selectedForReceive(incomingPending(message)!).length"
                     @click="decide(incomingPending(message)!, 'save-as')"
                   >
                     <FolderInput :size="18" aria-hidden="true" />
@@ -1544,7 +1610,7 @@ onUnmounted(() => {
                     class="icon-button"
                     aria-label="接收"
                     title="接收"
-                    :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                    :disabled="decisionBusy.has(incomingPending(message)!.id) || !selectedForReceive(incomingPending(message)!).length"
                     @click="decide(incomingPending(message)!, 'accept')"
                   >
                     <LoaderCircle
@@ -1562,10 +1628,7 @@ onUnmounted(() => {
                   <div>
                     <LoaderCircle class="spin" :size="13" />
                     <span>正在接收…</span>
-                    <small
-                      >{{ size(incomingActive(message)!.bytes) }} /
-                      {{ size(incomingActive(message)!.total) }}</small
-                    >
+                    <small>{{ transferProgress(incomingActive(message)!) }}</small>
                     <button
                       class="text-button"
                       @click="cancel(incomingActive(message)!)"
@@ -1573,7 +1636,10 @@ onUnmounted(() => {
                       取消
                     </button>
                   </div>
-                  <div v-if="browserOnly" class="browser-downloads"><button v-for="file in message.files" :key="file.id" class="text-button" @click="download(file,message.id)">下载 {{ file.name }}</button><small>文件由浏览器下载管理器保存。</small></div>
+                  <div v-if="browserOnly" class="browser-downloads">
+                    <button v-for="file in message.files.filter((file) => includesFile(incomingActive(message), file.id))" :key="file.id" class="text-button" @click="download(file, message.id)">下载 {{ file.name }}</button>
+                    <small>文件由浏览器下载管理器保存。</small>
+                  </div>
                   <progress
                     aria-label="文件接收进度"
                     :value="incomingActive(message)!.bytes"
@@ -1587,6 +1653,7 @@ onUnmounted(() => {
                   :class="{
                     expired:
                       !file.available &&
+                      includesFile(incomingDelivery(message), file.id) &&
                       receipt(message.id, file.id)?.status !== 'saved' &&
                       message.deliveries.every((d) => terminal(d.status)),
                   }"
@@ -1594,8 +1661,7 @@ onUnmounted(() => {
                   <div
                     v-if="
                       !incomingPending(message) &&
-                      !incomingActive(message) &&
-                      (file.available ||
+                      ((file.available && !incomingActive(message)) ||
                         (native &&
                           receipt(message.id, file.id)?.status === 'saved'))
                     "
@@ -1701,6 +1767,15 @@ onUnmounted(() => {
                     />
                   </button>
                   <div class="attachment-body">
+                    <input
+                      v-if="incomingPending(message)?.can_select_files"
+                      type="checkbox"
+                      class="attachment-checkbox"
+                      :aria-label="`接收 ${file.name}`"
+                      :checked="!excludedFiles.get(incomingPending(message)!.id)?.has(file.id)"
+                      :disabled="decisionBusy.has(incomingPending(message)!.id)"
+                      @change="toggleReceiveFile(incomingPending(message)!, file.id, $event)"
+                    />
                     <span class="file-icon"
                       ><ImageIcon
                         v-if="file.mime.startsWith('image/')"
@@ -1713,33 +1788,12 @@ onUnmounted(() => {
                             ? receipt(message.id, file.id)?.location
                             : undefined
                         "
-                        >{{ size(file.size)
-                        }}<template
-                          v-if="
-                            incomingDelivery(message) &&
-                            [
-                              'rejected',
-                              'cancelled',
-                              'failed',
-                              'interrupted',
-                            ].includes(incomingDelivery(message)!.status)
-                          "
-                        >
-                          ·
-                          {{
-                            statusLabel(incomingDelivery(message)!.status)
-                          }}</template
-                        ><template
-                          v-else-if="
-                            !file.available &&
-                            receipt(message.id, file.id)?.status !== 'saved' &&
-                            message.deliveries.every((d) => terminal(d.status))
-                          "
-                        >
-                          · 文件不可用或已过期</template
+                        >{{ size(file.size) }}
+                        <template v-if="!includesFile(incomingDelivery(message), file.id)">
+                          · 未选择接收</template
                         >
                         <template
-                          v-if="
+                          v-else-if="
                             receipt(message.id, file.id)?.status === 'saved'
                           "
                         >
@@ -1766,6 +1820,12 @@ onUnmounted(() => {
                           "
                         >
                           · 已接收</template
+                        >
+                        <template v-else-if="incomingDelivery(message) && ['rejected', 'cancelled', 'failed', 'interrupted'].includes(incomingDelivery(message)!.status)">
+                          · {{ statusLabel(incomingDelivery(message)!.status) }}</template
+                        >
+                        <template v-else-if="!file.available && message.deliveries.every((d) => terminal(d.status))">
+                          · 文件不可用或已过期</template
                         >
                       </small></span
                     >
@@ -1835,8 +1895,11 @@ onUnmounted(() => {
                       ? "本机"
                       : delivery.recipient_name
                   }}</span
-                  ><span>{{ statusLabel(delivery.status) }}</span
-                  ><button
+                  ><span>{{ statusLabel(delivery.status) }}<template v-if="delivery.status === 'completed' && delivery.selected_file_ids">
+                    · {{ delivery.selected_file_ids.length }}/{{ delivery.files.length }} 个文件
+                  </template></span>
+                  <small v-if="delivery.status === 'transferring'">{{ transferProgress(delivery) }}</small>
+                  <button
                     v-if="!terminal(delivery.status)"
                     class="text-button"
                     @click="cancel(delivery)"

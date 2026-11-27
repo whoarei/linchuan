@@ -453,13 +453,8 @@ impl App {
         if t.view.terminal() {
             return Err(Error::conflict("传输已结束"));
         }
-        t.view.bytes = t
-            .files
-            .iter()
-            .filter(|f| f.meta.id != file && f.complete)
-            .map(|f| f.meta.size)
-            .sum::<u64>()
-            + bytes;
+        t.stream_bytes.insert(file.into(), bytes);
+        t.refresh_stream_bytes(false);
         t.view.created = now();
         drop(state);
         self.notify();
@@ -556,6 +551,8 @@ mod tests {
                     text: String::new(),
                     files: vec![meta.clone()],
                     status: "accepted".into(),
+                    can_select_files: false,
+                    selected_file_ids: None,
                     bytes: 0,
                     total: 1,
                     created: now() - 301,
@@ -569,6 +566,7 @@ mod tests {
                     storage: FileStorage::Browser,
                     downloaded: false,
                 }],
+                stream_bytes: Default::default(),
                 peer_token: None,
                 incoming_remote: false,
                 reserved: 0,
