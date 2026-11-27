@@ -24,6 +24,23 @@ use std::{
 };
 use tokio::sync::{broadcast, Mutex, Semaphore};
 const MAX_STREAMS: usize = 8;
+const PREFERRED_HTTP_PORTS: [u16; 15] = [
+    51515, 52525, 53535, 54545, 55555, 56565, 57575, 58585, 59595, 60606, 61616, 62626, 63636,
+    64646, 65432,
+];
+
+async fn bind_http_listener() -> std::io::Result<tokio::net::TcpListener> {
+    for port in PREFERRED_HTTP_PORTS {
+        match tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied => continue,
+                _ => return Err(error),
+            },
+        }
+    }
+    tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await
+}
 
 fn pairing_code() -> String {
     format!("{:06}", uuid::Uuid::new_v4().as_u128() % 1_000_000)
@@ -143,8 +160,6 @@ impl App {
             .create_new(true)
             .open(work.join(".active"))?;
         try_run_lock(&run_lock)?;
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-        let port = listener.local_addr()?.port();
         let (events, _) = broadcast::channel(128);
         let (stop, _) = tokio::sync::watch::channel(false);
         let code = pairing_code();
@@ -159,6 +174,9 @@ impl App {
         } else {
             None
         };
+        // Let an explicitly configured HTTPS port take precedence over an HTTP preference.
+        let listener = bind_http_listener().await?;
+        let port = listener.local_addr()?.port();
         let app = Self(Arc::new(Inner {
             device_id: config.id.clone(),
             identity,
