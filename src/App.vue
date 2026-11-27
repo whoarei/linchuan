@@ -39,6 +39,7 @@ import {
 import QRCode from "qrcode";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import BrandMark from "./BrandMark.vue";
 import DesktopTitleBar from "./DesktopTitleBar.vue";
 import ScreenAssistance from "./ScreenAssistance.vue";
 import ConversationRow from "./ConversationRow.vue";
@@ -1286,7 +1287,7 @@ onUnmounted(() => {
     @ended="notify($event)"
   />
   <div v-if="loading || bootError" class="launch">
-    <div class="brand-icon">邻</div>
+    <BrandMark />
     <h1>邻传</h1>
     <template v-if="bootError">
       <p class="error" role="alert">{{ bootError }}</p>
@@ -1296,7 +1297,7 @@ onUnmounted(() => {
   </div>
   <main v-else-if="!ready" class="pair-page">
     <section class="pair-card">
-      <div class="brand-icon">邻</div>
+      <BrandMark />
       <h1>连接设备</h1>
       <p>配对 {{ hostName }}，开始传送文字和文件。</p>
       <form @submit.prevent="pair">
@@ -1343,9 +1344,10 @@ onUnmounted(() => {
     }"
   >
     <nav class="function-rail" aria-label="主要功能">
-      <button class="rail-brand" title="邻传" @click="setMode('devices')">
-        邻</button
-      ><button
+      <button class="rail-brand" aria-label="邻传" title="邻传" @click="setMode('devices')">
+        <BrandMark />
+      </button>
+      <button
         class="rail-button"
         :class="{ active: mode === 'devices' }"
         :aria-label="browserOnly ? '收发' : '设备'"
@@ -2099,7 +2101,7 @@ onUnmounted(() => {
         </div>
       </template>
       <div v-else class="welcome">
-        <div class="brand-icon">邻</div>
+        <BrandMark />
         <h2>邻传</h2>
         <p>选择设备或群聊，开始传输。</p>
         <button class="secondary" @click="modal = 'manual'">
@@ -2265,7 +2267,7 @@ onUnmounted(() => {
       </section>
     </main>
     <main v-else class="about-page">
-      <div class="brand-icon">邻</div>
+      <BrandMark />
       <h1>邻传 · Linchuan</h1>
       <span class="version-label">{{ state!.info.version }}</span>
       <section v-if="native" class="app-updates" aria-label="应用更新">

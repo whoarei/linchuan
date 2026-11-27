@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { ArrowUpRight, Check, Download, File, Image as ImageIcon, Link, UploadCloud, X } from "lucide-vue-next";
+import BrandMark from "./BrandMark.vue";
 import { api, ApiError, upload } from "./api";
 import { scanId, scanSize, type ScanView } from "./scan";
 
@@ -107,7 +108,7 @@ onUnmounted(() => {
   <main class="pair-page scan-visitor">
     <section class="pair-card scan-visitor-card">
       <header class="scan-visitor-header">
-        <div class="brand-icon" aria-hidden="true">邻</div>
+        <BrandMark />
         <span>{{ page?.kind === 'pickup' ? '扫码取件' : page?.kind === 'dropoff' ? '扫码交件' : '邻传' }}</span>
       </header>
       <h1>{{ page?.title || '邻传扫码页' }}</h1>

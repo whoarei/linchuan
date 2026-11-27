@@ -7,6 +7,7 @@ import {
 } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { Copy, Minus, Square, X } from "lucide-vue-next";
+import BrandMark from "./BrandMark.vue";
 
 const emit = defineEmits<{ error: [message: string] }>();
 type ResizeDirection = Parameters<DesktopWindow["startResizeDragging"]>[0];
@@ -110,6 +111,7 @@ onUnmounted(() => {
       aria-label="窗口标题栏"
     >
       <div class="titlebar-drag" @mousedown="drag">
+        <BrandMark />
         <span>邻传 · Linchuan</span>
       </div>
       <div class="window-controls" role="group" aria-label="窗口控制">
@@ -174,9 +176,14 @@ onUnmounted(() => {
   min-width: 0;
   display: flex;
   align-items: center;
+  gap: 6px;
   padding-left: 14px;
   color: #657189;
   font-size: 12px;
+}
+.titlebar-drag .brand-icon {
+  width: 24px;
+  height: 24px;
 }
 .titlebar-drag span {
   pointer-events: none;
