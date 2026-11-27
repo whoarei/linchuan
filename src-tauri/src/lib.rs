@@ -77,7 +77,11 @@ async fn bootstrap(app: tauri::AppHandle) -> Result<Bootstrap, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_opener::Builder::new()
+                .open_js_links_on_click(false)
+                .build(),
+        )
         .plugin(assistance::plugin())
         .plugin(assistance_linux::plugin())
         .plugin(receiving::plugin());

@@ -136,7 +136,11 @@ impl App {
         }
         let work = temporary.join(uid());
         tokio::fs::create_dir_all(&work).await?;
-        let run_lock = std::fs::File::create(work.join(".active"))?;
+        let run_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(work.join(".active"))?;
         try_run_lock(&run_lock)?;
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
         let port = listener.local_addr()?.port();

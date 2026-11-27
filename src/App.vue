@@ -45,6 +45,7 @@ import ConversationRow from "./ConversationRow.vue";
 import { useUpdates } from "./useUpdates";
 import { useReceiving } from "./useReceiving";
 import { useDesktopSettings } from "./useDesktopSettings";
+import { useModalFocus } from "./useModalFocus";
 import {
   browserIdentity,
   rememberBrowserName,
@@ -153,6 +154,8 @@ const modal = ref<
   | "leave"
   | "preview"
 >("");
+const modalContainer = ref<HTMLElement>();
+useModalFocus(modal, modalContainer, closeModal);
 const addMenu = ref(false);
 const qr = ref("");
 const shareAddress = ref("");
@@ -249,13 +252,14 @@ const canWrite = computed(
     !!current.value &&
     (current.value.kind === "direct" || membership.value?.state === "joined"),
 );
+const textTooLong = computed(() => new TextEncoder().encode(text.value).length > 65_536);
 const canSend = computed(
   () =>
     connected.value &&
     canWrite.value &&
     !sending.value &&
     (text.value.trim().length > 0 || files.value.length > 0) &&
-    new TextEncoder().encode(text.value).length <= 65536,
+    !textTooLong.value,
 );
 function browserConversation(c: Conversation) {
   return c.kind === "direct" && c.peer_kind === "browser";
@@ -437,7 +441,7 @@ function scrollBottom() {
     if (timeline.value) timeline.value.scrollTop = timeline.value.scrollHeight;
   });
 }
-async function refresh() {
+async function refresh(initial = false) {
   if (refreshing || disposed) return;
   refreshing = true;
   const requestToken = token();
@@ -466,13 +470,16 @@ async function refresh() {
     if (selected.value && (mode.value === "devices" || !next.me.owner) && !historyBusy.value)
       await loadMessages(false);
   } catch (error) {
-    if (requestToken !== token()) return;
+    if (disposed || requestToken !== token()) return;
     if (error instanceof ApiError && error.status === 401 && !native) {
       forget(requestToken);
       sessionChanged();
-    } else connected.value = false;
+    } else {
+      connected.value = false;
+      if (initial) throw error;
+    }
   } finally {
-    loading.value = false;
+    if (!initial) loading.value = false;
     refreshing = false;
   }
 }
@@ -1157,23 +1164,20 @@ function setMode(value: Mode) {
     void loadDesktopSettings();
   }
 }
-onMounted(async () => {
-  window.addEventListener("linchuan-session-change", sessionChanged);
+async function start() {
+  loading.value = true;
+  bootError.value = "";
+  clearInterval(poll);
   try {
     await bootstrap();
+    if (disposed) return;
     void loadDesktopSettings();
     void loadReceiveSettings();
     const info = await api<{ name: string }>("/api/info");
+    if (disposed) return;
     hostName.value = info.name;
-    if(native) {
-      try {
-        nativeListeners.push(await listen<NativeSelection[]>("linchuan-files",(event)=>nativeSelections(event.payload)));
-        nativeListeners.push(await listen<string>("linchuan-file-error",(event)=>notify(event.payload,true)));
-        nativeListeners.push(await listen<boolean>("linchuan-dragging",(event)=>{ dragging.value=event.payload && canWrite.value; }));
-      } catch { /* Native test hosts may omit the event bridge. */ }
-    }
-    if (token()) await refresh();
-    else loading.value = false;
+    if (token()) await refresh(true);
+    if (disposed) return;
     if (ready.value) events();
     poll = setInterval(() => {
       if (token()) {
@@ -1182,9 +1186,28 @@ onMounted(async () => {
       }
     }, 3000);
   } catch (error) {
-    bootError.value = (error as Error).message;
-    loading.value = false;
+    const reason = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    if (!disposed) bootError.value = reason || "请检查应用和网络后重试";
+  } finally {
+    if (!disposed) loading.value = false;
   }
+}
+onMounted(async () => {
+  window.addEventListener("linchuan-session-change", sessionChanged);
+  void start();
+  if (!native) return;
+  const listeners = [
+    listen<NativeSelection[]>("linchuan-files", (event) => nativeSelections(event.payload)),
+    listen<string>("linchuan-file-error", (event) => notify(event.payload, true)),
+    listen<boolean>("linchuan-dragging", (event) => { dragging.value = event.payload && canWrite.value; }),
+  ];
+  await Promise.all(listeners.map(async (listener) => {
+    try {
+      const unlisten = await listener;
+      if (disposed) unlisten();
+      else nativeListeners.push(unlisten);
+    } catch { /* Test hosts may omit the event bridge. */ }
+  }));
 });
 onUnmounted(() => {
   disposed = true;
@@ -1215,7 +1238,10 @@ onUnmounted(() => {
   <div v-if="loading || bootError" class="launch">
     <div class="brand-icon">邻</div>
     <h1>邻传</h1>
-    <p v-if="bootError" class="error">{{ bootError }}</p>
+    <template v-if="bootError">
+      <p class="error" role="alert">{{ bootError }}</p>
+      <button class="secondary" @click="start">重试</button>
+    </template>
     <LoaderCircle v-else class="spin" :size="22" />
   </div>
   <main v-else-if="!ready" class="pair-page">
@@ -1259,6 +1285,7 @@ onUnmounted(() => {
   <div
     v-else
     class="workspace"
+    :inert="!!modal"
     :class="{
       'chat-open': !!selected && mode === 'devices',
       'browser-only': browserOnly,
@@ -1490,6 +1517,15 @@ onUnmounted(() => {
             @click="screenAssistance?.start(currentDevice)"
           ><MonitorUp :size="16" />分享屏幕</button>
           <span v-else class="local-note">局域网直传</span>
+          <button
+            v-if="browserOnly"
+            class="icon-button mobile-disconnect"
+            aria-label="断开当前会话"
+            title="断开当前会话"
+            @click="disconnect"
+          >
+            <LogOut :size="20" />
+          </button>
         </header>
         <div
           v-if="group && membership?.state === 'invited'"
@@ -1968,6 +2004,8 @@ onUnmounted(() => {
             ref="composer"
             v-model="text"
             aria-label="发送文字"
+            :aria-invalid="textTooLong"
+            :aria-describedby="textTooLong ? 'text-limit-error' : undefined"
             :disabled="!canWrite || sending"
             :placeholder="
               canWrite
@@ -1981,6 +2019,9 @@ onUnmounted(() => {
             @keydown.ctrl.enter.prevent="send"
             @keydown.meta.enter.prevent="send"
           />
+          <p v-if="textTooLong" id="text-limit-error" class="error text-limit-error" role="alert">
+            文字超过 65,536 字节，请缩短后再发送。文件尚未上传。
+          </p>
           <div class="composer-footer">
             <small>Ctrl / ⌘ + Enter 发送</small
             ><button
@@ -2264,10 +2305,13 @@ onUnmounted(() => {
   </div>
   <div v-if="modal" class="modal-backdrop" @click.self="closeModal">
     <section
+      ref="modalContainer"
       class="modal"
       :class="{ 'image-modal': modal === 'preview' }"
       role="dialog"
       aria-modal="true"
+      aria-labelledby="modal-title"
+      tabindex="-1"
     >
       <button
         class="modal-close icon-button"
@@ -2278,7 +2322,7 @@ onUnmounted(() => {
       </button>
       <template v-if="modal === 'connect'"
         ><div class="modal-icon"><QrCode :size="24" /></div>
-        <h2>连接其他设备</h2>
+        <h2 id="modal-title">连接其他设备</h2>
         <p>在同一网络中，扫码或用浏览器打开地址。</p>
         <img :src="qr" class="qr-image" alt="浏览器访问二维码" /><select
           v-if="state!.info.addresses.length > 1 || browserHttps"
@@ -2301,7 +2345,7 @@ onUnmounted(() => {
         </button></template
       >
       <template v-else-if="modal === 'browser-https'">
-        <h2>配置网页控制</h2>
+        <h2 id="modal-title">配置网页控制</h2>
         <p>请使用观看方浏览器信任的证书。域名或 IP 地址需与证书匹配。</p>
         <form @submit.prevent="saveBrowserHttps">
           <label>域名或 IP 地址<input v-model="httpsHost" maxlength="253" required /></label>
@@ -2316,7 +2360,7 @@ onUnmounted(() => {
       </template>
       <template v-else-if="modal === 'manual'"
         ><div class="modal-icon"><Link :size="24" /></div>
-        <h2>通过地址连接</h2>
+        <h2 id="modal-title">通过地址连接</h2>
         <p>输入对方应用展示的完整访问地址。</p>
         <form @submit.prevent="connectPeer">
           <label
@@ -2334,7 +2378,7 @@ onUnmounted(() => {
       >
       <template v-else-if="modal === 'group'"
         ><div class="modal-icon"><Users :size="24" /></div>
-        <h2>{{ editingGroup ? "管理群聊" : "新建群聊" }}</h2>
+        <h2 id="modal-title">{{ editingGroup ? "管理群聊" : "新建群聊" }}</h2>
         <p>
           {{
             editingGroup
@@ -2378,7 +2422,7 @@ onUnmounted(() => {
         </form></template
       >
       <template v-else-if="modal === 'members' && group"
-        ><h2>{{ group.name }}</h2>
+        ><h2 id="modal-title">{{ group.name }}</h2>
         <p>
           {{ group.members.length }} 位成员 ·
           {{ group.members.filter((m) => m.state === "joined").length }}
@@ -2425,7 +2469,7 @@ onUnmounted(() => {
         </button></template
       >
       <template v-else-if="modal === 'leave'"
-        ><h2>退出群聊？</h2>
+        ><h2 id="modal-title">退出群聊？</h2>
         <p>本机历史会保留。再次加入需要群主重新邀请。</p>
         <div class="modal-actions">
           <button class="secondary" @click="modal = 'members'">取消</button
@@ -2435,7 +2479,7 @@ onUnmounted(() => {
         </div></template
       >
       <template v-else-if="modal === 'clear'"
-        ><h2>清理文件缓存？</h2>
+        ><h2 id="modal-title">清理文件缓存？</h2>
         <p>
           文字和历史卡片会保留，正在传输的文件会跳过。已清理的附件需向发送者重新获取。
         </p>
@@ -2447,7 +2491,7 @@ onUnmounted(() => {
         </div></template
       >
       <template v-else-if="modal === 'preview' && preview"
-        ><h3>{{ preview.name }}</h3>
+        ><h3 id="modal-title">{{ preview.name }}</h3>
         <img :src="preview.url" :alt="preview.name" class="preview-image"
       /></template>
     </section>
