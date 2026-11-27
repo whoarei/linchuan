@@ -4,11 +4,11 @@
 
 0.6.0 采用精简通信模型：浏览器配对后只与所打开的客户端互传，不显示附近设备、不参与群聊，也不经宿主向其他设备转发。原生客户端保留设备发现和客户端群聊。原生选取、拖入的文件直接流式读取；浏览器向宿主发送时先完成接收检查，再直接写入接收目录；正式接收文件不再自动保留第二份应用缓存。文字和纯图片消息自动接收，普通文件或混合附件保留确认。
 
-当前正式版为 **0.6.0**：支持浏览器与宿主单独互传、原文件直接流式发送、接收目录单份存储，以及文字和图片自动接收。继续支持[动态磁盘空间预算、大文件与复制／移动](docs/large-files.md)。
+**v0.8.0** 新增「收发」。可生成取件码供多人自行下载资料，也可生成交件码收集文件。同一局域网里的访客用浏览器扫码即可打开。
 
 支持 Android、Linux、Windows 的局域网文字、图片与文件传送工具。应用间直接互传；未安装应用的设备可通过浏览器打开对方地址，配对后双向收发，无需独立服务器。普通 HTTP 连接首选 `51515`，被占用时按顺序尝试其余预置端口。15 个预置端口都不可用时，由系统分配空闲端口。连接时以应用显示的地址为准。
 
-[下载 v0.6.0](https://github.com/whoarei/linchuan/releases/tag/v0.6.0) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [在线更新](docs/updates.md) · [开发与发布](docs/development.md) · [0.6.0 验证范围](docs/validation-0.6.0.md)
+[下载最新版](https://github.com/whoarei/linchuan/releases/latest) · [v0.8.0 发布说明](docs/releases/0.8.0.md) · [产品方案](docs/product-plan.md) · [技术方案](docs/technical-plan.md) · [会话与群聊数据模型](docs/data-model.md) · [在线更新](docs/updates.md) · [开发与发布](docs/development.md)
 
 0.4.0 提供[固定接收目录](docs/receive-storage.md)：客户端接收文件、图片后自动保存到系统下载目录下的“邻传”文件夹，可在设置中更改、打开或恢复默认目录。遇到重名时可选择覆盖、保留两份或跳过，保存失败可重试；清理应用缓存不会删除已保存文件。浏览器仍使用自己的下载设置。
 
@@ -31,7 +31,7 @@ Windows／Linux 提供[开机启动和托盘](docs/desktop-background.md)，设�
 
 会话、群成员、文字草稿和附件位置记录保存到 SQLite。原生发送文件引用原位置，收到文件保存在接收目录；外部移动、删除或修改可能使引用失效。浏览器未发送完的文件依赖原页面保持打开，刷新后需重新选择。缓存只用于粘贴内容等没有稳定原路径的来源及旧版本留下的附件。设置中可手动改名或“换个名字”、查看配对码和清理文件缓存；清理保留历史卡片。每次最多 64 个文件，每群最多 16 位成员。按实际磁盘空间接收文件，默认预留 2 GiB；发送超过 2 GiB 的文件需收发双方都升级到 0.5.3 或更新版本。应用和网页需保持运行；群聊不自动补发离线消息。
 
-Windows／Linux 的 0.3.0 至 0.5.3 用户可在“关于”中检查更新；更早版本可手动下载安装 0.6.0。Android 0.4.0 至 0.5.3 可直接升级，本版沿用其发布证书；0.3.0 及更早版本因旧签名不同需卸载后重装，请先保留需要的数据。
+Windows／Linux 用户可在「关于」中检查更新，或下载新版安装包。使用同一发布签名的 Android 用户可覆盖安装新版 APK。早期使用不同签名的 Android 版本需要先保留所需数据，再卸载重装。
 
 ### 收发
 
@@ -48,7 +48,7 @@ Windows／Linux 的 0.3.0 至 0.5.3 用户可在“关于”中检查更新；�
 | Windows 10/11 x64 | NSIS 安装包，需要 WebView2 |
 | 浏览器 | 现代 Chrome / Edge / Firefox / Safari，免安装连接运行中的应用 |
 
-Linux AppImage 下载后先执行 `chmod +x Linchuan_0.6.0_amd64.AppImage`。如遇 FUSE 环境缺失，可使用 `./Linchuan*.AppImage --appimage-extract-and-run`。Windows 首次运行需要允许应用接收局域网连接。
+Linux AppImage 下载后先执行 `chmod +x Linchuan_*_amd64.AppImage`。如遇 FUSE 环境缺失，可使用 `./Linchuan*.AppImage --appimage-extract-and-run`。Windows 首次运行需要允许应用接收局域网连接。
 
 ## 当前边界
 
