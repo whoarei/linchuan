@@ -2801,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "linchuan"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "enigo",
  "gstreamer",
@@ -2826,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "linchuan-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",
